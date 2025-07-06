@@ -1,0 +1,20 @@
+# CMakeLists.txt
+cmake_minimum_required(VERSION 4.0)
+project(lasm)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(HTS REQUIRED htslib)
+include_directories(${HTS_INCLUDE_DIRS})
+link_directories(${HTS_LIBRARY_DIRS})
+add_definitions(${HTS_CFLAGS_OTHER})
+
+set(SOURCE_FILES lasm.cpp)
+include_directories(./ext)
+set(CMAKE_PATH cmake)
+
+add_executable(${PROJECT_NAME} ${SOURCE_FILES})
+target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES})
+
+
+add_test(NAME TestBAM COMMAND lasm -i input.bam -o tst.fa)
