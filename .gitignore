@@ -1,0 +1,17 @@
+*.o
+*.obj
+*.so
+*.a
+*.lib
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+cmake_presets.json
+cmake_preset.cmake
+target_prebuild.cmake
+target_postinstall.cmake
+target_cxxabi.h.gch
+target_compile_features.cmake
+*.bam
+*.json
+build/*
