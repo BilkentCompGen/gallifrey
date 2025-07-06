@@ -1,8 +1,20 @@
 # CMakeLists.txt
 cmake_minimum_required(VERSION 4.0)
 project(lasm)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_USING_LINKER_mold)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+set(CMAKE_CXX_FLAGS "-Wall -Wextra")
+set(CMAKE_CXX_FLAGS_DEBUG "-g")
+set(CMAKE_CXX_FLAGS "-O3")
+set(CMAKE_CXX_FLAGS "-march=native")
+set(CMAKE_CXX_FLAGS "-mtune=native")
+set(CMAKE_CXX_FLAGS "-ftree-vectorize")
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(HTS REQUIRED htslib)
 include_directories(${HTS_INCLUDE_DIRS})
@@ -14,7 +26,27 @@ include_directories(./ext)
 set(CMAKE_PATH cmake)
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
-target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES})
+
+
+include(FetchContent)
+FetchContent_Declare(
+    cli11_proj
+    QUIET
+    GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
+    GIT_TAG v2.5.0 
+)
+
+FetchContent_MakeAvailable(cli11_proj)
+
+include(FetchContent)
+FetchContent_Declare(
+    gtl
+    GIT_REPOSITORY https://github.com/greg7mdp/gtl.git
+    GIT_TAG        v1.2.0 # adjust tag/branch/commit as needed
+)
+FetchContent_MakeAvailable(gtl)
+
+target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11)
 
 
 add_test(NAME TestBAM COMMAND lasm -i input.bam -o tst.fa)
