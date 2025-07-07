@@ -2,6 +2,7 @@
 #define LCMER_H
 #include <array>
 #include <algorithm>
+uint32_t MurmurHash3_32(const void *key, int len, uint32_t seed);
 template<int N>
 struct lcmer {
     std::array<uint32_t, N> data;
@@ -61,7 +62,7 @@ lcmer<N> update_lcmer(lcmer<N> l, uint32_t new_core) {
 template <int N>
 struct std::hash<lcmer<N>> {
     std::size_t operator()(const lcmer<N> &l) const noexcept {
-        return MurmurHash3_32(&l.data, N * sizeof(uint32_t));
+        return MurmurHash3_32(&l.data, N * sizeof(uint32_t), 12312342);
     }
 };
 #endif
