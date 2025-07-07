@@ -215,12 +215,12 @@ int main(int argc, char **argv) {
   cout << "Output: " << output << endl;
 
 
-  // bloom_parameters bparam;
-  // bparam.projected_element_count = 1'000'000'000;
-  // bparam.false_positive_probability = 0.0001; 
-  // bparam.random_seed = 0xA5A5A5A5;
-  // bparam.compute_optimal_parameters();
-  // bloom_filter bfil(bparam);
+  bloom_parameters bparam;
+  bparam.projected_element_count = 1'000'000'000;
+  bparam.false_positive_probability = 0.0001; 
+  bparam.random_seed = 0xA5A5A5A5;
+  bparam.compute_optimal_parameters();
+  bloom_filter bfil(bparam);
 
 
   uint8_t *data = NULL;
@@ -251,18 +251,18 @@ int main(int argc, char **argv) {
         }
         lcp_read lr = parse_cores_from_bam_record(std::get<1>(work),
                                                   std::get<0>(work), lcp_level);
-        // cout << bamdata->core.l_qseq << " to " << lr.cores.size() << "\n";
+        //cout << bamdata->core.l_qseq << " to " << lr.cores.size() << "\n";
         if (lr.cores.size() < L + 2) {
           free(std::get<1>(work));
           continue;
         }
         lcmer<L> l{lr.cores.begin()};
         for (size_t i = L; i < lr.cores.size(); ++i) {
-          // if(!bfil.contains(l)){
-          //   bfil.insert(l);
-          //   update_lcmer(l, lr.cores[i]);
-          //   continue;
-          // }
+          if(!bfil.contains(l)){
+            bfil.insert(l);
+            update_lcmer(l, lr.cores[i]);
+            continue;
+          }
           dbg.lazy_emplace_l(
               l,
               [&](dbg_map_t::value_type &val) {
@@ -281,10 +281,10 @@ int main(int argc, char **argv) {
           update_lcmer(l, lr.cores[i]);
           count.fetch_add(1);
         }
-        // if(!bfil.contains(l)){
-        //     bfil.insert(l);
-        //     continue;
-        // }
+        if(!bfil.contains(l)){
+            bfil.insert(l);
+            continue;
+        }
         dbg.lazy_emplace_l(
             l, [&](dbg_map_t::value_type &val) { 
               val.second.count++; 
@@ -315,5 +315,19 @@ int main(int argc, char **argv) {
   if (bamdata) {
     bam_destroy1(bamdata);
   }
+
+  FILE *out = fopen(output.c_str(), "w+");
+
+   for (const auto &p : dbg) {
+        fprintf(out, "S\t%lu\t*\tLN:i:%d\n", p.second.index, L);
+    }
+    for (const auto &p : dbg) {
+        lcmer ln = shift_lcmer(p.first);
+        for (uint32_t next : p.second.next) {
+            lcmer_set0(ln, next);
+              fprintf(out,"L\t%lu\t+\t%lu\t+\t%dM\n",p.second.index,dbg[ln].index,L-1);
+        }
+    }
+    fclose(out);
   return 0;
 }
