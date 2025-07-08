@@ -303,20 +303,33 @@ int main(int argc, char **argv) {
     string output;
     int lcp_level;
     int threads = 8;
-    app.add_option("-i,--input", input, "Input bam file")->required();
-    app.add_option("-o,--output", output, "Output gfa file")->required();
+    app.add_option("input", input, "Input bam file")->required();
+    app.add_option("output", output, "Output gfa file")->required();
     app.add_option("-l,--level", lcp_level, "LCP level to compute")->required();
     app.add_option("-t,--threads", threads, "Number of threads")
         ->capture_default_str();
-
-    CLI11_PARSE(app, argc, argv);
-    cout << "Input: " << input << endl;
-    cout << "Output: " << output << endl;
 
     bloom_parameters bparam;
     bparam.projected_element_count = 1'000'000;
     bparam.false_positive_probability = 0.0001;
     bparam.random_seed = 0xA5A5A5A5;
+    auto bfg =
+        app.add_option_group("bloomfilter", "Parameters to setup bloom filter");
+    bfg->add_option("--projected-element-count", bparam.projected_element_count,
+                    "Projected element count")
+        ->capture_default_str();
+    bfg->add_option("--false-positive-probability",
+                    bparam.false_positive_probability,
+                    "False positive probability")
+        ->capture_default_str();
+    bfg->add_option("--random-seed", bparam.random_seed, "Random seed")
+        ->capture_default_str();
+
+    CLI11_PARSE(app, argc, argv);
+
+    cout << "Input: " << input << endl;
+    cout << "Output: " << output << endl;
+
     bparam.compute_optimal_parameters();
     bloom_filter bfil(bparam);
 
