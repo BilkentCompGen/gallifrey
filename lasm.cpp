@@ -25,6 +25,27 @@ struct core_view {
 };
 
 
+//https://github.com/ruanjue/wtdbg2/blob/b77c5657c8095412317e4a20fe3668f5bde6b1ac/dna.h#L108
+template<class T>
+T reverse_complement_kmer(T kmer, int K){
+  uint32_t shift_count = (sizeof(T)*8) - 2 * K;
+  kmer = ~kmer;
+  kmer = ((kmer & 0x3333333333333333LLU)<< 2) | ((kmer & 0xCCCCCCCCCCCCCCCCLLU)>> 2);
+  kmer = ((kmer & 0x0F0F0F0F0F0F0F0FLLU)<< 4) | ((kmer & 0xF0F0F0F0F0F0F0F0LLU)>> 4);
+  if constexpr (sizeof(T)==8){
+    kmer= __builtin_bswap64(kmer);
+  }
+  else if constexpr (sizeof(T)==4){
+    kmer= __builtin_bswap32(kmer);
+  }
+  else if constexpr (sizeof(T)==2){
+    kmer= __builtin_bswap16(kmer);
+  }
+  kmer = kmer >> shift_count;
+  return kmer;
+}
+
+
 template <int _K, typename INT_TYPE = uint32_t> struct KmerViewOnNibbles {
   using int_type = INT_TYPE;
   static constexpr int k = _K;
@@ -72,6 +93,15 @@ void init_core_kmer(struct core *cr, _T Kval, uint64_t si, uint64_t ei) {
   cr->bit_size = 2 * SYNCMER_K;
 }
 
+template <typename _T>
+void init_core_kmer_xor(struct core *cr, _T Kval, uint64_t si, uint64_t ei) {
+  cr->start = si;
+  cr->end = ei;
+  cr->label = 0;
+  cr->label |= (Kval ^ reverse_complement_kmer(Kval, SYNCMER_K));
+  cr->bit_rep = 0x8000000000000000 | cr->label;
+  cr->bit_size = 2 * SYNCMER_K;
+}
 syncmer::syncmer_precomputed<syncmer::SYNCMER_RULE<SYNCMER_K, SYNCMER_S, SYNCMER_T>> table;
 uint64_t parse1_syncmers(const uint8_t *data, int64_t len, struct core *cores) {
   int core_index = 0;
@@ -81,7 +111,7 @@ uint64_t parse1_syncmers(const uint8_t *data, int64_t len, struct core *cores) {
   for (; it1 + SYNCMER_K < len; it1++) {
 
     if (table[kmer_view.value]) {
-      init_core_kmer<uint32_t>(&(cores[core_index]), kmer_view.value, it1,
+      init_core_kmer_xor<uint32_t>(&(cores[core_index]), kmer_view.value, it1,
                                   it1 + SYNCMER_K);
       core_index++;
     }
@@ -396,6 +426,8 @@ int main(int argc, char **argv) {
   for (const auto &p : dbg) {
     fprintf(out, "S\t%lu\t*\tLN:i:%d\tKC:i:%lu\n", p.second.index, LCMER_L,
             p.second.count);
+    // The code snippet provided seems to be a mix of 
+    // Explain: 
   }
   for (const auto &p : dbg) {
     lcmer ln = shift_lcmer(p.first);
@@ -405,6 +437,9 @@ int main(int argc, char **argv) {
               LCMER_L - 1);
     }
   }
+
+  
+
   fclose(out);
   return 0;
 }

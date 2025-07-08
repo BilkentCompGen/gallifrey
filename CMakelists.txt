@@ -25,9 +25,6 @@ set(CMAKE_PATH cmake)
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
 
-
-# target_compile_definitions(${PROJECT_NAME} PUBLIC T=100)
-
 include(FetchContent)
 FetchContent_Declare(
     cli11_proj
@@ -73,4 +70,4 @@ add_test(NAME TestBAM COMMAND lasm -i input.bam -o tst.fa)
 
 
 
-target_compile_definitions(${PROJECT_NAME} PUBLIC SYNCMER_RULE=OpenSyncmerRule SYNCMER_S=3 SYNCMER_T=3)
+target_compile_definitions(${PROJECT_NAME} PUBLIC SYNCMER_RULE=DensitySyncmerRule LCMER_L=128 SYNCMER_S=3 SYNCMER_T=100)
