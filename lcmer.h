@@ -1,16 +1,14 @@
 #ifndef LCMER_H
 #define LCMER_H
-#include <array>
 #include <algorithm>
+#include <array>
 uint32_t MurmurHash3_32(const void *key, int len, uint32_t seed);
-template<int N>
+template <int N>
 struct lcmer {
     std::array<uint32_t, N> data;
 
-    lcmer () {}
-    lcmer (auto it) {
-        std::copy(it, it + N, std::begin(data));
-    }
+    lcmer() {}
+    lcmer(auto it) { std::copy(it, it + N, std::begin(data)); }
 
     bool operator==(const lcmer &other) const {
         for (int i = 0; i < N; ++i) {
@@ -37,28 +35,31 @@ struct lcmer {
         }
     }
 
+    void set0(uint32_t new_core) { data[N - 1] = new_core; }
+    void setN(uint32_t new_core) { data[0] = new_core; }
+    static lcmer<N> left_shift(lcmer<N> l) {
+        for (int i = 1; i < N; ++i) {
+            l.data[i - 1] = l.data[i];
+        }
+        return l;
+    }
 
+    static lcmer<N> right_shift(lcmer<N> l) {
+        for (int i = N - 1; i > 0; --i) {
+            l.data[i] = l.data[i - 1];
+        }
+        return l;
+    }
+
+    uint32_t update_lcmer(uint32_t new_core) {
+        uint32_t old_core = data[0];
+        for (int i = 1; i < N; ++i) {
+            data[i - 1] = data[i];
+        }
+        data[N - 1] = new_core;
+        return old_core;
+    }
 };
-template<int N>
-void lcmer_set0(lcmer<N> &l, uint32_t new_core) {
-    l.data[N - 1] = new_core;
-}
-template<int N>
-lcmer<N> shift_lcmer(lcmer<N> l) {
-    for (int i = 1; i < N; ++i) {
-        l.data[i - 1] = l.data[i];
-    }
-    return l;
-}
-template<int N>
-lcmer<N> update_lcmer(lcmer<N> l, uint32_t new_core) {
-    for (int i = 1; i < N; ++i) {
-        l.data[i - 1] = l.data[i];
-    }
-    l.data[N - 1] = new_core;
-    return l;
-}
-
 
 template <int N>
 struct std::hash<lcmer<N>> {
