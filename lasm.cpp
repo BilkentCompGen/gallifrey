@@ -233,11 +233,7 @@ struct lcp_read {
 struct dbg_value {
     size_t count;
     size_t index;
-    gtl::parallel_flat_hash_set<uint32_t,
-                                gtl::priv::hash_default_hash<uint32_t>,
-                                gtl::priv::hash_default_eq<uint32_t>,
-                                std::allocator<uint32_t>, 2, std::mutex>
-        next;
+    gtl::flat_hash_set<uint32_t> next;
 };
 lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
                                      int lcp_level) {
@@ -340,7 +336,7 @@ int main(int argc, char **argv) {
     bam1_t *bamdata = reader.init_data();
     using worktype = std::tuple<uint64_t, uint8_t *>;
     using mutex_type = std::mutex;
-    moodycamel::ConcurrentQueue<worktype> work_queue(10, 1, 0);
+    moodycamel::ConcurrentQueue<worktype> work_queue(32*threads, 1, 0);
     using dbg_value_type = dbg_value;
     using dbg_map_t = gtl::parallel_flat_hash_map<
         lcmer<LCMER_L>, dbg_value_type, std::hash<lcmer<LCMER_L>>,
@@ -445,6 +441,8 @@ int main(int argc, char **argv) {
     for (std::thread &t : consumers) {
         t.join();
     }
+
+    printf("Processed %lu reads\n", count.load());
     printf("Skipped %lu reads due to insufficient cores\n",
            skipped_reads_count.load());
     //   for (auto &p : core_counter) {
@@ -455,7 +453,7 @@ int main(int argc, char **argv) {
     }
 
     FILE *out = fopen(output.c_str(), "w");
-    fprintf(stderr, "Something printed\n");
+
     for (const auto &p : dbg) {
         fprintf(out, "S\t%lu\t*\tLN:i:%d\tKC:i:%lu\n", p.second.index, LCMER_L,
                 p.second.count);

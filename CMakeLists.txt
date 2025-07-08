@@ -64,7 +64,7 @@ FetchContent_Declare(
 
 
 
-target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue)
+target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue pthread)
 
 
 add_test(NAME TestBAM COMMAND lasm -i input.bam -o tst.fa)
