@@ -52,8 +52,9 @@ lcmer<N> shift_lcmer(lcmer<N> l) {
 }
 template<int N>
 lcmer<N> update_lcmer(lcmer<N> l, uint32_t new_core) {
-    // std::shift_left( std::begin(l.data), std::end(l.data), 1);
-    shift_lcmer(l);
+    for (int i = 1; i < N; ++i) {
+        l.data[i - 1] = l.data[i];
+    }
     l.data[N - 1] = new_core;
     return l;
 }

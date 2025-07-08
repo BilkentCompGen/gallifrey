@@ -1,9 +1,10 @@
 #include <CLI/CLI.hpp>
 #include <cstdint>
 #define LCPTOOLS_IMPL
-#include "ext/lcptools/lcptools_ho.h"
 #include "ext/bloom_filter.hpp"
+#include "ext/lcptools/lcptools_ho.h"
 #include "lcmer.h"
+#include "syncmer.h"
 #include <concurrentqueue.h>
 #include <gtl/phmap.hpp>
 #include <gtl/vector.hpp>
@@ -11,7 +12,6 @@
 #include <htslib/sam.h>
 #include <iostream>
 #include <string>
-
 using std::cout;
 using std::endl;
 using std::string;
@@ -24,6 +24,31 @@ struct core_view {
 // DCT
 // CORE
 // DEEPEN
+
+template <int K, typename INT_TYPE = uint32_t> struct KmerViewOnNibbles {
+  using int_type = INT_TYPE;
+  static constexpr int k = K;
+  int_type value;
+  static constexpr int_type KMASK = ((int_type)1 << k) - 1;
+  uint8_t nibble_mask = 15;
+  KmerViewOnNibbles() : value{0} {}
+
+  int fill(const uint8_t *data_address) {
+    int i;
+    for (i = 0; i < k; i++) {
+      move_get(data_address, i);
+    }
+    return i;
+  }
+  int_type move_get(const uint8_t *data_address, int index) {
+    value <<= 2;
+    if constexpr (KMASK != -1)
+      value &= KMASK;
+    value |= bam_seqi(data_address, index);
+    return value;
+  }
+};
+
 void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
                    uint64_t si, uint64_t ei) {
   cr->start = si;
@@ -35,6 +60,37 @@ void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
   cr->label |= (bam_seqi(data, si + distance - 1));
   cr->bit_rep = 0x8000000000000000 | cr->label;
   cr->bit_size = 2 * distance;
+}
+
+template <typename T, int K>
+void init_core_kmer(struct core *cr, T Kval, uint64_t si, uint64_t ei) {
+  cr->start = si;
+  cr->end = ei;
+  cr->label = 0;
+  cr->label |= Kval;
+  cr->bit_rep = 0x8000000000000000 | cr->label;
+  cr->bit_size = 2 * K;
+}
+#define KVAL 8
+syncmer::syncmer_precomputed<syncmer::DensitySyncmerRule<KVAL, 3, 25, uint64_t>> table;
+template <int K>
+uint64_t parse1_syncmers(const uint8_t *data, int64_t len, struct core *cores) {
+  int core_index = 0;
+  KmerViewOnNibbles<K, uint32_t> kmer_view;
+  int64_t it1 = kmer_view.fill(data);
+  // find lcp cores
+  for (; it1 + K < len; it1++) {
+
+    if (table[kmer_view.value]) {
+      init_core_kmer<uint32_t, K>(&(cores[core_index]), kmer_view.value, it1,
+                                  it1 + K);
+      core_index++;
+    }
+    kmer_view.move_get(data,it1);
+    // cout << "None\n";
+  }
+  // cout << "CORESSS" << it1 << "\t" << it2 << "\n";
+  return core_index;
 }
 
 uint64_t parse1_bam(const uint8_t *data, int64_t len, struct core *cores) {
@@ -52,50 +108,51 @@ uint64_t parse1_bam(const uint8_t *data, int64_t len, struct core *cores) {
       continue;
     }
 
-    // check for RINT core
-    if (bam_seqi(data, (it1 + 1)) == bam_seqi(data, (it1 + 2))) {
+    // // check for RINT core
+    // if (bam_seqi(data, (it1 + 1)) == bam_seqi(data, (it1 + 2))) {
 
-      // count middle characters
-      uint32_t middle_count = 1;
-      int64_t temp = it1 + 2;
-      while (temp < len && bam_seqi(data, (temp - 1)) == bam_seqi(data, temp)) {
-        temp++;
-        middle_count++;
-      }
-      if (temp != len) {
-        // check if there is any SSEQ cores left behind
-        if (it2 < it1 && last_invalid_char_index < it2 - 1) {
-          init_core1bam(&(cores[core_index]), data, it1 - it2 + 2, it2 - 1,
-                        it1 + 1);
-          core_index++;
-        }
+    //   // count middle characters
+    //   uint32_t middle_count = 1;
+    //   int64_t temp = it1 + 2;
+    //   while (temp < len && bam_seqi(data, (temp - 1)) == bam_seqi(data,
+    //   temp)) {
+    //     temp++;
+    //     middle_count++;
+    //   }
+    //   if (temp != len) {
+    //     // check if there is any SSEQ cores left behind
+    //     if (it2 < it1 && last_invalid_char_index < it2 - 1) {
+    //       init_core1bam(&(cores[core_index]), data, it1 - it2 + 2, it2 - 1,
+    //                     it1 + 1);
+    //       core_index++;
+    //     }
 
-        // create RINT core
-        it2 = it1 + 2 + middle_count;
-        init_core1bam(&(cores[core_index]), data, it2 - it1, it1, it2);
-        core_index++;
+    //     // create RINT core
+    //     it2 = it1 + 2 + middle_count;
+    //     init_core1bam(&(cores[core_index]), data, it2 - it1, it1, it2);
+    //     core_index++;
 
-        continue;
-      }
-    }
+    //     continue;
+    //   }
+    // }
 
-    if (bam_seqi(data, it1) > bam_seqi(data, (it1 + 1)) &&
-        bam_seqi(data, (it1 + 1)) < bam_seqi(data, (it1 + 2))) {
+    // if (bam_seqi(data, it1) > bam_seqi(data, (it1 + 1)) &&
+    //     bam_seqi(data, (it1 + 1)) < bam_seqi(data, (it1 + 2))) {
 
-      // check if there is any SSEQ cores left behind
-      if (it2 < it1 && last_invalid_char_index < it2 - 1) {
-        init_core1bam(&(cores[core_index]), data, it1 - it2 + 2, it2 - 1,
-                      it1 + 1);
-        core_index++;
-      }
+    //   // check if there is any SSEQ cores left behind
+    //   if (it2 < it1 && last_invalid_char_index < it2 - 1) {
+    //     init_core1bam(&(cores[core_index]), data, it1 - it2 + 2, it2 - 1,
+    //                   it1 + 1);
+    //     core_index++;
+    //   }
 
-      // create LMIN core
-      it2 = it1 + 3;
-      init_core1bam(&(cores[core_index]), data, it2 - it1, it1, it2);
-      core_index++;
+    //   // create LMIN core
+    //   it2 = it1 + 3;
+    //   init_core1bam(&(cores[core_index]), data, it2 - it1, it1, it2);
+    //   core_index++;
 
-      continue;
-    }
+    //   continue;
+    // }
 
     if (0 == it1) {
       continue;
@@ -107,12 +164,12 @@ uint64_t parse1_bam(const uint8_t *data, int64_t len, struct core *cores) {
         bam_seqi(data, (it1 - 1)) <= bam_seqi(data, (it1)) &&
         bam_seqi(data, (it1 + 2)) >= bam_seqi(data, (it1 + 3))) {
 
-      // check if there is any SSEQ cores left behind
-      if (it2 < it1 && last_invalid_char_index < it2 - 1) {
-        init_core1bam(&(cores[core_index]), data, it1 - it2 + 2, it2 - 1,
-                      it1 + 1);
-        core_index++;
-      }
+      // // check if there is any SSEQ cores left behind
+      // if (it2 < it1 && last_invalid_char_index < it2 - 1) {
+      //   init_core1bam(&(cores[core_index]), data, it1 - it2 + 2, it2 - 1,
+      //                 it1 + 1);
+      //   core_index++;
+      // }
 
       // create LMAX core
       it2 = it1 + 3;
@@ -134,7 +191,7 @@ void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len) {
   lps_ptr->size = 0;
   lps_ptr->cores =
       (struct core *)malloc((len / CONSTANT_FACTOR) * sizeof(struct core));
-  lps_ptr->size = parse1_bam(data, len, lps_ptr->cores);
+  lps_ptr->size = parse1_syncmers<KVAL>(data, len, lps_ptr->cores);
 }
 
 struct lcp_read {
@@ -145,10 +202,13 @@ struct lcp_read {
     pos.reserve(size);
   }
 };
-struct dbg_value{
+struct dbg_value {
   size_t count;
   size_t index;
-  gtl::vector<uint32_t> next;
+  gtl::parallel_flat_hash_set<uint32_t, gtl::priv::hash_default_hash<uint32_t>,
+                              gtl::priv::hash_default_eq<uint32_t>,
+                              std::allocator<uint32_t>, 2, std::mutex>
+      next;
 };
 lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
                                      int lcp_level) {
@@ -160,6 +220,7 @@ lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
   lcp_read lr;
   lr.reserve(str.size);
   for (int i = 0; i < str.size; ++i) {
+    // fprintf(stderr, "%u\n", str.cores[i].bit_size);
     lr.cores.emplace_back(str.cores[i].label);
     lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
   }
@@ -199,6 +260,16 @@ struct BAMReader {
 
 #define L 8
 int main(int argc, char **argv) {
+
+  // syncmer::syncmer_precomputed<syncmer::OpenSyncmerRule<8, 3, 4, uint16_t>>
+  //     table;
+  // // syncmer::syncmer_precomputed<syncmer::DensitySyncmerRule<8, 1, 100,
+  // // uint16_t>> table;
+  // for (size_t i = 0; i < table.size; ++i) {
+  //   printf("%lx \t %s\n", i, table[i] ? "syncmer" : "not syncmer");
+  // }
+  // return 0;
+
   CLI::App app("lasm");
 
   string input;
@@ -214,14 +285,12 @@ int main(int argc, char **argv) {
   cout << "Input: " << input << endl;
   cout << "Output: " << output << endl;
 
-
   bloom_parameters bparam;
   bparam.projected_element_count = 1'000'000'000;
-  bparam.false_positive_probability = 0.0001; 
+  bparam.false_positive_probability = 0.0001;
   bparam.random_seed = 0xA5A5A5A5;
   bparam.compute_optimal_parameters();
   bloom_filter bfil(bparam);
-
 
   uint8_t *data = NULL;
 
@@ -237,65 +306,69 @@ int main(int argc, char **argv) {
       lcmer<L>, dbg_value_type, std::hash<lcmer<L>>,
       gtl::priv::hash_default_eq<lcmer<L>>,
       std::allocator<std::pair<const lcmer<L>, dbg_value_type>>, 4, mutex_type>;
-  std::vector<std::thread> consumers;
+  using counter = gtl::parallel_flat_hash_map<
+      size_t,size_t, std::hash<size_t>,
+      gtl::priv::hash_default_eq<size_t>,
+      std::allocator<std::pair<size_t, size_t>>, 4, mutex_type>;
 
+    
+  std::vector<std::thread> consumers;
+  counter core_counter;
   dbg_map_t dbg;
   for (int tid = 0; tid < threads; ++tid) {
 
-    consumers.emplace_back([&]() {
-      uint64_t lcmer_index = tid;
-      worktype work;
-      while (!done.load() || work_queue.size_approx() != 0) {
-        if (!work_queue.try_dequeue(work)) {
-          continue;
-        }
-        lcp_read lr = parse_cores_from_bam_record(std::get<1>(work),
-                                                  std::get<0>(work), lcp_level);
-        //cout << bamdata->core.l_qseq << " to " << lr.cores.size() << "\n";
-        if (lr.cores.size() < L + 2) {
-          free(std::get<1>(work));
-          continue;
-        }
-        lcmer<L> l{lr.cores.begin()};
-        for (size_t i = L; i < lr.cores.size(); ++i) {
-          if(!bfil.contains(l)){
-            bfil.insert(l);
-            update_lcmer(l, lr.cores[i]);
-            continue;
+    consumers.emplace_back(
+        [&](int t) {
+          uint64_t lcmer_index = 0;
+          worktype work;
+          while (!done.load() || work_queue.size_approx() > 0) {
+            if (!work_queue.try_dequeue(work)) {
+              continue;
+            }
+            lcp_read lr = parse_cores_from_bam_record(
+                std::get<1>(work), std::get<0>(work), lcp_level);
+            // cout << bamdata->core.l_qseq << " to " << lr.cores.size() <<
+            // "\n";
+            core_counter[lr.cores.size()]++;
+            if (lr.cores.size() < L + 2) {
+              free(std::get<1>(work));
+              continue;
+            }
+            lcmer<L> l{lr.cores.begin()};
+            for (size_t i = L; i < lr.cores.size(); ++i) {
+              // if(!bfil.contains(l)){
+              //   bfil.insert(l);
+              //   update_lcmer(l, lr.cores[i]);
+              //   continue;
+              // }
+              dbg.lazy_emplace_l(
+                  l,
+                  [&](dbg_map_t::value_type &val) {
+                    val.second.count++;
+                    val.second.next.insert(lr.cores[i]);
+                  },
+                  [&](const dbg_map_t::constructor &ctor) {
+                    ctor(l,
+                         dbg_value_type{1UL, lcmer_index | t, {lr.cores[i]}});
+                    lcmer_index += 128;
+                  });
+              l = update_lcmer(l, lr.cores[i]);
+              count.fetch_add(1);
+            }
+            // if(!bfil.contains(l)){
+            //     bfil.insert(l);
+            //     continue;
+            // }
+            dbg.lazy_emplace_l(
+                l, [](dbg_map_t::value_type &val) { val.second.count++; },
+                [&](const dbg_map_t::constructor &ctor) {
+                  ctor(l, dbg_value_type{1UL, lcmer_index | t, {}});
+                  lcmer_index += 128;
+                });
+            free(std::get<1>(work));
           }
-          dbg.lazy_emplace_l(
-              l,
-              [&](dbg_map_t::value_type &val) {
-                val.second.count++;
-                auto &vec = val.second.next;
-                if (std::find(vec.begin(), vec.end(), lr.cores[i]) !=
-                    vec.end()) { // TODO check performance.
-                  vec.push_back(lr.cores[i]);
-                }
-              },
-              [&](const dbg_map_t::constructor &ctor) {
-                ctor(l, dbg_value_type{1UL, lcmer_index,
-                                        gtl::vector<uint32_t>{lr.cores[i]}});
-                lcmer_index += 128;
-              });
-          update_lcmer(l, lr.cores[i]);
-          count.fetch_add(1);
-        }
-        if(!bfil.contains(l)){
-            bfil.insert(l);
-            continue;
-        }
-        dbg.lazy_emplace_l(
-            l, [&](dbg_map_t::value_type &val) { 
-              val.second.count++; 
-            },
-            [&](const dbg_map_t::constructor &ctor) {
-              ctor(l, dbg_value_type{1UL, lcmer_index, gtl::vector<uint32_t>{}});
-              lcmer_index += 128;
-            });
-        free(std::get<1>(work));
-      }
-    });
+        },
+        tid);
   }
 
   while (reader.read(bamdata)) {
@@ -312,22 +385,27 @@ int main(int argc, char **argv) {
   for (std::thread &t : consumers) {
     t.join();
   }
+  for(auto &p: core_counter){
+    fprintf(stderr, "CC\t%lu\t%lu\n", p.first, p.second);
+  }
   if (bamdata) {
     bam_destroy1(bamdata);
   }
 
-  FILE *out = fopen(output.c_str(), "w+");
-
-   for (const auto &p : dbg) {
-        fprintf(out, "S\t%lu\t*\tLN:i:%d\n", p.second.index, L);
+  FILE *out = fopen(output.c_str(), "w");
+  fprintf(stderr, "Something printed\n");
+  for (const auto &p : dbg) {
+    fprintf(out, "S\t%lu\t*\tLN:i:%d\tKC:i:%lu\n", p.second.index, L,
+            p.second.count);
+  }
+  for (const auto &p : dbg) {
+    lcmer ln = shift_lcmer(p.first);
+    for (uint32_t next : p.second.next) {
+      lcmer_set0(ln, next);
+      fprintf(out, "L\t%lu\t+\t%lu\t+\t%dM\n", p.second.index, dbg[ln].index,
+              L - 1);
     }
-    for (const auto &p : dbg) {
-        lcmer ln = shift_lcmer(p.first);
-        for (uint32_t next : p.second.next) {
-            lcmer_set0(ln, next);
-              fprintf(out,"L\t%lu\t+\t%lu\t+\t%dM\n",p.second.index,dbg[ln].index,L-1);
-        }
-    }
-    fclose(out);
+  }
+  fclose(out);
   return 0;
 }
