@@ -12,6 +12,9 @@
 #include <htslib/sam.h>
 #include <iostream>
 #include <string>
+
+#include "config.h"
+
 using std::cout;
 using std::endl;
 using std::string;
@@ -20,14 +23,11 @@ struct core_view {
   core *from;
   core *to;
 };
-// TODO SYNCMER
-// DCT
-// CORE
-// DEEPEN
 
-template <int K, typename INT_TYPE = uint32_t> struct KmerViewOnNibbles {
+
+template <int _K, typename INT_TYPE = uint32_t> struct KmerViewOnNibbles {
   using int_type = INT_TYPE;
-  static constexpr int k = K;
+  static constexpr int k = _K;
   int_type value;
   static constexpr int_type KMASK = ((int_type)1 << k) - 1;
   uint8_t nibble_mask = 15;
@@ -62,28 +62,27 @@ void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
   cr->bit_size = 2 * distance;
 }
 
-template <typename T, int K>
-void init_core_kmer(struct core *cr, T Kval, uint64_t si, uint64_t ei) {
+template <typename _T>
+void init_core_kmer(struct core *cr, _T Kval, uint64_t si, uint64_t ei) {
   cr->start = si;
   cr->end = ei;
   cr->label = 0;
   cr->label |= Kval;
   cr->bit_rep = 0x8000000000000000 | cr->label;
-  cr->bit_size = 2 * K;
+  cr->bit_size = 2 * SYNCMER_K;
 }
-#define KVAL 8
-syncmer::syncmer_precomputed<syncmer::DensitySyncmerRule<KVAL, 3, 25, uint64_t>> table;
-template <int K>
+
+syncmer::syncmer_precomputed<syncmer::SYNCMER_RULE<SYNCMER_K, SYNCMER_S, SYNCMER_T>> table;
 uint64_t parse1_syncmers(const uint8_t *data, int64_t len, struct core *cores) {
   int core_index = 0;
-  KmerViewOnNibbles<K, uint32_t> kmer_view;
+  KmerViewOnNibbles<SYNCMER_K, uint32_t> kmer_view;
   int64_t it1 = kmer_view.fill(data);
   // find lcp cores
-  for (; it1 + K < len; it1++) {
+  for (; it1 + SYNCMER_K < len; it1++) {
 
     if (table[kmer_view.value]) {
-      init_core_kmer<uint32_t, K>(&(cores[core_index]), kmer_view.value, it1,
-                                  it1 + K);
+      init_core_kmer<uint32_t>(&(cores[core_index]), kmer_view.value, it1,
+                                  it1 + SYNCMER_K);
       core_index++;
     }
     kmer_view.move_get(data,it1);
@@ -99,7 +98,7 @@ uint64_t parse1_bam(const uint8_t *data, int64_t len, struct core *cores) {
   int64_t it2 = len;
 
   int core_index = 0;
-  int64_t last_invalid_char_index = -1;
+  // int64_t last_invalid_char_index = -1;
 
   // find lcp cores
   for (; it1 + 2 < len; it1++) {
@@ -191,7 +190,7 @@ void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len) {
   lps_ptr->size = 0;
   lps_ptr->cores =
       (struct core *)malloc((len / CONSTANT_FACTOR) * sizeof(struct core));
-  lps_ptr->size = parse1_syncmers<KVAL>(data, len, lps_ptr->cores);
+  lps_ptr->size = parse1_syncmers(data, len, lps_ptr->cores);
 }
 
 struct lcp_read {
@@ -258,7 +257,7 @@ struct BAMReader {
   }
 };
 
-#define L 8
+
 int main(int argc, char **argv) {
 
   // syncmer::syncmer_precomputed<syncmer::OpenSyncmerRule<8, 3, 4, uint16_t>>
@@ -303,9 +302,9 @@ int main(int argc, char **argv) {
   moodycamel::ConcurrentQueue<worktype> work_queue(10, 1, 0);
   using dbg_value_type = dbg_value;
   using dbg_map_t = gtl::parallel_flat_hash_map<
-      lcmer<L>, dbg_value_type, std::hash<lcmer<L>>,
-      gtl::priv::hash_default_eq<lcmer<L>>,
-      std::allocator<std::pair<const lcmer<L>, dbg_value_type>>, 4, mutex_type>;
+      lcmer<LCMER_L>, dbg_value_type, std::hash<lcmer<LCMER_L>>,
+      gtl::priv::hash_default_eq<lcmer<LCMER_L>>,
+      std::allocator<std::pair<const lcmer<LCMER_L>, dbg_value_type>>, 4, mutex_type>;
   using counter = gtl::parallel_flat_hash_map<
       size_t,size_t, std::hash<size_t>,
       gtl::priv::hash_default_eq<size_t>,
@@ -330,12 +329,12 @@ int main(int argc, char **argv) {
             // cout << bamdata->core.l_qseq << " to " << lr.cores.size() <<
             // "\n";
             core_counter[lr.cores.size()]++;
-            if (lr.cores.size() < L + 2) {
+            if (lr.cores.size() < LCMER_L + 2) {
               free(std::get<1>(work));
               continue;
             }
-            lcmer<L> l{lr.cores.begin()};
-            for (size_t i = L; i < lr.cores.size(); ++i) {
+            lcmer<LCMER_L> l{lr.cores.begin()};
+            for (size_t i = LCMER_L; i < lr.cores.size(); ++i) {
               // if(!bfil.contains(l)){
               //   bfil.insert(l);
               //   update_lcmer(l, lr.cores[i]);
@@ -395,7 +394,7 @@ int main(int argc, char **argv) {
   FILE *out = fopen(output.c_str(), "w");
   fprintf(stderr, "Something printed\n");
   for (const auto &p : dbg) {
-    fprintf(out, "S\t%lu\t*\tLN:i:%d\tKC:i:%lu\n", p.second.index, L,
+    fprintf(out, "S\t%lu\t*\tLN:i:%d\tKC:i:%lu\n", p.second.index, LCMER_L,
             p.second.count);
   }
   for (const auto &p : dbg) {
@@ -403,7 +402,7 @@ int main(int argc, char **argv) {
     for (uint32_t next : p.second.next) {
       lcmer_set0(ln, next);
       fprintf(out, "L\t%lu\t+\t%lu\t+\t%dM\n", p.second.index, dbg[ln].index,
-              L - 1);
+              LCMER_L - 1);
     }
   }
   fclose(out);

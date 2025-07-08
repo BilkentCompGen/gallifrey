@@ -123,7 +123,7 @@ struct DensitySyncmerRule {
       (std::numeric_limits<int_type>::max() / double(Denominator)) * Numerator;
   static int_type hash(int_type a) noexcept { return Hash{}(a); }
   static bool is_syncmer(int_type a) noexcept { return hash(a) < density; }
-  static bool is_syncmer(const smq<int_type, K> &q) noexcept { return false; }
+  static bool is_syncmer(const smq<int_type, _K> &) noexcept { return false; }
 };
 
 template <SyncmerRule Rule> struct syncmer_precomputed { // TODO maybe bloom filter version

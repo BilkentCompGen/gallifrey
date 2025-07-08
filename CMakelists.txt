@@ -11,12 +11,8 @@ endif()
 set(CMAKE_CXX_FLAGS "-Wall -Wextra")
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-set(CMAKE_CXX_FLAGS "-O3")
-set(CMAKE_CXX_FLAGS "-march=native")
-# set(CMAKE_CXX_FLAGS "-mtune=native")
-set(CMAKE_CXX_FLAGS "-ftree-vectorize")
+set(CMAKE_CXX_FLAGS "-O3 -march=native -ftree-vectorize  -Wno-interference-size")
 endif()
-
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(HTS REQUIRED htslib)
 include_directories(${HTS_INCLUDE_DIRS})
@@ -29,6 +25,8 @@ set(CMAKE_PATH cmake)
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
 
+
+# target_compile_definitions(${PROJECT_NAME} PUBLIC T=100)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -67,7 +65,12 @@ FetchContent_Declare(
 
 
 
+
 target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue)
 
 
 add_test(NAME TestBAM COMMAND lasm -i input.bam -o tst.fa)
+
+
+
+target_compile_definitions(${PROJECT_NAME} PUBLIC SYNCMER_RULE=OpenSyncmerRule SYNCMER_S=3 SYNCMER_T=3)
