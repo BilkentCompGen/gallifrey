@@ -1,5 +1,7 @@
 #include <CLI/CLI.hpp>
 #include <cstdint>
+
+#include "CLI/CLI.hpp"
 #define LCPTOOLS_IMPL
 #include <concurrentqueue.h>
 #include <htslib/hts.h>
@@ -15,7 +17,7 @@
 #include "ext/lcptools/lcptools_ho.h"
 #include "lcmer.h"
 #include "syncmer.h"
-
+#include "histogram.h"
 using std::cout;
 using std::endl;
 using std::string;
@@ -283,69 +285,20 @@ struct BAMReader {
     }
 };
 
-int main(int argc, char **argv) {
-    // syncmer::syncmer_precomputed<syncmer::OpenSyncmerRule<8, 3, 4, uint16_t>>
-    //     table;
-    // // syncmer::syncmer_precomputed<syncmer::DensitySyncmerRule<8, 1, 100,
-    // // uint16_t>> table;
-    // for (size_t i = 0; i < table.size; ++i) {
-    //   printf("%lx \t %s\n", i, table[i] ? "syncmer" : "not syncmer");
-    // }
-    // return 0;
+using mutex_type = std::mutex;
+using worktype = std::tuple<uint64_t, uint8_t *>;
 
-    CLI::App app("lasm");
+using dbg_value_type = dbg_value;
+using dbg_map_t = gtl::parallel_flat_hash_map<
+    lcmer<LCMER_L>, dbg_value_type, std::hash<lcmer<LCMER_L>>,
+    gtl::priv::hash_default_eq<lcmer<LCMER_L>>,
+    std::allocator<std::pair<const lcmer<LCMER_L>, dbg_value_type>>, 4,
+    mutex_type>;
 
-    string input;
-    string output;
-    int lcp_level;
-    int threads = 8;
-    app.add_option("input", input, "Input bam file")->required();
-    app.add_option("output", output, "Output gfa file")->required();
-    app.add_option("-l,--level", lcp_level, "LCP level to compute")->required();
-    app.add_option("-t,--threads", threads, "Number of threads")
-        ->capture_default_str();
-
-    bloom_parameters bparam;
-    bparam.projected_element_count = 1'000'000;
-    bparam.false_positive_probability = 0.0001;
-    bparam.random_seed = 0xA5A5A5A5;
-    auto bfg =
-        app.add_option_group("bloomfilter", "Parameters to setup bloom filter");
-    bfg->add_option("--projected-element-count", bparam.projected_element_count,
-                    "Projected element count")
-        ->capture_default_str();
-    bfg->add_option("--false-positive-probability",
-                    bparam.false_positive_probability,
-                    "False positive probability")
-        ->capture_default_str();
-    bfg->add_option("--random-seed", bparam.random_seed, "Random seed")
-        ->capture_default_str();
-
-    CLI11_PARSE(app, argc, argv);
-
-    cout << "Input: " << input << endl;
-    cout << "Output: " << output << endl;
-
-    bparam.compute_optimal_parameters();
-    bloom_filter bfil(bparam);
-
-    uint8_t *data = NULL;
-
-    std::atomic<int> count;
-    BAMReader reader(input);
-    bam1_t *bamdata = reader.init_data();
-    using worktype = std::tuple<uint64_t, uint8_t *>;
-    using mutex_type = std::mutex;
-    moodycamel::ConcurrentQueue<worktype> work_queue(32*threads, 1, 0);
-    using dbg_value_type = dbg_value;
-    using dbg_map_t = gtl::parallel_flat_hash_map<
-        lcmer<LCMER_L>, dbg_value_type, std::hash<lcmer<LCMER_L>>,
-        gtl::priv::hash_default_eq<lcmer<LCMER_L>>,
-        std::allocator<std::pair<const lcmer<LCMER_L>, dbg_value_type>>, 4,
-        mutex_type>;
-    using counter = gtl::parallel_flat_hash_map<
-        size_t, size_t, std::hash<size_t>, gtl::priv::hash_default_eq<size_t>,
-        std::allocator<std::pair<size_t, size_t>>, 4, mutex_type>;
+dbg_map_t construct_dbg(string input, int threads, int lcp_level,
+                        bloom_filter &bfil) {
+    std::atomic<uint64_t> count;
+    moodycamel::ConcurrentQueue<worktype> work_queue(32 * threads, 1, 0);
 
     std::vector<std::thread> consumers;
     //   counter core_counter;
@@ -427,6 +380,10 @@ int main(int argc, char **argv) {
             },
             tid);
     }
+    uint8_t *data = NULL;
+
+    BAMReader reader(input);
+    bam1_t *bamdata = reader.init_data();
 
     while (reader.read(bamdata)) {
         // printf("NAME: %s\n", bam_get_qname(bamdata));
@@ -441,7 +398,6 @@ int main(int argc, char **argv) {
     for (std::thread &t : consumers) {
         t.join();
     }
-
     printf("Processed %lu reads\n", count.load());
     printf("Skipped %lu reads due to insufficient cores\n",
            skipped_reads_count.load());
@@ -451,24 +407,152 @@ int main(int argc, char **argv) {
     if (bamdata) {
         bam_destroy1(bamdata);
     }
+    return dbg;
+}
 
-    FILE *out = fopen(output.c_str(), "w");
-
+void print_dbg(FILE *out, const dbg_map_t &dbg) {
     for (const auto &p : dbg) {
         fprintf(out, "S\t%lu\t*\tLN:i:%d\tKC:i:%lu\n", p.second.index, LCMER_L,
                 p.second.count);
-        // The code snippet provided seems to be a mix of
-        // Explain:
     }
     for (const auto &p : dbg) {
         lcmer ln = lcmer<LCMER_L>::right_shift(p.first);
         for (uint32_t next : p.second.next) {
             ln.setN(next);
-            fprintf(out, "L\t%lu\t+\t%lu\t+\t%dM\n", dbg[ln].index,
+            if (dbg.find(ln) == dbg.end()) {
+                fprintf(stderr, "Cannot find the lcmer!\n");
+                continue;
+            }
+            fprintf(out, "L\t%lu\t+\t%lu\t+\t%dM\n", dbg.at(ln).index,
                     p.second.index, LCMER_L - 1);
         }
     }
+}
 
-    fclose(out);
+int asm_program(CLI::App &app) {
+    string input;
+    string output;
+    int lcp_level;
+    int threads = 8;
+    app.add_option("input", input, "Input bam file")->required();
+    app.add_option("output", output, "Output gfa file")->required();
+    app.add_option("-l,--level", lcp_level, "LCP level to compute")->required();
+    app.add_option("-t,--threads", threads, "Number of threads")
+        ->capture_default_str();
+
+    bloom_parameters bparam;
+    bparam.projected_element_count = 1'000'000;
+    bparam.false_positive_probability = 0.0001;
+    bparam.random_seed = 0xA5A5A5A5;
+    auto bfg =
+        app.add_option_group("bloomfilter", "Parameters to setup bloom filter");
+    bfg->add_option("--projected-element-count", bparam.projected_element_count,
+                    "Projected element count")
+        ->capture_default_str();
+    bfg->add_option("--false-positive-probability",
+                    bparam.false_positive_probability,
+                    "False positive probability")
+        ->capture_default_str();
+    bfg->add_option("--random-seed", bparam.random_seed, "Random seed")
+        ->capture_default_str();
+
+    app.callback([&]() {
+        cout << "Input: " << input << endl;
+        cout << "Output: " << output << endl;
+
+        bparam.compute_optimal_parameters();
+        bloom_filter bfil(bparam);
+
+        dbg_map_t dbg = construct_dbg(input, threads, lcp_level, bfil);
+
+        FILE *out = fopen(output.c_str(), "w");
+        print_dbg(out, dbg);
+        fclose(out);
+    });
+
+    return 0;
+}
+
+template <class T>
+struct stat_accu {
+    T count;
+    T mean;
+    T dS;
+    T min;
+    T max;
+
+    stat_accu() : count(0), mean(0), dS(0), min(0), max(0) {}
+
+    void update(T val) {
+        count++;
+        auto mean_dif = (val - mean) / count;
+        auto new_mean = mean + mean_dif;
+
+        auto dS_dif = (val - new_mean) * (val - mean);
+        auto new_dS = dS + dS_dif;
+
+        mean = new_mean;
+        dS = new_dS;
+    }
+
+    constexpr T variance() const { return dS / count; }
+
+    constexpr T stddev() const { return sqrt(variance()); }
+};
+
+void stats_program(CLI::App &app) {
+    string *input = new string;
+    uint64_t *update_frequency = new uint64_t{100};
+    app.add_option("input", *input, "Input bam file")->required();
+    app.add_option("--update-frequency", *update_frequency,"Update frequency")->capture_default_str();
+    app.callback([input, update_frequency]() {
+        BAMReader reader(*input);
+        bam1_t *bamdata = reader.init_data();
+        // uint8_t *data;
+        // uint64_t read_count;
+        uint64_t base_count = 0;
+
+        gtl::flat_hash_map<string, stat_accu<double>> stats;
+        uint64_t read_count = 0;
+        printf("\n");
+        histo histogram{ 100, 50, 20};
+        while (reader.read(bamdata)) {
+            // printf("NAME: %s\n", bam_get_qname(bamdata));
+            // data = bam_get_seq(bamdata);
+            // uint8_t *data_copy = (uint8_t *)malloc(
+                // bamdata->core.l_qseq / 2 + 1);  // TODO Fix the extra memory
+
+            stats["length"].update(bamdata->core.l_qseq);
+            base_count += bamdata->core.l_qseq;
+            histogram.push(bamdata->core.l_qseq);
+            if((read_count % *update_frequency) == 0){
+                printf(
+                    "\rcount: %llu\tbase-count: %llu\t length(µ,σ): %.2lf %.2lf    "
+                    "                       \n",
+                    read_count, base_count, stats["length"].mean,
+                    stats["length"].stddev());
+                    fflush(stdout);
+                histogram.reroll(stdout, 1+histogram.print(stdout));
+            }
+            ++read_count;
+        }
+        printf("\rcount: %llu\tbase-count: %llu\t length(µ,σ): %.2lf %.2lf\n",
+               read_count, base_count, stats["length"].mean,
+               stats["length"].stddev());
+        histogram.print(stdout);
+        return 0;
+    });
+}
+
+int main(int argc, char **argv) {
+    CLI::App app("lasm");
+    app.require_subcommand(1);
+    app.set_help_all_flag("--help-all", "Expand all help");
+    auto *hifi_prog = app.add_subcommand("hifi", "run hifi assembly");
+    asm_program(*hifi_prog);
+    auto *stats_prog =
+        app.add_subcommand("bam-stats", "Print stats on input bam");
+    stats_program(*stats_prog);
+    CLI11_PARSE(app, argc, argv);
     return 0;
 }
