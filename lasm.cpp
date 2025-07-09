@@ -6,7 +6,15 @@
 #include <concurrentqueue.h>
 #include <htslib/hts.h>
 #include <htslib/sam.h>
+#include <htslib/bgzf.h>
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <htslib/bgzf.h>
+#include <htslib/hfile.h>
+#include "endian.h"   // for le16toh()
 #include <gtl/phmap.hpp>
 #include <gtl/vector.hpp>
 #include <iostream>
@@ -254,14 +262,15 @@ lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
     free_lps(&str);
     return lr;
 }
-
 struct BAMReader {
     string filename;
     samFile *fp;
     sam_hdr_t *hdr;
 
-    BAMReader(const string &filename) : fp{sam_open(filename.c_str(), "rb")} {
+    BAMReader(const string &filename, int threads=2) : fp{sam_open(filename.c_str(), "rb")} {
         this->filename = filename;
+        // bgzf_mt(fp->fp.bgzf, 2, 0);
+        // hts_set_threads(fp,threads);
         if (!(hdr = sam_hdr_read(fp))) {
             throw "Cannot read header from file!";
         }
@@ -276,6 +285,20 @@ struct BAMReader {
     }
 
     bool read(bam1_t *bamdata) { return sam_read1(fp, hdr, bamdata) >= 0; }
+    off_t tell() {
+        if(fp->is_bgzf){
+            return bgzf_tell(fp->fp.bgzf);
+        }
+        return -199;    
+    }
+    int seek(off_t offset){
+        if (fp->is_bgzf){
+            // return hseek(fp->fp.bgzf->fp, offset, SEEK_SET);
+            return bgzf_seek(fp->fp.bgzf, offset, SEEK_SET);
+        }
+        else
+            return -199;
+    }
     bam1_t *init_data() {
         bam1_t *data = bam_init1();
         if (data == NULL) {
@@ -429,7 +452,9 @@ void print_dbg(FILE *out, const dbg_map_t &dbg) {
     }
 }
 
-int asm_program(CLI::App &app) {
+int asm_program(CLI::App &parent) {
+    auto *app_ = parent.add_subcommand("hifi", "run hifi assembly");
+    auto &app = *app_;
     std::shared_ptr<string> input { new string};
     std::shared_ptr<string> output { new string};
     std::shared_ptr<int> lcp_level{ new int};
@@ -439,7 +464,7 @@ int asm_program(CLI::App &app) {
     app.add_option("-l,--level", *lcp_level, "LCP level to compute")->required();
     app.add_option("-t,--threads", *threads, "Number of threads")
         ->capture_default_str();
-
+    
     std::shared_ptr<bloom_parameters> bparam{new bloom_parameters};
     bparam->projected_element_count = 1'000'000;
     bparam->false_positive_probability = 0.0001;
@@ -500,7 +525,9 @@ struct stat_accu {
     constexpr T stddev() const { return sqrt(variance()); }
 };
 
-void stats_program(CLI::App &app) {
+void stats_program(CLI::App &parent) {
+    auto *app_ = parent.add_subcommand("bam-stats", "Print stats on input bam");
+    auto &app = *app_;
     std::shared_ptr<string> input {new string};
     std::shared_ptr<uint64_t> update_frequency {new uint64_t{100}};
     app.add_option("input", *input, "Input bam file")->required();
@@ -543,16 +570,153 @@ void stats_program(CLI::App &app) {
         return 0;
     });
 }
+typedef struct {
+    off_t  start;    // byte‐offset of the BGZF block in file
+    uint32_t len;    // total block length in bytes (header+payload+footer)
+} bgzf_block_t;
 
+// Scan through fp, record each block's start+length.
+bgzf_block_t* index_bgzf_blocks(htsFile *hts_fp, size_t *n_blocks_out) {
+    BGZF *bgzf = hts_fp->fp.bgzf;
+    hFILE *hfp  = bgzf->fp;
+
+    // dynamic array of blocks
+    size_t cap = 256, n = 0;
+    bgzf_block_t *idx = (bgzf_block_t *) malloc(cap * sizeof(*idx));
+    if (!idx) { perror("malloc"); exit(1); }
+
+    // start at beginning of file
+    if ( hseek(hfp, 0, SEEK_SET) < 0 ) {
+        perror("hseek");
+        exit(1);
+    }
+
+    while (1) {
+        off_t block_start = htell(hfp);
+        unsigned char hdr[18];
+
+        // try to read the fixed‐size BGZF header
+        ssize_t got = hread(hfp, hdr, sizeof(hdr));
+        if ( got < (ssize_t)sizeof(hdr) ) {
+            // EOF or truncated → done
+            break;
+        }
+
+        // check GZIP+BGZF magic
+        if ( hdr[0]!=0x1f || hdr[1]!=0x8b || hdr[2]!=0x08 || hdr[3]!=0x04 ) {
+            fprintf(stderr, "bad BGZF magic at %lld\n", (long long)block_start);
+            break;
+        }
+
+        // read XLEN (bytes 10..11), should be ≥6; but we know standard BGZF uses 6
+        uint16_t xlen = le16toh(*(uint16_t*)(hdr+10));
+        if ( xlen < 6 ) {
+            fprintf(stderr, "unexpected XLEN=%u at %lld\n", xlen, (long long)block_start);
+            break;
+        }
+
+        // BSIZE is the last two bytes of the 18‐byte header (at hdr[16..17])
+        uint16_t bsize = le16toh(*(uint16_t*)(hdr+16));
+        // total block length = bsize + 1
+        uint32_t block_len = (uint32_t)bsize + 1;
+
+        // record it
+        if ( n == cap ) {
+            cap *= 2;
+            idx = (bgzf_block_t *) realloc(idx, cap * sizeof(*idx));
+            if (!idx) { perror("realloc"); exit(1); }
+        }
+        idx[n].start = block_start;
+        idx[n].len   = block_len;
+        n++;
+
+        // jump to the start of *next* block header
+        if ( hseek(hfp, block_start + block_len, SEEK_SET) < 0 ) {
+            perror("hseek next");
+            break;
+        }
+    }
+
+    *n_blocks_out = n;
+    return idx;
+}
+void process_each_block(const char *fn,
+                        bgzf_block_t *idx,
+                        size_t n,
+                        bam_hdr_t *hdr)
+{
+    for ( size_t i = 0; i < n; i++ ) {
+        off_t  start   = idx[i].start;
+        off_t  len     = idx[i].len;
+        // compute virtual‐offset window for this block
+        int64_t vstart = ((int64_t)start << 16);
+        int64_t vend   = (((int64_t)start + len) << 16);
+
+        // open a fresh BAM reader
+        htsFile *fp2 = hts_open(fn, "r");
+        if (!fp2) { fprintf(stderr,"hts_open failed\n"); exit(1); }
+
+        // seek to the start of this block
+        if ( bgzf_seek(fp2->fp.bgzf, vstart, SEEK_SET) < 0 ) {
+            fprintf(stderr,"bgzf_seek failed on block %zu\n", i);
+            exit(1);
+        }
+
+        // now read *all* records whose virtual‐offset < vend
+        bam1_t *rec = bam_init1();
+        while (1) {
+            int64_t here = bgzf_tell(fp2->fp.bgzf);
+            if ( here >= vend ) break;   // we've consumed this block
+
+            int ret = sam_read1(fp2, hdr, rec);
+            if ( ret < 0 ) break;        // EOF or error within block
+
+            // --- process this record ---
+            fprintf(stdout,
+                    "Block %3zu @%10lld len=%6u: QNAME=%s\n",
+                    i,
+                    (long long)start,
+                    idx[i].len,
+                    bam_get_qname(rec));
+        }
+        bam_destroy1(rec);
+        hts_close(fp2);
+    }
+}
+
+
+void test_htslib_file_movements(CLI::App &parent){
+    auto *app_ = parent.add_subcommand("test-hts", "Testing HTSLib Multi File movements");
+    auto &app = *app_;
+   struct parameters {
+        string input_file;
+        int threads;
+        int block_size;
+    };
+    // Allocate parameters as heap and set default values
+    std::shared_ptr<parameters> params {new parameters{"", 8, 4}};
+    app.add_option("input", params->input_file, "Input file")->required();
+    app.add_option("-t,--threads", params->threads, "Number of threads")->capture_default_str();
+    app.add_option("-b,--block-size", params->block_size, "Block size")->capture_default_str();
+    
+    app.callback([=]() {
+        printf("%s\t%d\n", params->input_file.c_str(), params->threads);
+       // Open the BAM file using HTSlib
+
+        BAMReader jumper{params->input_file};
+        bam_hdr_t *hdr = bam_hdr_read(jumper.fp->fp.bgzf);
+        size_t n_blocks;
+        bgzf_block_t *index = index_bgzf_blocks(jumper.fp, &n_blocks);
+        process_each_block(params->input_file.c_str(), index, n_blocks,hdr);
+    });
+}
 int main(int argc, char **argv) {
     CLI::App app("lasm");
     app.require_subcommand(1);
     app.set_help_all_flag("--help-all", "Expand all help");
-    auto *hifi_prog = app.add_subcommand("hifi", "run hifi assembly");
-    asm_program(*hifi_prog);
-    auto *stats_prog =
-        app.add_subcommand("bam-stats", "Print stats on input bam");
-    stats_program(*stats_prog);
+    asm_program(app);
+    stats_program(app);
+    test_htslib_file_movements(app);
     CLI11_PARSE(app, argc, argv);
     return 0;
 }
