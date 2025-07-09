@@ -19,7 +19,12 @@ struct histo{
 
         for(unsigned c : bins){
             unsigned scale = scale_start;
-            fprintf(f, "%u: ", bin_width * idx);
+            int need_more;
+            fprintf(f, "%u%n", bin_width * idx, &need_more); 
+            for(int i = 0; i < 12 - need_more;++ i){
+                fputc(' ', f);
+            };
+            fputc(':', f);
             if(max_c_per_line < c/scale_start){
               scale_start *=2;
             }
@@ -30,14 +35,14 @@ struct histo{
             for(i = 1; i < characters.size();++i){
                 scale /=scale_div;
                 if(c>scale){
-                    putc(characters[i], f);
+                    fputc(characters[i], f);
                     break;
                 }
             }
-            for(; i < max_c_per_line-1;++i){
-                putc(' ', f);
+            fprintf(f, " %u%n", bins[idx], &need_more);
+            for(; i < max_c_per_line-1-need_more;++i){
+                fputc(' ', f);
             }
-
             fputc('\n', f);
             ++idx;
         }
@@ -62,7 +67,7 @@ struct histo{
     void push(unsigned value){
         auto bin_tgt = value / bin_width;
         if (bin_tgt > max_lines){
-            resize_bins(bin_width * 1.5);
+            resize_bins(bin_width * 1.25);
             push(value);
             return;
         }

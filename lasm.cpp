@@ -430,42 +430,42 @@ void print_dbg(FILE *out, const dbg_map_t &dbg) {
 }
 
 int asm_program(CLI::App &app) {
-    string input;
-    string output;
-    int lcp_level;
-    int threads = 8;
-    app.add_option("input", input, "Input bam file")->required();
-    app.add_option("output", output, "Output gfa file")->required();
-    app.add_option("-l,--level", lcp_level, "LCP level to compute")->required();
-    app.add_option("-t,--threads", threads, "Number of threads")
+    std::shared_ptr<string> input { new string};
+    std::shared_ptr<string> output { new string};
+    std::shared_ptr<int> lcp_level{ new int};
+    std::shared_ptr<int> threads {new int {8}};
+    app.add_option("input", *input, "Input bam file")->required();
+    app.add_option("output", *output, "Output gfa file")->required();
+    app.add_option("-l,--level", *lcp_level, "LCP level to compute")->required();
+    app.add_option("-t,--threads", *threads, "Number of threads")
         ->capture_default_str();
 
-    bloom_parameters bparam;
-    bparam.projected_element_count = 1'000'000;
-    bparam.false_positive_probability = 0.0001;
-    bparam.random_seed = 0xA5A5A5A5;
+    std::shared_ptr<bloom_parameters> bparam{new bloom_parameters};
+    bparam->projected_element_count = 1'000'000;
+    bparam->false_positive_probability = 0.0001;
+    bparam->random_seed = 0xA5A5A5A5;
     auto bfg =
         app.add_option_group("bloomfilter", "Parameters to setup bloom filter");
-    bfg->add_option("--projected-element-count", bparam.projected_element_count,
+    bfg->add_option("--projected-element-count", bparam->projected_element_count,
                     "Projected element count")
         ->capture_default_str();
     bfg->add_option("--false-positive-probability",
-                    bparam.false_positive_probability,
+                    bparam->false_positive_probability,
                     "False positive probability")
         ->capture_default_str();
-    bfg->add_option("--random-seed", bparam.random_seed, "Random seed")
+    bfg->add_option("--random-seed", bparam->random_seed, "Random seed")
         ->capture_default_str();
 
-    app.callback([&]() {
-        cout << "Input: " << input << endl;
-        cout << "Output: " << output << endl;
+    app.callback([=]() {
+        cout << "Input: " << *input << endl;
+        cout << "Output: " << *output << endl;
 
-        bparam.compute_optimal_parameters();
-        bloom_filter bfil(bparam);
+        bparam->compute_optimal_parameters();
+        bloom_filter bfil(*bparam);
 
-        dbg_map_t dbg = construct_dbg(input, threads, lcp_level, bfil);
+        dbg_map_t dbg = construct_dbg(*input, *threads, *lcp_level, bfil);
 
-        FILE *out = fopen(output.c_str(), "w");
+        FILE *out = fopen(output->c_str(), "w");
         print_dbg(out, dbg);
         fclose(out);
     });
@@ -501,8 +501,8 @@ struct stat_accu {
 };
 
 void stats_program(CLI::App &app) {
-    string *input = new string;
-    uint64_t *update_frequency = new uint64_t{100};
+    std::shared_ptr<string> input {new string};
+    std::shared_ptr<uint64_t> update_frequency {new uint64_t{100}};
     app.add_option("input", *input, "Input bam file")->required();
     app.add_option("--update-frequency", *update_frequency,"Update frequency")->capture_default_str();
     app.callback([input, update_frequency]() {
