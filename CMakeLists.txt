@@ -71,4 +71,4 @@ add_test(NAME TestBAM COMMAND lasm -i input.bam -o tst.fa)
 
 
 
-target_compile_definitions(${PROJECT_NAME} PUBLIC SYNCMER_RULE=OpenSyncmerRule LCMER_L=32 SYNCMER_S=3 SYNCMER_T=3)
+target_compile_definitions(${PROJECT_NAME} PUBLIC SYNCMER_RULE=OpenSyncmerRule LCMER_L=8 SYNCMER_S=3 SYNCMER_T=3 SYNCMER_K=8)
