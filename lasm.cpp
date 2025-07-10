@@ -579,7 +579,7 @@ dbg_map_t construct_dbg_v2(string input, int threads, int lcp_level,
                 }
                 int ret = sam_read1(reader.fp, hdr, rec.get());
                 if (ret < 0) {
-                    std::print(std::cerr, "Popped {} {}\n", chunk.vstart,
+                    std::cerr << std::format("Popped {} {}\n", chunk.vstart,
                                chunk.vend);
                     break;
                 }
