@@ -1,6 +1,7 @@
 
 
 #include "circularqueue.h"
+#include "config.h"
 #include "lcptools/lcptools_ho.h"
 #include <concepts>
 #include <gtl/bit_vector.hpp>
@@ -132,7 +133,7 @@ template <SyncmerRule Rule> struct syncmer_precomputed { // TODO maybe bloom fil
   gtl::bit_vector lut;
   syncmer_precomputed() : lut(size) {
     for (size_t i = 0; i < size; ++i) {
-      lut.set(i, rule::is_syncmer(i));
+      lut.set(i, rule::is_syncmer(i & KMER_SPACE_MASK));
     }
   }
   constexpr bool operator[](size_t idx) const noexcept { return lut[idx]; }

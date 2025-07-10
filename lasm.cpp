@@ -73,8 +73,10 @@ struct KmerViewOnNibbles {
         value <<= 2;
         if constexpr (KMASK != -1) value &= KMASK;
         value |= bam_seqi(data_address, index);
-        return value;
+        return value & KMER_SPACE_MASK;
     }
+
+    constexpr int_type get() const noexcept { return value & KMER_SPACE_MASK; }
 };
 
 void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
@@ -118,8 +120,8 @@ uint64_t parse1_syncmers(const uint8_t *data, int64_t len, struct core *cores) {
     int64_t it1 = kmer_view.fill(data);
     // find lcp cores
     for (; it1 + SYNCMER_K < len; it1++) {
-        if (table[kmer_view.value]) {
-            init_core_kmer<uint32_t>(&(cores[core_index]), kmer_view.value, it1,
+        if (table[kmer_view.get()]) {
+            init_core_kmer<uint32_t>(&(cores[core_index]), kmer_view.get(), it1,
                                      it1 + SYNCMER_K);
             core_index++;
         }
@@ -580,7 +582,7 @@ dbg_map_t construct_dbg_v2(string input, int threads, int lcp_level,
                 int ret = sam_read1(reader.fp, hdr, rec.get());
                 if (ret < 0) {
                     std::cerr << std::format("Popped {} {}\n", chunk.vstart,
-                               chunk.vend);
+                                             chunk.vend);
                     break;
                 }
 
@@ -706,13 +708,16 @@ int asm_program(CLI::App &parent) {
         // cout << "Input: " << *input << endl;
         // cout << "Output: " << *output << endl;
 
+        INIT_TIMERS(HIFIASM);
         bparam->compute_optimal_parameters();
         bloom_filter bfil(*bparam);
+        TIME_CHECKPOINT(HIFIASM, stderr, "Bloom Filter setup");
 
         dbg_map_t dbg = construct_dbg_v2(*input, *threads, *lcp_level, bfil);
-
+        TIME_CHECKPOINT(HIFIASM, stderr, "DBG construction finished");
         FILE *out = fopen(output->c_str(), "w");
         print_dbg(out, dbg);
+        TIME_CHECKPOINT(HIFIASM, stderr, "DBG printing finished");
         fclose(out);
     });
 
