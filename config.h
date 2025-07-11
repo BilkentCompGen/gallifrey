@@ -25,6 +25,9 @@
 #define KMER_SPACE_MASK 0xDDDDDDDDDDDDDDDD
 #endif 
 
+#ifndef BAMREAD_CHUNK_SIZE
+#define BAMREAD_CHUNK_SIZE 128ULL
+#endif
 
 #define INIT_TIMERS(name) \
     std::chrono::high_resolution_clock::time_point name##_chrono_start = std::chrono::high_resolution_clock::now(); \

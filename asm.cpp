@@ -1,5 +1,4 @@
 #include "asm.h"
-#include "bgzf.h"
 
 #include <concurrentqueue.h>
 #include <htslib/bgzf.h>
@@ -10,7 +9,10 @@
 #include <gtl/vector.hpp>
 #include <iostream>
 
+#include "bgzf.h"
 #include "endian.h"  // for le16toh()
+#include "ext/bloom_filter.hpp"
+#include "gtl/phmap_fwd_decl.hpp"
 #include "lcmer.h"
 
 struct dbg_value {
@@ -28,9 +30,26 @@ using dbg_map_t = gtl::parallel_flat_hash_map<
     std::allocator<std::pair<const lcmer<LCMER_L>, dbg_value_type>>, 4,
     mutex_type>;
 
-// move the dbg_map emplace lambda to a separate function.
-inline void emplace2dbg(dbg_map_t &dbg, lcmer<LCMER_L> &l,
-                        uint64_t &lcmer_index, int thread_id) {
+struct bgzfseqaddress {
+    int64_t seek;
+    uint32_t idx;
+    uint32_t from;
+    uint32_t to;
+};
+using core2bgzf_index_t = gtl::parallel_flat_hash_map<
+    uint32_t, bgzfseqaddress, gtl::priv::hash_default_hash<uint32_t>,
+    gtl::priv::hash_default_eq<uint32_t>,
+    std::allocator<std::pair<const uint32_t, bgzfseqaddress>>, 4, mutex_type>;
+
+struct BGZFCoreIndex {
+    core2bgzf_index_t idx;
+    void emplace(uint32_t core, bgzfseqaddress a) {
+        idx.try_emplace(core, a);
+    }
+};
+
+inline void emplace2dbg_first(dbg_map_t &dbg, lcmer<LCMER_L> &l,
+                              uint64_t &lcmer_index, int thread_id) {
     dbg.lazy_emplace_l(
         l, [](dbg_map_t::value_type &val) { val.second.count++; },
         [&](const dbg_map_t::constructor &ctor) {
@@ -38,9 +57,10 @@ inline void emplace2dbg(dbg_map_t &dbg, lcmer<LCMER_L> &l,
             lcmer_index += 128;
         });
 }
-inline void emplace2dbg2(dbg_map_t &dbg, lcmer<LCMER_L> &l,
-                         uint64_t &lcmer_index, bool &skipped,
-                         uint32_t out_core, int thread_id) {
+
+inline void emplace2dbg_linked(dbg_map_t &dbg, lcmer<LCMER_L> &l,
+                               uint64_t &lcmer_index, bool &skipped,
+                               uint32_t out_core, int thread_id) {
     dbg.lazy_emplace_l(
         l,
         [&](dbg_map_t::value_type &val) {
@@ -57,122 +77,10 @@ inline void emplace2dbg2(dbg_map_t &dbg, lcmer<LCMER_L> &l,
         });
 }
 
-dbg_map_t construct_dbg(std::string input, int threads, int lcp_level,
-                        bloom_filter &bfil) {
-    std::atomic<uint64_t> count;
-    using worktype = std::tuple<uint64_t, uint8_t *>;
-
-    moodycamel::ConcurrentQueue<worktype> work_queue(32 * threads, 1, 0);
-
-    std::vector<std::thread> consumers;
-    //   counter core_counter;
-    dbg_map_t dbg;
-    std::atomic<size_t> skipped_reads_count{0};
-    std::atomic<bool> done{false};
-    for (int tid = 0; tid < threads; ++tid) {
-        consumers.emplace_back(
-            [&](int t) {
-                uint64_t lcmer_index = 0;
-                worktype work;
-                while (!done.load() || work_queue.size_approx() > 0) {
-                    if (!work_queue.try_dequeue(work)) {
-                        continue;
-                    }
-                    lcp_read lr = parse_cores_from_bam_record(
-                        std::get<1>(work), std::get<0>(work), lcp_level);
-                    // cout << bamdata->core.l_qseq << " to " << lr.cores.size()
-                    // <<
-                    // "\n";
-                    // core_counter[lr.cores.size()]++;
-                    if (lr.cores.size() < LCMER_L + 2) {
-                        skipped_reads_count.fetch_add(1);
-                        free(std::get<1>(work));
-                        continue;
-                    }
-                    lcmer<LCMER_L> l{lr.cores.begin()};
-                    bool skipped = false;
-                    size_t i;
-                    for (i = LCMER_L; i < lr.cores.size(); ++i) {
-                        if (bfil.contains(l)) {
-                            break;
-                        }
-                        bfil.insert(l);
-                        l.update_lcmer(lr.cores[i]);
-                    }
-                    dbg.lazy_emplace_l(
-                        l,
-                        [](dbg_map_t::value_type &val) { val.second.count++; },
-                        [&](const dbg_map_t::constructor &ctor) {
-                            ctor(l, dbg_value_type{1UL, lcmer_index | t, {}});
-                            lcmer_index += 128;
-                        });
-                    for (; i < lr.cores.size(); ++i) {
-                        uint32_t out_core = l.update_lcmer(lr.cores[i]);
-                        if (!bfil.contains(l)) {
-                            bfil.insert(l);
-                            skipped = true;
-                            continue;
-                        }
-
-                        dbg.lazy_emplace_l(
-                            l,
-                            [&](dbg_map_t::value_type &val) {
-                                val.second.count++;
-                                if (!skipped) val.second.next.insert(out_core);
-                            },
-                            [&](const dbg_map_t::constructor &ctor) {
-                                if (skipped)
-                                    ctor(l, dbg_value_type{
-                                                1UL, lcmer_index | t, {}});
-                                else
-                                    ctor(l,
-                                         dbg_value_type{
-                                             1UL, lcmer_index | t, {out_core}});
-                                lcmer_index += 128;
-                            });
-                        skipped = false;
-                        count.fetch_add(1);
-                    }
-                    free(std::get<1>(work));
-                }
-            },
-            tid);
-    }
-    uint8_t *data = NULL;
-
-    BAMReader reader(input);
-    bam1_t *bamdata = reader.init_data();
-
-    while (reader.read(bamdata)) {
-        data = bam_get_seq(bamdata);
-        uint8_t *data_copy = (uint8_t *)malloc(bamdata->core.l_qseq / 2 +
-                                               1);  // TODO Fix the extra memory
-        memcpy(data_copy, data, bamdata->core.l_qseq / 2 + 1);
-        while (!work_queue.try_enqueue(
-            std::make_tuple(bamdata->core.l_qseq, data_copy)));
-    }
-    done.store(true);
-    for (std::thread &t : consumers) {
-        t.join();
-    }
-    printf("Processed %llu reads\n", count.load());
-    printf("Skipped %lu reads due to insufficient cores\n",
-           skipped_reads_count.load());
-    //   for (auto &p : core_counter) {
-    //     fprintf(stderr, "CC\t%lu\t%lu\n", p.first, p.second);
-    //   }
-    if (bamdata) {
-        bam_destroy1(bamdata);
-    }
-    return dbg;
-}
-
 struct Chunk {
     int64_t vstart;
     int64_t vend;
 };
-
-constexpr size_t CHUNK_SIZE = 128;
 
 struct Block {
     off_t start;
@@ -224,34 +132,6 @@ class BlockIterator {
     bool valid_ = true;
 };
 
-// void process_chunk(htsFile *fp, const Chunk &chunk) {
-
-//     if (chunk.vstart > 0) {
-//         if (bgzf_seek(fp->fp.bgzf, chunk.vstart, SEEK_SET) < 0) {
-//             std::cerr << "bgzf_seek failed on chunk vstart=" << chunk.vstart
-//                       << "\n";
-//             std::exit(EXIT_FAILURE);
-//         }
-//     }
-//     std::unique_ptr<bam1_t, decltype(&bam_destroy1)> rec(bam_init1(),
-//                                                          bam_destroy1);
-//     while (true) {
-//         int64_t here = bgzf_tell(fp->fp.bgzf);
-//         if (here >= chunk.vend) {
-//             // std::print(std::cerr, "Bopped {} {}\n", chunk.vstart,
-//             // chunk.vend);
-//             break;
-//         }
-//         int ret = sam_read1(fp, hdr, rec.get());
-//         if (ret < 0) {
-//             std::print(std::cerr, "Popped {} {}\n", chunk.vstart,
-//             chunk.vend); break;
-//         }
-//         std::print(cout, "{}\t{}\n", string{bam_get_qname(rec.get())},
-//                    here << '\n');
-//     }
-// }
-
 dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
                            bloom_filter &bfil) {
     using worktype = Chunk;
@@ -260,6 +140,9 @@ dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
     std::atomic<int64_t> skipped_reads_count{0};
     std::atomic<int64_t> count{0};
     dbg_map_t dbg;
+
+    BGZFCoreIndex core_idx;
+
     auto work = [&](int tid) {
         uint64_t lcmer_index = 0;
         worktype chunk;
@@ -282,21 +165,26 @@ dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
             } else {
                 // hdr = sam_hdr_read(reader.fp);
             }
-
+            unsigned sr1_cnt = 0;
             while (true) {
                 int64_t here = bgzf_tell(reader.fp->fp.bgzf);
                 if (here >= chunk.vend) {
-                    // std::print(std::cerr, "Bopped {} {}\n", chunk.vstart,
-                    // chunk.vend);
                     break;
                 }
                 int ret = sam_read1(reader.fp, hdr, rec.get());
-                if (ret < 0) {
-                    std::cerr << std::format("Popped {} {}\n", chunk.vstart,
+                ++sr1_cnt;
+                if (ret == -1) {
+                    std::cerr << std::format("End of file {} at {} {}\n",
+                                             reader.filename, chunk.vstart,
                                              chunk.vend);
                     break;
+                } else if (ret < -1) {
+                    std::cerr << std::format(
+                        "sam_read1 failed on {} {} possibly due to a read "
+                        "being longer than block size in the previous block\n",
+                        reader.filename, chunk.vstart, chunk.vend);
+                    break;
                 }
-
                 lcp_read lr = parse_cores_from_bam_record(
                     bam_get_seq(rec.get()), rec->core.l_qseq, lcp_level);
 
@@ -314,9 +202,11 @@ dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
                     bfil.insert(l);
                     l.update_lcmer(lr.cores[i]);
                 }
+                for(int q = i - LCMER_L; q < i; ++q){
+                    core_idx.emplace(lr.cores[q], { chunk.vstart, sr1_cnt ,lr.pos[q].first, lr.pos[q].second});
+                }
                 std::optional<lcmer<LCMER_L>> waiter = l;
-                // uint32_t wait_core = out_core;
-                // emplace2dbg(dbg, l, lcmer_index, tid);
+
                 for (; i < lr.cores.size(); ++i) {
                     uint32_t out_core = l.update_lcmer(lr.cores[i]);
                     if (!bfil.contains(l)) {
@@ -324,22 +214,22 @@ dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
                         skipped = true;
                         continue;
                     }
+                    core_idx.emplace(lr.cores[i], { chunk.vstart, sr1_cnt ,lr.pos[i].first, lr.pos[i].second});
                     if (skipped) {
                         waiter = l;
                         skipped = false;
                         continue;
                     }
                     if (waiter.has_value()) {  // TODO Validate this approach
-                        emplace2dbg(dbg, waiter.value(), lcmer_index, tid);
+                        emplace2dbg_first(dbg, waiter.value(), lcmer_index,
+                                          tid);
                         waiter = std::nullopt;
                     }
-                    emplace2dbg2(dbg, l, lcmer_index, skipped, out_core, tid);
+                    emplace2dbg_linked(dbg, l, lcmer_index, skipped, out_core,
+                                       tid);
                 }
                 skipped = false;
                 count.fetch_add(1);
-                // std::print(cout, "{}\t{}\n",
-                // string{bam_get_qname(rec.get())},
-                //    here << '\n');
             }
         }
     };
@@ -359,7 +249,7 @@ dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
 
         size_t count = 1;
         // accumulate up to CHUNK_SIZE blocks
-        while (count < CHUNK_SIZE && iter.next(blk)) {
+        while (count < BAMREAD_CHUNK_SIZE && iter.next(blk)) {
             last_vend = blk.vend();
             ++count;
         }
@@ -395,17 +285,23 @@ void print_dbg(FILE *out, const dbg_map_t &dbg) {
     }
 }
 
-int run_assembly(const std::string &input, const std::string &output, int threads, int lcp_level, bloom_parameters bparam) {
-    INIT_TIMERS(HIFIASM);
+int run_assembly(const std::string &input, const std::string &output,
+                 int threads, int lcp_level, bloom_param bpd) {
+    INIT_TIMERS(HIFI_ASSEMBLY);
+    bloom_parameters bparam;
+    bparam.false_positive_probability = bpd.false_positive_rate;
+    bparam.projected_element_count = bpd.projected_count;
+    bparam.random_seed = bpd.seed;
+
     bparam.compute_optimal_parameters();
     bloom_filter bfil(bparam);
-    TIME_CHECKPOINT(HIFIASM, stderr, "Bloom Filter setup");
+    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Bloom Filter setup");
 
     dbg_map_t dbg = construct_dbg_v2(input, threads, lcp_level, bfil);
-    TIME_CHECKPOINT(HIFIASM, stderr, "DBG construction finished");
+    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG construction finished");
     FILE *out = fopen(output.c_str(), "w");
     print_dbg(out, dbg);
-    TIME_CHECKPOINT(HIFIASM, stderr, "DBG printing finished");
+    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG printing finished");
 
     fclose(out);
     return 0;

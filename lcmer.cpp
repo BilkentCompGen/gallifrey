@@ -1,4 +1,5 @@
 #include "lcmer.h"
+
 #include "syncmer.h"
 
 void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
@@ -17,7 +18,8 @@ void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
 syncmer::syncmer_precomputed<
     syncmer::SYNCMER_RULE<SYNCMER_K, SYNCMER_S, SYNCMER_T>>
     table;
-uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len, struct core *cores) {
+uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
+                             struct core *cores) {
     int core_index = 0;
     KmerViewOnNibbles<SYNCMER_K, uint32_t> kmer_view;
     int64_t it1 = kmer_view.fill(data);
@@ -34,6 +36,7 @@ uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len, struct core *core
     // cout << "CORESSS" << it1 << "\t" << it2 << "\n";
     return core_index;
 }
+
 uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores) {
     int64_t it1 = 0;
     int64_t it2 = len;
@@ -75,6 +78,7 @@ uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores) {
     // cout << "CORESSS" << it1 << "\t" << it2 << "\n";
     return core_index;
 }
+
 void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len) {
     lps_ptr->level = 1;
     lps_ptr->size = 0;
@@ -82,6 +86,7 @@ void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len) {
         (struct core *)malloc((len / CONSTANT_FACTOR) * sizeof(struct core));
     lps_ptr->size = parse1_bam_syncmers(data, len, lps_ptr->cores);
 }
+
 lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
                                      int lcp_level) {
     // uint64_t estimated_core_size = (int)(len / std::pow(1.5, lcp_level));

@@ -3,7 +3,6 @@
 #include <string>
 #include "asm.h"
 #include "stats.h"
-#include <memory>
 #define LCPTOOLS_IMPL
 #include "ext/lcptools/lcptools_ho.h"
 
@@ -11,40 +10,43 @@ using std::string;
 
 struct bloom_parameters;
 int asm_program(CLI::App &parent) {
+    struct parameters{
+        string input;
+        string output;
+        int lcp_level;
+        int threads;
+    };
     auto *app_ = parent.add_subcommand("hifi", "run hifi assembly");
     auto &app = *app_;
-    std::shared_ptr<string> input{new string};
-    std::shared_ptr<string> output{new string};
-    std::shared_ptr<int> lcp_level{new int};
-    std::shared_ptr<int> threads{new int{8}};
-    app.add_option("input", *input, "Input bam file")->required();
-    app.add_option("output", *output, "Output gfa file")->required();
-    app.add_option("-l,--level", *lcp_level, "LCP level to compute")
+    parameters *p = new parameters {"","", 5, 8};
+    app.add_option("input", p->input, "Input bam file")->required();
+    app.add_option("output", p->output, "Output gfa file")->required();
+    app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
         ->required();
-    app.add_option("-t,--threads", *threads, "Number of threads")
+    app.add_option("-t,--threads", p->threads, "Number of threads")
         ->capture_default_str();
 
-    std::shared_ptr<bloom_parameters> bparam{new bloom_parameters};
-    bparam->projected_element_count = 1'000'000;
-    bparam->false_positive_probability = 0.0001;
-    bparam->random_seed = 0xA5A5A5A5;
+    bloom_param* bparam = new bloom_param;
+    bparam->projected_count = 1'000'000;
+    bparam->false_positive_rate = 0.0001;
+    bparam->seed = 0xA5A5A5A5;
     auto bfg =
         app.add_option_group("bloomfilter", "Parameters to setup bloom filter");
     bfg->add_option("--projected-element-count",
-                    bparam->projected_element_count, "Projected element count")
+                    bparam->projected_count, "Projected element count")
         ->capture_default_str();
     bfg->add_option("--false-positive-probability",
-                    bparam->false_positive_probability,
+                    bparam->false_positive_rate,
                     "False positive probability")
         ->capture_default_str();
-    bfg->add_option("--random-seed", bparam->random_seed, "Random seed")
+    bfg->add_option("--random-seed", bparam->seed, "Random seed")
         ->capture_default_str();
 
     app.callback([=]() {
-        // cout << "Input: " << *input << endl;
-        // cout << "Output: " << *output << endl;
-        return run_assembly(*input, *output,  *threads, *lcp_level, *bparam);
-
+        int ret = run_assembly(p->input, p->output,  p->threads, p->lcp_level, *bparam);
+        delete p;
+        delete bparam;
+        return ret;
     });
     return 0;
 }
@@ -52,15 +54,12 @@ int asm_program(CLI::App &parent) {
 void stats_program(CLI::App &parent) {
     auto *app_ = parent.add_subcommand("bam-stats", "Print stats on input bam");
     auto &app = *app_;
-    std::shared_ptr<string> input{new string};
-    std::shared_ptr<uint64_t> update_frequency{new uint64_t{100}};
-    std::shared_ptr<int> lcmer_level{new int{5}};
     struct parameters {
         string input_file;
         int update_frequency;
         int lcmer_level;
     };
-    auto params = std::make_shared<parameters>("", 100, 5);
+    parameters* params = new parameters{"", 100, 5};
     app.add_option("input", params->input_file, "Input bam file")->required();
     app.add_option("--update-frequency", params->update_frequency, "Update frequency")
         ->capture_default_str();
@@ -68,7 +67,9 @@ void stats_program(CLI::App &parent) {
         ->capture_default_str();
 
     app.callback([=]() {
-        return run_stats(params->input_file, params->update_frequency, params->lcmer_level);
+        int ret =  run_stats(params->input_file, params->update_frequency, params->lcmer_level);
+        delete params;
+        return ret;
     });
 }
 
@@ -82,7 +83,7 @@ void test_htslib_file_movements(CLI::App &parent) {
         int block_size;
     };
     // Allocate parameters as heap and set default values
-    std::shared_ptr<parameters> params{new parameters{"", 8, 4}};
+    parameters* params = new parameters{"", 8, 4};
     app.add_option("input", params->input_file, "Input file")->required();
     app.add_option("-t,--threads", params->threads, "Number of threads")
         ->capture_default_str();
@@ -91,6 +92,8 @@ void test_htslib_file_movements(CLI::App &parent) {
 
     app.callback([=]() {
 
+        delete params;
+        return 0;
     });
 }
 int main(int argc, char **argv) {
