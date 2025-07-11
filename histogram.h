@@ -1,3 +1,6 @@
+#pragma once
+#ifndef _HISTOGRAM_H_
+#define _HISTOGRAM_H_
 // terminal_histogram.cpp
 // A utility for drawing multiple histograms and text boxes in terminal using
 // termbox2
@@ -6,8 +9,6 @@
 // #include <__format/format_functions.h>
 #include <format>
 // #include <print>
-#define TB_IMPL
-#define TB_OPT_V1_COMPAT
 #include <algorithm>
 #include <csignal>
 #include <cstdint>
@@ -15,9 +16,11 @@
 #include <sstream>
 #include <string>
 #include <vector>
-
-#include "circularqueue.h"
+// #define TB_IMPL
+// #define TB_OPT_V1_COMPAT
 #include "ext/termbox2.h"
+#include "circularqueue.h"
+
 class Cell {
    public:
     int gr, gc;  // grid coords
@@ -248,3 +251,5 @@ class Screen {
                 tb_set_cell(c * cW, r * cH, U'┼', TB_WHITE, TB_DEFAULT);
     }
 };
+
+#endif

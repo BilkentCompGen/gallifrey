@@ -44,9 +44,7 @@ using core2bgzf_index_t = gtl::parallel_flat_hash_map<
 
 struct BGZFCoreIndex {
     core2bgzf_index_t idx;
-    void emplace(uint32_t core, bgzfseqaddress a) {
-        idx.try_emplace(core, a);
-    }
+    void emplace(uint32_t core, bgzfseqaddress a) { idx.try_emplace(core, a); }
 };
 
 inline void emplace2dbg_first(dbg_map_t &dbg, lcmer<LCMER_L> &l,
@@ -176,12 +174,13 @@ dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
                 ++sr1_cnt;
                 if (ret == -1) {
                     fprintf(stderr, "End of file %s at %lld %lld\n",
-                                             reader.filename.c_str(), chunk.vstart,
-                                             chunk.vend);
+                            reader.filename.c_str(), chunk.vstart, chunk.vend);
                     break;
                 } else if (ret < -1) {
-                    fprintf(stderr,
-                        "sam_read1 failed on %s %lld %lld possibly due to a read "
+                    fprintf(
+                        stderr,
+                        "sam_read1 failed on %s %lld %lld possibly due to a "
+                        "read "
                         "being longer than block size in the previous block\n",
                         reader.filename.c_str(), chunk.vstart, chunk.vend);
                     break;
@@ -203,8 +202,10 @@ dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
                     bfil.insert(l);
                     l.update_lcmer(lr.cores[i]);
                 }
-                for(int q = i - LCMER_L; q < i; ++q){
-                    core_idx.emplace(lr.cores[q], { chunk.vstart, sr1_cnt ,lr.pos[q].first, lr.pos[q].second});
+                for (int q = i - LCMER_L; q < i; ++q) {
+                    core_idx.emplace(lr.cores[q],
+                                     {chunk.vstart, sr1_cnt, lr.pos[q].first,
+                                      lr.pos[q].second});
                 }
                 std::optional<lcmer<LCMER_L>> waiter = l;
 
@@ -215,7 +216,9 @@ dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
                         skipped = true;
                         continue;
                     }
-                    core_idx.emplace(lr.cores[i], { chunk.vstart, sr1_cnt ,lr.pos[i].first, lr.pos[i].second});
+                    core_idx.emplace(lr.cores[i],
+                                     {chunk.vstart, sr1_cnt, lr.pos[i].first,
+                                      lr.pos[i].second});
                     if (skipped) {
                         waiter = l;
                         skipped = false;

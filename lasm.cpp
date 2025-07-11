@@ -3,6 +3,7 @@
 #include <string>
 #include "asm.h"
 #include "stats.h"
+#include "sthist.h"
 #define LCPTOOLS_IMPL
 #include <stdint.h>
 #include "ext/lcptools/lcptools_ho.h"
@@ -74,25 +75,22 @@ void stats_program(CLI::App &parent) {
     });
 }
 
-void test_htslib_file_movements(CLI::App &parent) {
-    auto *app_ = parent.add_subcommand("test-hts",
+void stdin_hist_prog(CLI::App &parent) {
+    auto *app_ = parent.add_subcommand("mephisto",
                                        "Testing HTSLib Multi File movements");
     auto &app = *app_;
     struct parameters {
-        string input_file;
-        int threads;
-        int block_size;
+        int dims;
+        int freq;
     };
     // Allocate parameters as heap and set default values
-    parameters* params = new parameters{"", 8, 4};
-    app.add_option("input", params->input_file, "Input file")->required();
-    app.add_option("-t,--threads", params->threads, "Number of threads")
-        ->capture_default_str();
-    app.add_option("-b,--block-size", params->block_size, "Block size")
-        ->capture_default_str();
+    parameters* params = new parameters{1, 10};
+    app.add_option("--dims", params->dims, "screen dimensions")->capture_default_str();
+    app.add_option("--freq", params->freq,"Frequency of histogram updates")->capture_default_str();
+ 
 
     app.callback([=]() {
-
+        int ret = run_hist_on_stdin(params->dims, params->freq);
         delete params;
         return 0;
     });
@@ -103,7 +101,7 @@ int main(int argc, char **argv) {
     app.set_help_all_flag("--help-all", "Expand all help");
     asm_program(app);
     stats_program(app);
-    test_htslib_file_movements(app);
+    stdin_hist_prog(app);
     CLI11_PARSE(app, argc, argv);
     return 0;
 }

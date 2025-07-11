@@ -19,7 +19,7 @@ include_directories(${HTS_INCLUDE_DIRS})
 link_directories(${HTS_LIBRARY_DIRS})
 add_definitions(${HTS_CFLAGS_OTHER})
 
-set(SOURCE_FILES lasm.cpp asm.cpp stats.cpp lcmer.cpp)
+set(SOURCE_FILES lasm.cpp asm.cpp stats.cpp lcmer.cpp sthist.cpp)
 include_directories(./ext)
 set(CMAKE_PATH cmake)
 
