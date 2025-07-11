@@ -5,6 +5,7 @@
 #include <htslib/hfile.h>
 #include <htslib/sam.h>
 
+#include <cstdio>
 #include <gtl/phmap.hpp>
 #include <gtl/vector.hpp>
 #include <iostream>
@@ -174,15 +175,15 @@ dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
                 int ret = sam_read1(reader.fp, hdr, rec.get());
                 ++sr1_cnt;
                 if (ret == -1) {
-                    std::cerr << std::format("End of file {} at {} {}\n",
-                                             reader.filename, chunk.vstart,
+                    fprintf(stderr, "End of file %s at %lld %lld\n",
+                                             reader.filename.c_str(), chunk.vstart,
                                              chunk.vend);
                     break;
                 } else if (ret < -1) {
-                    std::cerr << std::format(
-                        "sam_read1 failed on {} {} possibly due to a read "
+                    fprintf(stderr,
+                        "sam_read1 failed on %s %lld %lld possibly due to a read "
                         "being longer than block size in the previous block\n",
-                        reader.filename, chunk.vstart, chunk.vend);
+                        reader.filename.c_str(), chunk.vstart, chunk.vend);
                     break;
                 }
                 lcp_read lr = parse_cores_from_bam_record(

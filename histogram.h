@@ -5,7 +5,7 @@
 // For termbox2: define implementation and compatibility
 // #include <__format/format_functions.h>
 #include <format>
-#include <print>
+// #include <print>
 #define TB_IMPL
 #define TB_OPT_V1_COMPAT
 #include <algorithm>

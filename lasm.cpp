@@ -4,6 +4,7 @@
 #include "asm.h"
 #include "stats.h"
 #define LCPTOOLS_IMPL
+#include <stdint.h>
 #include "ext/lcptools/lcptools_ho.h"
 
 using std::string;
