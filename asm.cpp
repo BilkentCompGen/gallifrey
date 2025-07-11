@@ -136,8 +136,8 @@ dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
     using worktype = Chunk;
     moodycamel::ConcurrentQueue<worktype> work_queue(32 * threads, 1, 0);
     std::atomic<bool> done{false};
-    std::atomic<int64_t> skipped_reads_count{0};
-    std::atomic<int64_t> count{0};
+    gtl::vector<int64_t> skipped_reads_count(threads, 0);
+    gtl::vector<int64_t> count(threads, 0);
     dbg_map_t dbg;
 
     BGZFCoreIndex core_idx;
@@ -189,7 +189,7 @@ dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
                     bam_get_seq(rec.get()), rec->core.l_qseq, lcp_level);
 
                 if (lr.cores.size() < LCMER_L + 2) {
-                    skipped_reads_count.fetch_add(1);
+                    skipped_reads_count[tid] += 1;
                     continue;
                 }
                 lcmer<LCMER_L> l{lr.cores.begin()};
@@ -233,7 +233,7 @@ dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
                                        tid);
                 }
                 skipped = false;
-                count.fetch_add(1);
+                count[tid] += 1;
             }
         }
     };
@@ -264,9 +264,17 @@ dbg_map_t construct_dbg_v2(std::string input, int threads, int lcp_level,
     for (auto &t : consumers) {
         t.join();
     }
-    printf("Processed %lld reads\n", count.load());
+    int64_t count_accu = 0;
+    for(int64_t c : count){
+        count_accu += c;
+    }
+    int64_t skip_accu = 0;
+    for(int64_t s : skipped_reads_count){
+        skip_accu += s;
+    }
+    printf("Processed %lld reads\n", count_accu);
     printf("Skipped %lld reads due to insufficient cores\n",
-           skipped_reads_count.load());
+           skip_accu);
     return dbg;
 }
 
