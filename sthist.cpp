@@ -21,16 +21,12 @@ int run_hist_on_stdin(int dims, int freq = 10) {
     h = 0;
     int histograms [dims];
     int idx = 0;
-    while (w * h < dims) {
-        histograms[idx++] = screen.addHistogram<double>(h,w, "h");
-        if (w > h){
-            ++h;
-        }   
-        else if (w <= h){
-            ++w;
+    for(int i = 0; i< w; ++i){
+        for (int j = 0; j <h;++j){
+            histograms[idx++] = screen.addHistogram<double>(j,i, "h");
         }
-            
-    };
+    }
+   
     
     double val;
     int i = 0;
