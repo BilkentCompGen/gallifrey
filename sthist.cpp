@@ -17,8 +17,8 @@ int run_hist_on_stdin(int dims, int freq = 10) {
             ++w;
     };
     Screen screen {h,w};
-    w = 0;
-    h = 0;
+    // w = 0;
+    // h = 0;
     int histograms [dims];
     int idx = 0;
     for(int i = 0; i< w; ++i){
