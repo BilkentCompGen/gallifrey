@@ -64,11 +64,11 @@ FetchContent_Declare(
 
 
 
-target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue pthread deflate tbb)
+target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue pthread deflate)
 
 
 add_test(NAME TestBAM COMMAND lasm -i input.bam -o tst.fa)
 
 
 
-target_compile_definitions(${PROJECT_NAME} PUBLIC SYNCMER_RULE=OpenSyncmerRule LCMER_L=8 SYNCMER_S=3 SYNCMER_T=3 SYNCMER_K=8)
+target_compile_definitions(${PROJECT_NAME} PUBLIC SYNCMER_RULE=OpenSyncmerRule LCMER_L=24 SYNCMER_S=2 SYNCMER_T=3 SYNCMER_K=8)

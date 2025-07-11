@@ -85,7 +85,7 @@ struct OpenSyncmerRule {
   }
 };
 
-template <int _K, int _S, typename INT_TYPE = uint32_t,
+template <int _K, int _S, int _TIGNORED, typename INT_TYPE = uint32_t,
           class Hash = murmur<INT_TYPE>>
 struct ClosedSyncmerRule {
   using int_type = INT_TYPE;

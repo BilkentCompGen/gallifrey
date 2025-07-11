@@ -1,7 +1,9 @@
 #include <CLI/CLI.hpp>
 #include <cstdint>
+#include <optional>
 
 #include "CLI/CLI.hpp"
+#include "circularqueue.h"
 #define LCPTOOLS_IMPL
 #include <concurrentqueue.h>
 #include <htslib/bgzf.h>
@@ -603,14 +605,24 @@ dbg_map_t construct_dbg_v2(string input, int threads, int lcp_level,
                     bfil.insert(l);
                     l.update_lcmer(lr.cores[i]);
                 }
-
-                emplace2dbg(dbg, l, lcmer_index, tid);
+                std::optional<lcmer<LCMER_L>> waiter = l;
+                // uint32_t wait_core = out_core;
+                // emplace2dbg(dbg, l, lcmer_index, tid);
                 for (; i < lr.cores.size(); ++i) {
                     uint32_t out_core = l.update_lcmer(lr.cores[i]);
                     if (!bfil.contains(l)) {
                         bfil.insert(l);
                         skipped = true;
                         continue;
+                    }
+                    if(skipped){
+                        waiter = l;
+                        skipped = false;
+                        continue;
+                    }
+                    if(waiter.has_value()){ // TODO Validate this approach
+                        emplace2dbg(dbg, waiter.value(), lcmer_index, tid);
+                        waiter = std::nullopt;
                     }
                     emplace2dbg2(dbg, l, lcmer_index, skipped, out_core, tid);
                 }
@@ -772,57 +784,50 @@ void stats_program(CLI::App &parent) {
 
         gtl::flat_hash_map<string, stat_accu<double>> stats;
         uint64_t read_count = 0;
-        printf("\n");
-        histo hist_len{"Read lengths", 100, 50, 20};
-        histo hist_cores{"Core counts", 10, 10, 5};
-        histo hist_core_lens{"Core lengths", 200, 100, 5};
+
+        Screen screen(2, 2);
+        int read_len_hist = screen.addHistogram<int>(0, 0, "Read Lengths");
+        int core_count_hist = screen.addHistogram<int>(0, 1, "Core counts");
+        int core_len_hist = screen.addHistogram<int>(1, 0, "Core lengths");
+        int text = screen.addText<uint64_t, uint64_t, double, double, double,
+                                  double, double, double>(
+            1, 1,
+            "read count: {}\nbase-count: {}\nlength(µ,σ): {:.2f} "
+            "{:.2f}\ncores(µ,σ): {:.2f} {:.2f}\ncore-lengths(µ,σ): {:.2f} "
+            "{:.2f}");
+
+        struct tb_event ev;
+
         while (reader.read(bamdata)) {
             lcp_read lcps = parse_cores_from_bam_record(
                 bam_get_seq(bamdata), bamdata->core.l_qseq, *lcmer_level);
             stats["length"].update(bamdata->core.l_qseq);
             stats["core-count"].update(lcps.cores.size());
             for (const auto &len : lcps.pos) {
-                hist_core_lens.push(len.second - len.first);
+                screen.pushHistogram<int>(core_len_hist,
+                                          len.second - len.first);
                 stats["core-length"].update(len.second - len.first);
             }
             base_count += bamdata->core.l_qseq;
-            hist_len.push(bamdata->core.l_qseq);
-
-            hist_cores.push(lcps.cores.size());
-
-            if ((read_count % *update_frequency) == 0) {
-                printf(
-                    "\rcount: %llu\tbase-count: %llu\t length(µ,σ): %.2lf "
-                    "%.2lf\tcores(µ,σ): %.2lf %.2lf\t core-lengths(µ,σ): %.2lf "
-                    "%.2lf    "
-                    "                       \n",
-                    read_count, base_count, stats["length"].mean,
-                    stats["length"].stddev(), stats["core-count"].mean,
-                    stats["core-count"].stddev(), stats["core-length"].mean,
-                    stats["core-length"].stddev());
-                fflush(stdout);
-                int reroll_count = 1;
-                reroll_count += hist_len.print(stdout);
-                reroll_count += hist_cores.print(stdout);
-                reroll_count += hist_core_lens.print(stdout);
-                hist_len.reroll(stdout, reroll_count);
+            screen.pushHistogram<int>(read_len_hist, bamdata->core.l_qseq);
+            screen.pushHistogram<int>(core_count_hist, lcps.cores.size());
+            screen.setTextValues<uint64_t, uint64_t, double, double, double,
+                                 double, double, double>(
+                text, read_count, base_count, stats["length"].mean,
+                stats["length"].stddev(), stats["core-count"].mean,
+                stats["core-count"].stddev(), stats["core-length"].mean,
+                stats["core-length"].stddev());
+            if (read_count % *update_frequency == 0) {
+                screen.update();
             }
             ++read_count;
+            // screen.update();
+            while (tb_peek_event(&ev, 0) != TB_ERR_NO_EVENT) {
+                if (ev.type == TB_EVENT_KEY && ev.key == TB_KEY_CTRL_C)
+                    goto enough;
+            }
         }
-        printf(
-            "\rcount: %llu\tbase-count: %llu\t length(µ,σ): %.2lf "
-            "%.2lf\tcores(µ,σ): %.2lf %.2lf\t core-lengths(µ,σ): %.2lf "
-            "%.2lf    "
-            "                       \n",
-            read_count, base_count, stats["length"].mean,
-            stats["length"].stddev(), stats["core-count"].mean,
-            stats["core-count"].stddev(), stats["core-length"].mean,
-            stats["core-length"].stddev());
-        fflush(stdout);
-        int reroll_count = 1;
-        hist_len.print(stdout);
-        hist_cores.print(stdout);
-        hist_core_lens.print(stdout);
+    enough:
         return 0;
     });
 }
