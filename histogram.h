@@ -5,7 +5,6 @@
 // For termbox2: define implementation and compatibility
 // #include <__format/format_functions.h>
 #include <format>
-#include <iostream>
 #include <print>
 #define TB_IMPL
 #define TB_OPT_V1_COMPAT
@@ -167,11 +166,14 @@ class Screen {
     bool running = true;
     Screen(int r, int c) : gridR(r), gridC(c) {
         if (tb_init()) throw;
+        
         tb_clear();
         std::signal(SIGINT, [](int) {
             tb_shutdown();
             std::exit(0);
         });
+        tb_set_input_mode(TB_INPUT_MOUSE );
+
         compute();
     }
     ~Screen() { tb_shutdown(); }

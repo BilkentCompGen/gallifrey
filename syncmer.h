@@ -1,4 +1,6 @@
-
+#pragma once
+#ifndef _SYNCMER_H_
+#define _SYNCMER_H_
 
 #include "circularqueue.h"
 #include "config.h"
@@ -140,3 +142,6 @@ template <SyncmerRule Rule> struct syncmer_precomputed { // TODO maybe bloom fil
 };
 
 } // namespace syncmer
+
+
+#endif 
