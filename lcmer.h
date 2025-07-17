@@ -1,14 +1,15 @@
-#pragma  once
+#pragma once
+#include <iterator>
 #ifndef LCMER_H
 #define LCMER_H
+#include <htslib/sam.h>
+
 #include <algorithm>
 #include <array>
+#include <gtl/vector.hpp>
 
 #include "config.h"
-
 #include "ext/lcptools/lcptools_ho.h"
-#include <htslib/sam.h>
-#include <gtl/vector.hpp>
 
 uint32_t MurmurHash3_32(const void *key, int len, uint32_t seed);
 
@@ -26,8 +27,11 @@ struct lcmer {
     std::array<uint32_t, N> data;
 
     lcmer() {}
-    lcmer(auto it) { std::copy(it, it + N, std::begin(data)); }
-
+    lcmer(const lcmer<N> &other) {
+        memcpy(this->data.data(), other.data.data(), N * sizeof(uint32_t));
+    }
+    lcmer(std::forward_iterator auto it) { std::copy(it, it + N, std::begin(data)); }
+    
     bool operator==(const lcmer &other) const {
         for (int i = 0; i < N; ++i) {
             if (data[i] != other.data[i]) return false;
@@ -108,10 +112,12 @@ T reverse_complement_kmer(T kmer, int K) {
 
 template <int _K, typename INT_TYPE = uint32_t>
 struct KmerViewOnNibbles {
+    static constexpr int tab[] = { 4, 0, 1, 4, 2, 4, 4, 4, 3, 4, 4, 4, 4, 4, 4, 4 };
+
     using int_type = INT_TYPE;
     static constexpr int k = _K;
     int_type value;
-    static constexpr int_type KMASK = ((int_type)1 << k) - 1;
+    static constexpr int_type KMASK = ((int_type)1 << (2 * k)) - 1;
     uint8_t nibble_mask = 15;
     KmerViewOnNibbles() : value{0} {}
 
@@ -125,7 +131,7 @@ struct KmerViewOnNibbles {
     int_type move_get(const uint8_t *data_address, int index) {
         value <<= 2;
         if constexpr (KMASK != -1) value &= KMASK;
-        value |= bam_seqi(data_address, index);
+        value |= tab[bam_seqi(data_address, index)];
         return value & KMER_SPACE_MASK;
     }
 
@@ -155,7 +161,8 @@ void init_core_kmer_xor(struct core *cr, _T Kval, uint64_t si, uint64_t ei) {
     cr->bit_size = 2 * SYNCMER_K;
 }
 
-uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len, struct core *cores);
+uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
+                             struct core *cores);
 
 uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores);
 

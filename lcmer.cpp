@@ -7,9 +7,9 @@ void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
     cr->start = si;
     cr->end = ei;
     cr->label = 0;
-    cr->label |= ((distance - 2) << 6);
-    cr->label |= (bam_seqi(data, si) << 4);
-    cr->label |= (bam_seqi(data, si + distance - 2) << 2);
+    cr->label |= ((distance - 2) << 12);
+    cr->label |= (bam_seqi(data, si) << 8);
+    cr->label |= (bam_seqi(data, si + distance - 2) << 4);
     cr->label |= (bam_seqi(data, si + distance - 1));
     cr->bit_rep = 0x8000000000000000 | cr->label;
     cr->bit_size = 2 * distance;
@@ -25,6 +25,7 @@ uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
     int64_t it1 = kmer_view.fill(data);
     // find lcp cores
     for (; it1 + SYNCMER_K < len; it1++) {
+        // printf("%d\t%d\n", kmer_view.get(), table[kmer_view.get()]);
         if (table[kmer_view.get()]) {
             init_core_kmer<uint32_t>(&(cores[core_index]), kmer_view.get(), it1,
                                      it1 + SYNCMER_K);
@@ -97,7 +98,6 @@ lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
     lcp_read lr;
     lr.reserve(str.size);
     for (int i = 0; i < str.size; ++i) {
-        // fprintf(stderr, "%u\n", str.cores[i].bit_size);
         lr.cores.emplace_back(str.cores[i].label);
         lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
     }

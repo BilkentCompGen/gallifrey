@@ -131,12 +131,13 @@ struct DensitySyncmerRule {
 
 template <SyncmerRule Rule> struct syncmer_precomputed { // TODO maybe bloom filter version
   using rule = Rule;
-  const size_t size = 1 << (2 * Rule::K - 1);
+  constexpr static size_t size = 2 << (2 * Rule::K-1);
   gtl::bit_vector lut;
   syncmer_precomputed() : lut(size) {
     for (size_t i = 0; i < size; ++i) {
       lut.set(i, rule::is_syncmer(i & KMER_SPACE_MASK));
     }
+    // std::cout << size <<"\t" << lut << "\n";
   }
   constexpr bool operator[](size_t idx) const noexcept { return lut[idx]; }
 };

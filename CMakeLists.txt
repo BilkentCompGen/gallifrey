@@ -11,7 +11,7 @@ endif()
 set(CMAKE_CXX_FLAGS "-Wall -Wextra")
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-set(CMAKE_CXX_FLAGS "-O3 -march=native -ftree-vectorize  -Wno-interference-size")
+set(CMAKE_CXX_FLAGS "-O3 -march=native -ftree-vectorize  -Wno-interference-size -Wall -Wextra -pedantic")
 endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(HTS REQUIRED htslib)
@@ -64,11 +64,10 @@ FetchContent_Declare(
 
 
 
-target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue pthread deflate)
+target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue pthread deflate z )
 
 
 add_test(NAME TestBAM COMMAND lasm -i input.bam -o tst.fa)
 
 
-
-target_compile_definitions(${PROJECT_NAME} PUBLIC SYNCMER_RULE=OpenSyncmerRule LCMER_L=24 SYNCMER_S=2 SYNCMER_T=3 SYNCMER_K=8)
+target_compile_definitions(${PROJECT_NAME} PUBLIC SYNCMER_RULE=DensitySyncmerRule LCMER_L=16 SYNCMER_S=3 SYNCMER_T=55 SYNCMER_K=6)
