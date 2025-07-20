@@ -12,6 +12,7 @@
 #include <type_traits>
 
 namespace syncmer {
+  
 
 template <class INT_TYPE> struct murmur {
   using type = INT_TYPE;
@@ -134,6 +135,20 @@ template <SyncmerRule Rule> struct syncmer_precomputed { // TODO maybe bloom fil
   constexpr static size_t size = 2 << (2 * Rule::K-1);
   gtl::bit_vector lut;
   syncmer_precomputed() : lut(size) {
+    for (size_t i = 0; i < size; ++i) {
+      lut.set(i, rule::is_syncmer(i & KMER_SPACE_MASK));
+    }
+    // std::cout << size <<"\t" << lut << "\n";
+  }
+  constexpr bool operator[](size_t idx) const noexcept { return lut[idx]; }
+};
+
+
+template <SyncmerRule Rule> struct syncmer_precomputed_nibble { // TODO maybe bloom filter version
+  using rule = Rule;
+  constexpr static size_t size = 2 << (2 * Rule::K-1);
+  gtl::bit_vector lut;
+  syncmer_precomputed_nibble() : lut(size) {
     for (size_t i = 0; i < size; ++i) {
       lut.set(i, rule::is_syncmer(i & KMER_SPACE_MASK));
     }

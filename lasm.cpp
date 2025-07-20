@@ -28,7 +28,7 @@ int asm_program(CLI::App &parent) {
         ->capture_default_str();
 
     bloom_param *bparam = new bloom_param;
-    bparam->projected_count = 1'000'000;
+    bparam->projected_count = 100'000'000;
     bparam->false_positive_rate = 0.0001;
     bparam->seed = 0xA5A5A5A5;
     auto bfg =

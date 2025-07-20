@@ -21,13 +21,13 @@ syncmer::syncmer_precomputed<
 uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
                              struct core *cores) {
     int core_index = 0;
-    KmerViewOnNibbles<SYNCMER_K, uint32_t> kmer_view;
+    KmerViewOnNibbles<SYNCMER_K, uint32_t, 2> kmer_view;
     int64_t it1 = kmer_view.fill(data);
     // find lcp cores
     for (; it1 + SYNCMER_K < len; it1++) {
         // printf("%d\t%d\n", kmer_view.get(), table[kmer_view.get()]);
         if (table[kmer_view.get()]) {
-            init_core_kmer<uint32_t>(&(cores[core_index]), kmer_view.get(), it1,
+            init_core_kmer<uint32_t,2>(&(cores[core_index]), kmer_view.get(), it1,
                                      it1 + SYNCMER_K);
             core_index++;
         }
@@ -37,7 +37,25 @@ uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
     // cout << "CORESSS" << it1 << "\t" << it2 << "\n";
     return core_index;
 }
-
+uint64_t parse1_kseq_syncmers(const char *data, int64_t len,
+                             struct core *cores) {
+    int core_index = 0;
+    KmerViewOnBytes<SYNCMER_K, uint32_t, 2> kmer_view;
+    int64_t it1 = kmer_view.fill(data);
+    // find lcp cores
+    for (; it1 + SYNCMER_K < len; it1++) {
+        // printf("%d\t%d\n", kmer_view.get(), table[kmer_view.get()]);
+        if (table[kmer_view.get()]) {
+            init_core_kmer<uint32_t,2>(&(cores[core_index]), kmer_view.get(), it1,
+                                     it1 + SYNCMER_K);
+            core_index++;
+        }
+        kmer_view.move_get(data, it1);
+        // cout << "None\n";
+    }
+    // cout << "CORESSS" << it1 << "\t" << it2 << "\n";
+    return core_index;
+}
 uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores) {
     int64_t it1 = 0;
     int64_t it2 = len;
@@ -88,12 +106,37 @@ void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len) {
     lps_ptr->size = parse1_bam_syncmers(data, len, lps_ptr->cores);
 }
 
+void init_lps_kseq(lps *lps_ptr, const char *data, size_t len) {
+    lps_ptr->level = 1;
+    lps_ptr->size = 0;
+    lps_ptr->cores =
+        (struct core *)malloc((len / CONSTANT_FACTOR) * sizeof(struct core));
+    lps_ptr->size = parse1_kseq_syncmers(data, len, lps_ptr->cores);
+}
+
+
+
 lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
                                      int lcp_level) {
     // uint64_t estimated_core_size = (int)(len / std::pow(1.5, lcp_level));
 
     lps str;
     init_lps_bam(&str, data, len);
+    lps_deepen(&str, lcp_level);
+    lcp_read lr;
+    lr.reserve(str.size);
+    for (int i = 0; i < str.size; ++i) {
+        lr.cores.emplace_back(str.cores[i].label);
+        lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
+    }
+    free_lps(&str);
+    return lr;
+}
+lcp_read parse_cores_from_kseq(const char *s, size_t len, int lcp_level) {
+    // uint64_t estimated_core_size = (int)(len / std::pow(1.5, lcp_level));
+
+    lps str;
+    init_lps_kseq(&str, s, len);
     lps_deepen(&str, lcp_level);
     lcp_read lr;
     lr.reserve(str.size);

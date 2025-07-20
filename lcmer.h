@@ -30,8 +30,10 @@ struct lcmer {
     lcmer(const lcmer<N> &other) {
         memcpy(this->data.data(), other.data.data(), N * sizeof(uint32_t));
     }
-    lcmer(std::forward_iterator auto it) { std::copy(it, it + N, std::begin(data)); }
-    
+    lcmer(std::forward_iterator auto it) {
+        std::copy(it, it + N, std::begin(data));
+    }
+
     bool operator==(const lcmer &other) const {
         for (int i = 0; i < N; ++i) {
             if (data[i] != other.data[i]) return false;
@@ -110,15 +112,15 @@ T reverse_complement_kmer(T kmer, int K) {
     return kmer;
 }
 
-template <int _K, typename INT_TYPE = uint32_t>
+template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
 struct KmerViewOnNibbles {
-    static constexpr int tab[] = { 4, 0, 1, 4, 2, 4, 4, 4, 3, 4, 4, 4, 4, 4, 4, 4 };
+    static constexpr int tab[] = {4, 0, 1, 4, 2, 4, 4, 4,
+                                  3, 4, 4, 4, 4, 4, 4, 4};
 
     using int_type = INT_TYPE;
     static constexpr int k = _K;
     int_type value;
-    static constexpr int_type KMASK = ((int_type)1 << (2 * k)) - 1;
-    uint8_t nibble_mask = 15;
+    static constexpr int_type KMASK = ((int_type)1 << (BIT_WIDTH * k)) - 1;
     KmerViewOnNibbles() : value{0} {}
 
     int fill(const uint8_t *data_address) {
@@ -129,10 +131,47 @@ struct KmerViewOnNibbles {
         return i;
     }
     int_type move_get(const uint8_t *data_address, int index) {
-        value <<= 2;
+        value <<= BIT_WIDTH;
         if constexpr (KMASK != -1) value &= KMASK;
-        value |= tab[bam_seqi(data_address, index)];
-        return value & KMER_SPACE_MASK;
+        if constexpr (BIT_WIDTH == 2) {
+            value |= tab[bam_seqi(data_address, index)];
+        } else {
+            value |= bam_seqi(data_address, index);
+        }
+        value = value & KMER_SPACE_MASK;
+        return value;
+    }
+
+    constexpr int_type get() const noexcept { return value & KMER_SPACE_MASK; }
+};
+
+template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
+struct KmerViewOnBytes {
+    static constexpr int tab[] = {['A']=0, ['C']=1, ['G']=2, ['T']=3, ['N']=0, ['a'] = 0, ['c']=1, ['g']=2, ['t'] = 3};
+
+    using int_type = INT_TYPE;
+    static constexpr int k = _K;
+    int_type value;
+    static constexpr int_type KMASK = ((int_type)1 << (BIT_WIDTH * k)) - 1;
+    KmerViewOnBytes() : value{0} {}
+
+    int fill(const char *data) {
+        int i;
+        for (i = 0; i < k; i++) {
+            move_get(data, i);
+        }
+        return i;
+    }
+    int_type move_get(const char *data, int index) {
+        value <<= BIT_WIDTH;
+        if constexpr (KMASK != -1) value &= KMASK;
+        if constexpr (BIT_WIDTH == 2) {
+            value |= tab[data[index]];
+        } else {
+            value |= data[index];
+        }
+        value = value & KMER_SPACE_MASK;
+        return value;
     }
 
     constexpr int_type get() const noexcept { return value & KMER_SPACE_MASK; }
@@ -141,14 +180,14 @@ struct KmerViewOnNibbles {
 void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
                    uint64_t si, uint64_t ei);
 
-template <typename _T>
+template <typename _T, int WIDTH = 2>
 void init_core_kmer(struct core *cr, _T Kval, uint64_t si, uint64_t ei) {
     cr->start = si;
     cr->end = ei;
     cr->label = 0;
     cr->label |= Kval;
     cr->bit_rep = 0x8000000000000000 | cr->label;
-    cr->bit_size = 2 * SYNCMER_K;
+    cr->bit_size = WIDTH * SYNCMER_K;
 }
 
 template <typename _T>
@@ -172,4 +211,6 @@ void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len);
 lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
                                      int lcp_level);
 
+lcp_read parse_cores_from_kseq(const char *data, size_t len,
+                                     int lcp_level);
 #endif

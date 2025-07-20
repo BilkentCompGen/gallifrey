@@ -1,14 +1,17 @@
 #include "asm.h"
 
-#include <_stdio.h>
+#include <string_view>
+
+// #include <algorithm>
 #include <concurrentqueue.h>
 #include <htslib/bgzf.h>
 #include <htslib/hfile.h>
-#include <htslib/sam.h>
 #include <htslib/hts.h>
+#include <htslib/sam.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <zlib.h>
 
-
-#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <gtl/phmap.hpp>
@@ -19,6 +22,8 @@
 #include "bgzf.h"
 #include "config.h"
 #include "ext/bloom_filter.hpp"
+#include "ext/kseq.h"
+#include "ext/sam_internal.h"
 #include "gtl/phmap_fwd_decl.hpp"
 #include "lcmer.h"
 
@@ -26,15 +31,13 @@
 // means each overlap takes 16 bytes instead.
 
 using mutex_type = std::mutex;
-int hts_useek(htsFile *fp, off_t uoffset, int where)
-{
+int hts_useek(htsFile *fp, off_t uoffset, int where) {
     if (fp->is_bgzf)
         return bgzf_useek(fp->fp.bgzf, uoffset, where);
     else
-        return (hseek(fp->fp.hfile, uoffset, SEEK_SET) >= 0)? 0 : -1;
+        return (hseek(fp->fp.hfile, uoffset, SEEK_SET) >= 0) ? 0 : -1;
 }
-off_t hts_utell(htsFile *fp)
-{
+off_t hts_utell(htsFile *fp) {
     if (fp->is_bgzf)
         return bgzf_utell(fp->fp.bgzf);
     else
@@ -42,9 +45,10 @@ off_t hts_utell(htsFile *fp)
 }
 struct bidbg_val {
     gtl::flat_hash_set<uint64_t> prev;
-    gtl::flat_hash_set<uint64_t> next;
+    // gtl::flat_hash_set<uint64_t> next;
     int cc;
     gtl::vector<std::pair<uint64_t, int>> merged;
+    char *seq = NULL;
 };
 using bidbg = gtl::parallel_flat_hash_map<
     uint64_t, bidbg_val, std::hash<uint64_t>,
@@ -56,7 +60,7 @@ using lcmer_index_map_t = gtl::parallel_node_hash_map<
     std::allocator<std::pair<const lcmer<LCMER_L>, uint64_t>>, 12, mutex_type>;
 
 using reverse_lcmer_idx_t = gtl::parallel_node_hash_map<
-    uint64_t, const lcmer<LCMER_L>, gtl::priv::hash_default_hash<uint64_t>,
+    uint64_t, const lcmer<LCMER_L> *, gtl::priv::hash_default_hash<uint64_t>,
     gtl::priv::hash_default_eq<uint64_t>,
     std::allocator<std::pair<const uint64_t, const lcmer<LCMER_L> *>>, 4,
     mutex_type>;
@@ -66,6 +70,18 @@ struct lcmer_index_t {
     bloom_filter bf;
     lcmer_index_t(const bloom_parameters &bparam) : bf{bparam} {}
 
+    void compute_inverse() {
+        for (const auto &[k, v] : map) {
+            rev.try_emplace(v, &k);
+        }
+    }
+    uint64_t get(const lcmer<LCMER_L> &l) const {
+        auto it = map.find(l);
+        if (it != map.end()) {
+            return it->second;
+        }
+        return 0;
+    }
     uint64_t emplace(const lcmer<LCMER_L> &l, uint64_t &idx, int tid) {
         if (!bf.contains(l)) {
             bf.insert(l);
@@ -146,38 +162,6 @@ bool validate_sam_read(int ret, const BAMReader &reader, const Chunk &chunk) {
 }
 
 /**
- * @brief Generates chunks of SAM/BAM blocks and enqueues them into a concurrent
- * queue.
- *
- * This function instantiates a BAMReader for the given input filename, iterates
- * over its blocks using a BlockIterator, and groups consecutive blocks up to a
- * specified chunk size (BAMREAD_CHUNK_SIZE). It then attempts to enqueue each
- * generated chunk into a moodycamel::ConcurrentQueue of Chunk objects.
- *
- * @param input The path to the input SAM/BAM file.
- * @param chunk_queue A reference to a moodycamel::ConcurrentQueue where chunks
- * will be enqueued.
- */
-auto generate_chunks(std::string input,
-                     moodycamel::ConcurrentQueue<Chunk> &chunk_queue) {
-    BAMReader reader{input};
-    BlockIterator iter(reader.fp);
-    Block blk;
-    // fetch chunks until no more blocks
-    while (iter.next(blk)) {
-        // first block in chunk
-        int64_t first_vstart = blk.vstart();
-        int64_t last_vend = blk.vend();
-
-        size_t count = 1;
-        while (count < BAMREAD_CHUNK_SIZE && iter.next(blk)) {
-            last_vend = blk.vend();
-            ++count;
-        }
-        while (!chunk_queue.try_enqueue({first_vstart, last_vend}));
-    }
-}
-/**
  * @brief Processes cores by generating LCmers and calculates overlaps stores
  * core locations on the bam file.
  *
@@ -212,34 +196,18 @@ auto generate_chunks(std::string input,
  * @param read_index Identifier for the current read in processing.
  */
 auto process_cores(const lcp_read &lr, lcmer_index_t &lci, int thread_id,
-                   uint64_t &lcmer_index, overlap_idx_t &ovlps, bidbg &dbg,
-                   BGZFCoreIndex &core_index, int64_t bgzf_here,
+                   uint64_t &lcmer_index, bidbg &dbg, int64_t bgzf_here,
                    unsigned read_index) {
     lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
     uint64_t two_cores = lr.cores[0];
-    core_index.emplace(
-        lr.cores[1], coreaddress_in_bgzf{bgzf_here, read_index, lr.pos[1].first,
-                                         lr.pos[1].second});
 
-    for (int i = 1; i < LCMER_L + 1; ++i) {
-        two_cores = (two_cores << 32) | lr.cores[i];
-        ovlps.try_emplace(two_cores, lr.pos[i - 1].second - lr.pos[i].first);
-        core_index.emplace(lr.cores[i], coreaddress_in_bgzf{
-                                            bgzf_here, read_index,
-                                            lr.pos[i].first, lr.pos[i].second});
-    }
     gtl::vector<uint64_t> ll(1, 0);
     ll.reserve(lr.cores.size() - LCMER_L + 3);
     ll.push_back(lci.emplace(l, lcmer_index, thread_id));
     for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
-        two_cores = (two_cores << 32) | lr.cores[i];
-        ovlps.try_emplace(two_cores, lr.pos[i - 1].second - lr.pos[i].first);
         uint32_t in_core = lr.cores[i];
         uint32_t out_core = l.update_lcmer(in_core);
         ll.push_back(lci.emplace(l, lcmer_index, thread_id));
-        core_index.emplace(lr.cores[i], coreaddress_in_bgzf{
-                                            bgzf_here, read_index,
-                                            lr.pos[i].first, lr.pos[i].second});
     }
     ll.push_back(0);
 
@@ -252,13 +220,9 @@ auto process_cores(const lcp_read &lr, lcmer_index_t &lci, int thread_id,
                 continue;
             } else {
                 dbg.lazy_emplace_l(
-                    ll[i],
-                    [&](bidbg::value_type &val) {
-                        val.second.next.emplace(ll[i + 1]);
-                        val.second.cc++;
-                    },
+                    ll[i], [&](bidbg::value_type &val) { val.second.cc++; },
                     [&](const bidbg::constructor &ctr) {
-                        ctr(ll[i], bidbg_val{{}, {ll[i + 1]}, 1});
+                        ctr(ll[i], bidbg_val{{}, 1});
                     });
             }
         } else {
@@ -270,96 +234,374 @@ auto process_cores(const lcp_read &lr, lcmer_index_t &lci, int thread_id,
                         val.second.cc++;
                     },
                     [&](const bidbg::constructor &ctr) {
-                        ctr(ll[i], bidbg_val{{ll[i - 1]}, {}, 1});
+                        ctr(ll[i], bidbg_val{{ll[i - 1]}, 1, {}});
                     });
             } else {
                 dbg.lazy_emplace_l(
                     ll[i],
                     [&](bidbg::value_type &val) {
                         val.second.prev.emplace(ll[i - 1]);
-                        val.second.next.emplace(ll[i + 1]);
                         val.second.cc++;
                     },
                     [&](const bidbg::constructor &ctr) {
-                        ctr(ll[i], bidbg_val{{ll[i - 1]}, {ll[i + 1]}, 1});
+                        ctr(ll[i], bidbg_val{{ll[i - 1]}, 1, {}});
                     });
             }
         }
     }
 }
 
-auto process_chunks(const std::string &input, int thread_id, int lcp_level,
-                    moodycamel::ConcurrentQueue<Chunk> &chunk_queue, bidbg &dbg,
-                    overlap_idx_t &ovlps, BGZFCoreIndex &core_loc_idx,
-                    lcmer_index_t &lci, std::atomic<bool> &done,
-                    int &processed_read_count, int &all_reads) {
-    uint64_t lcmer_index = 0;
-    Chunk chunk;
-    BAMReader reader{input};
-    std::unique_ptr<bam1_t, decltype(&bam_destroy1)> rec(bam_init1(),
-                                                         bam_destroy1);
-    sam_hdr_t *hdr = NULL;
+struct BAMKit {
+    /**
+     * @brief Generates chunks of SAM/BAM blocks and enqueues them into a
+     * concurrent queue.
+     *
+     * This function instantiates a BAMReader for the given input filename,
+     * iterates over its blocks using a BlockIterator, and groups consecutive
+     * blocks up to a specified chunk size (BAMREAD_CHUNK_SIZE). It then
+     * attempts to enqueue each generated chunk into a
+     * moodycamel::ConcurrentQueue of Chunk objects.
+     *
+     * @param input The path to the input SAM/BAM file.
+     * @param chunk_queue A reference to a moodycamel::ConcurrentQueue where
+     * chunks will be enqueued.
+     */
+    static auto generate_chunks(
+        std::string input, moodycamel::ConcurrentQueue<Chunk> &chunk_queue) {
+        BAMReader reader{input};
+        BlockIterator iter(reader.fp);
+        Block blk;
+        // fetch chunks until no more blocks
+        while (iter.next(blk)) {
+            // first block in chunk
+            int64_t first_vstart = blk.vstart();
+            int64_t last_vend = blk.vend();
 
-    while (chunk_queue.size_approx() > 0 || !done.load()) {
-        if (!chunk_queue.try_dequeue(chunk)) {
-            continue;
+            size_t count = 1;
+            while (count < BAMREAD_CHUNK_SIZE && iter.next(blk)) {
+                last_vend = blk.vend();
+                ++count;
+            }
+            while (!chunk_queue.try_enqueue({first_vstart, last_vend}));
         }
-        if (chunk.vstart > 0) {
-            if (bgzf_seek(reader.fp->fp.bgzf, chunk.vstart, SEEK_SET) < 0) {
-                std::cerr << "bgzf_seek failed on chunk vstart=" << chunk.vstart
-                          << "\n";
-                std::exit(EXIT_FAILURE);
-            }
-        }
-        int src = 0;
-        while (true) {
-            int64_t here = bgzf_tell(reader.fp->fp.bgzf);
-            if (here >= chunk.vend) {
-                break;
-            }
-            auto telled = hts_utell(reader.fp);
-            int ret = sam_read1(reader.fp, hdr, rec.get());
-            ++src;
-            if (!validate_sam_read(ret, reader, chunk)) {
-                break;
-            }
-            lcp_read lr = parse_cores_from_bam_record(
-                bam_get_seq(rec.get()), rec->core.l_qseq, lcp_level);
-            if (lr.cores.size() < LCMER_L + 2) {
-                // printf("Skipping read %lld, cores.size()=%zu\n", here,
-                // lr.cores.size());
+    }
+    static auto process_chunks(const std::string &input, int thread_id,
+                               int lcp_level,
+                               moodycamel::ConcurrentQueue<Chunk> &chunk_queue,
+                               bidbg &dbg, lcmer_index_t &lci,
+                               std::atomic<bool> &done,
+                               int &processed_read_count, int &all_reads) {
+        uint64_t lcmer_index = 0;
+        Chunk chunk;
+        BAMReader reader{input};
+        std::unique_ptr<bam1_t, decltype(&bam_destroy1)> rec(bam_init1(),
+                                                             bam_destroy1);
+        sam_hdr_t *hdr = NULL;
+
+        while (chunk_queue.size_approx() > 0 || !done.load()) {
+            if (!chunk_queue.try_dequeue(chunk)) {
                 continue;
             }
-            ++processed_read_count;
-            process_cores(lr, lci, thread_id, lcmer_index, ovlps, dbg,
-                          core_loc_idx, telled, src);
+            if (chunk.vstart > 0) {
+                if (bgzf_seek(reader.fp->fp.bgzf, chunk.vstart, SEEK_SET) < 0) {
+                    std::cerr
+                        << "bgzf_seek failed on chunk vstart=" << chunk.vstart
+                        << "\n";
+                    std::exit(EXIT_FAILURE);
+                }
+            }
+            int src = 0;
+            while (true) {
+                int64_t here = bgzf_tell(reader.fp->fp.bgzf);
+                if (here >= chunk.vend) {
+                    break;
+                }
+                auto telled = hts_utell(reader.fp);
+                int ret = sam_read1(reader.fp, hdr, rec.get());
+                ++src;
+                if (!validate_sam_read(ret, reader, chunk)) {
+                    break;
+                }
+                lcp_read lr = parse_cores_from_bam_record(
+                    bam_get_seq(rec.get()), rec->core.l_qseq, lcp_level);
+                if (lr.cores.size() < LCMER_L + 2) {
+                    // printf("Skipping read %lld, cores.size()=%zu\n", here,
+                    // lr.cores.size());
+                    continue;
+                }
+                ++processed_read_count;
+                process_cores(lr, lci, thread_id, lcmer_index, dbg, telled,
+                              src);
+            }
+            all_reads += src;
+            // printf("%zu\n", );
         }
-        all_reads += src;
-        // printf("%zu\n", );
     }
-}
 
-auto construct_dbg_v4(std::string input, int threads, int lcp_level,
-                      const bloom_parameters &bparam) {
+    static auto reverse_process_cores(uint8_t *seq_nibble, const lcp_read &lr,
+                                      const lcmer_index_t &lci, bidbg &dbg) {
+        lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
+
+        uint64_t val = lci.get(l);
+        for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
+            int ovlp = lr.pos[i - 1].second - lr.pos[i].first;
+            int slen = lr.pos[i].second - lr.pos[i - 1].second;
+            dbg.modify_if(val, [&](bidbg::value_type &val) {
+                if (val.second.seq == NULL) {
+                    if (slen > 0) {
+                        val.second.seq = (char *)malloc(slen + 1);
+                        nibble2base(seq_nibble, val.second.seq, slen);
+                        val.second.seq[slen] = '\0';
+                    } else {
+                        val.second.seq = (char *)malloc(1);
+                        val.second.seq[0] = '\0';
+                    }
+                }
+            });
+            uint32_t in_core = lr.cores[i];
+            uint32_t out_core = l.update_lcmer(in_core);
+            val = lci.get(l);
+        }
+    }
+    static void convert2basespace(std::string input, FILE *out, bidbg &dbg,
+                                  const lcmer_index_t &lci, int threads,
+                                  int lcp_level) {
+        moodycamel::ConcurrentQueue<Chunk> chunk_queue{100000, 1, 1};
+        std::atomic<bool> done{false};
+        gtl::vector<std::thread> workers;
+        for (int i = 1; i < threads; ++i) {
+            workers.emplace_back(
+                [&](int tid) {
+                    uint64_t lcmer_index = 0;
+                    Chunk chunk;
+                    BAMReader reader{input};
+                    std::unique_ptr<bam1_t, decltype(&bam_destroy1)> rec(
+                        bam_init1(), bam_destroy1);
+                    sam_hdr_t *hdr = NULL;
+
+                    while (chunk_queue.size_approx() > 0 || !done.load()) {
+                        if (!chunk_queue.try_dequeue(chunk)) {
+                            continue;
+                        }
+                        if (chunk.vstart > 0) {
+                            if (bgzf_seek(reader.fp->fp.bgzf, chunk.vstart,
+                                          SEEK_SET) < 0) {
+                                std::cerr << "bgzf_seek failed on chunk vstart="
+                                          << chunk.vstart << "\n";
+                                std::exit(EXIT_FAILURE);
+                            }
+                        }
+                        int src = 0;
+                        while (true) {
+                            int64_t here = bgzf_tell(reader.fp->fp.bgzf);
+                            if (here >= chunk.vend) {
+                                break;
+                            }
+                            auto telled = hts_utell(reader.fp);
+                            int ret = sam_read1(reader.fp, hdr, rec.get());
+                            ++src;
+                            if (!validate_sam_read(ret, reader, chunk)) {
+                                break;
+                            }
+                            lcp_read lr = parse_cores_from_bam_record(
+                                bam_get_seq(rec.get()), rec->core.l_qseq,
+                                lcp_level);
+                            if (lr.cores.size() < LCMER_L + 2) {
+                                // printf("Skipping read %lld,
+                                // cores.size()=%zu\n", here, lr.cores.size());
+                                continue;
+                            }
+                            BAMKit::reverse_process_cores(
+                                bam_get_seq(rec.get()), lr, lci, dbg);
+                        }
+
+                        // printf("%zu\n", );
+                    }
+                },
+                i);
+        }
+        generate_chunks(input, chunk_queue);
+        done.store(true);
+        for (auto &worker : workers) {
+            worker.join();
+        }
+    }
+};
+
+struct FASTXKit {
+    KSEQ_INIT(int, read)
+
+    static auto reverse_process_cores(const char *seq, const lcp_read &lr,
+                               const lcmer_index_t &lci, bidbg &dbg) {
+        lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
+
+        uint64_t val = lci.get(l);
+        for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
+            int ovlp = lr.pos[i - 1].second - lr.pos[i].first;
+            int slen = lr.pos[i].second - lr.pos[i - 1].second;
+            dbg.modify_if(val, [&](bidbg::value_type &val) {
+                if (val.second.seq == NULL) {
+                    if (slen > 0) {
+                        val.second.seq = (char *)malloc(slen + 1);
+                        strncpy(val.second.seq, seq + lr.pos[i - 1].second,
+                                slen);
+                        val.second.seq[slen] = '\0';
+                    } else {
+                        val.second.seq = (char *)malloc(1);
+                        val.second.seq[0] = '\0';
+                    }
+                }
+            });
+            uint32_t in_core = lr.cores[i];
+            uint32_t out_core = l.update_lcmer(in_core);
+            val = lci.get(l);
+        }
+    }
+    static auto generate_chunks(
+        std::string input, moodycamel::ConcurrentQueue<Chunk> &chunk_queue) {
+        FILE *fp = fopen(input.c_str(), "rb");
+        fseek(fp, 0L, SEEK_END);
+        int64_t sz = ftell(fp);
+        fseek(fp, 0L, SEEK_SET);
+        // Lets say average read is 20K bases. We want CHUNK_SIZE reads in each
+        // chunk. so we want to seek intervals of 20K * CHUNK_SIZE;
+        int64_t chunk_size = 20000 * BAMREAD_CHUNK_SIZE;
+        int64_t current_seek = 0;
+        int64_t prev_seek = 0;
+        int64_t new_pos = 0;
+        char *buffer = NULL;
+        size_t cap = 128000;
+        do {
+            fseek(fp, chunk_size, SEEK_CUR);
+            while (getline(&buffer, &cap, fp) != -1) {
+                if (buffer[0] == '@' || buffer[0] == '>') {
+                    break;
+                }
+                new_pos = ftell(fp);
+            }
+
+            while (!chunk_queue.try_enqueue(Chunk{prev_seek, new_pos}));
+            prev_seek = new_pos;
+
+            current_seek += chunk_size;
+        } while (current_seek < sz - chunk_size);
+        while (!chunk_queue.try_enqueue(Chunk{prev_seek, sz}));
+        free(buffer);
+    }
+    static auto process_chunks(const std::string &input, int thread_id,
+                               int lcp_level,
+                               moodycamel::ConcurrentQueue<Chunk> &chunk_queue,
+                               bidbg &dbg, lcmer_index_t &lci,
+                               std::atomic<bool> &done,
+                               int &processed_read_count, int &all_reads) {
+        uint64_t lcmer_index = 0;
+        Chunk chunk;
+        FILE *fp = fopen(input.c_str(), "rb");
+        int64_t here = 0;
+
+        kseq_t *seq = kseq_init(fileno(fp));
+        while (chunk_queue.size_approx() > 0 || !done.load()) {
+            if (!chunk_queue.try_dequeue(chunk)) {
+                continue;
+            }
+            // printf("chunk %lld\t%lld\n", chunk.vstart, chunk.vend);
+            fseek(fp, chunk.vstart - here, SEEK_CUR);
+            while (kseq_read(seq) > 0) {
+                // printf("%s", buffer);
+
+                here = ftell(fp);
+                lcp_read lr =
+                    parse_cores_from_kseq(seq->seq.s, seq->seq.l, lcp_level);
+                ++all_reads;
+                if (lr.cores.size() < LCMER_L + 2) {
+                    // printf("Skipping read %lld, cores.size()=%zu\n", here,
+                    // lr.cores.size());
+                    continue;
+                }
+                ++processed_read_count;
+                process_cores(lr, lci, thread_id, lcmer_index, dbg, here, 0);
+                if (here >= chunk.vend) {
+                    break;
+                }
+            }
+            // break;
+            fflush(stdout);
+            // printf("%zu\n", );
+        }
+        kseq_destroy(seq);
+    }
+
+    static void convert2basespace(std::string input, FILE *out, bidbg &dbg,
+                                  const lcmer_index_t &lci, int threads,
+                                  int lcp_level) {
+        moodycamel::ConcurrentQueue<Chunk> chunk_queue{100000, 1, 1};
+        std::atomic<bool> done{false};
+        gtl::vector<std::thread> workers;
+        for (int i = 1; i < threads; ++i) {
+            workers.emplace_back(
+                [&](int tid) {
+                    uint64_t lcmer_index = 0;
+                    Chunk chunk;
+                    FILE *fp = fopen(input.c_str(), "rb");
+                    int64_t here = 0;
+
+                    kseq_t *seq = kseq_init(fileno(fp));
+                    while (chunk_queue.size_approx() > 0 || !done.load()) {
+                        if (!chunk_queue.try_dequeue(chunk)) {
+                            continue;
+                        }
+                        // printf("chunk %lld\t%lld\n", chunk.vstart,
+                        // chunk.vend);
+                        fseek(fp, chunk.vstart - here, SEEK_CUR);
+                        while (kseq_read(seq) > 0) {
+                            // printf("%s", buffer);
+
+                            here = ftell(fp);
+                            lcp_read lr = parse_cores_from_kseq(
+                                seq->seq.s, seq->seq.l, lcp_level);
+                            if (lr.cores.size() < LCMER_L + 2) {
+                                // printf("Skipping read %lld,
+                                // cores.size()=%zu\n", here, lr.cores.size());
+                                continue;
+                            }
+                            reverse_process_cores(seq->seq.s, lr, lci, dbg);
+                            if (here >= chunk.vend) {
+                                break;
+                            }
+                        }
+                        // break;
+                        fflush(stdout);
+                        // printf("%zu\n", );
+                    }
+                    kseq_destroy(seq);
+                },
+                i);
+        }
+        generate_chunks(input, chunk_queue);
+        done.store(true);
+        for (auto &worker : workers) {
+            worker.join();
+        }
+    }
+};
+template <class Kit>
+auto construct_dbg(std::string input, int threads, int lcp_level,
+                   const bloom_parameters &bparam) {
     moodycamel::ConcurrentQueue<Chunk> chunk_queue{100000, 1, 1};
     std::atomic<bool> done{false};
 
     bidbg dbg;
     lcmer_index_t lci{bparam};
-    BGZFCoreIndex core_index{.filename = input, .idx = {}};
-    overlap_idx_t ovlp_idx;
-
     gtl::vector<std::thread> workers;
     gtl::vector<int> rc(threads - 1, 0);
     gtl::vector<int> all_read_count(threads - 1, 0);
     for (int i = 0; i < threads - 1; ++i) {
-        workers.emplace_back(process_chunks, input, i + 1, lcp_level,
+        workers.emplace_back(Kit::process_chunks, input, i + 1, lcp_level,
                              std::ref(chunk_queue), std::ref(dbg),
-                             std::ref(ovlp_idx), std::ref(core_index),
                              std::ref(lci), std::ref(done), std::ref(rc[i]),
                              std::ref(all_read_count[i]));
     }
-    generate_chunks(input, chunk_queue);
+    Kit::generate_chunks(input, chunk_queue);
     done.store(true);
     for (auto &worker : workers) {
         worker.join();
@@ -372,7 +614,7 @@ auto construct_dbg_v4(std::string input, int threads, int lcp_level,
     }
     fprintf(stderr, "Processed %d reads: Used %d for the dbg and skipped %d\n",
             all_reads, used_reads, all_reads - used_reads);
-    return std::make_tuple(lci, core_index, ovlp_idx, dbg);
+    return std::make_tuple(lci, dbg);
 }
 
 struct sv {
@@ -567,16 +809,28 @@ void to_basespace(FILE *out, const unitig_ar_graph_t &g,
     }
 }
 
+void print_dbg_seqs(FILE *out, const bidbg &dbg) {
+    for (const auto &[lval, edges] : dbg) {
+        fprintf(out, "S\tC%llu\t%s\tLN:i:%zu\tRC:i:%d\n", lval,
+                edges.seq == NULL ? "" : edges.seq,
+                edges.seq == NULL ? 0 : strlen(edges.seq), edges.cc);
+        for (uint64_t nl : edges.prev) {
+            if (dbg.contains(nl))
+                fprintf(out, "L\tC%llu\t+\tC%llu\t+\t%dM\n", nl, lval, 0);
+        }
+    }
+}
 void print_dbg_v4(FILE *out, bidbg &dbg, lcmer_index_t &lci) {
     for (const auto &[lval, edges] : dbg) {
         int sum_cc = edges.cc;
-        for(const auto &p : edges.merged){
+        for (const auto &p : edges.merged) {
             sum_cc += p.second;
         }
         fprintf(out, "S\tC%llu\t*\tLN:i:%zu\tRC:i:%d\n", lval,
                 LCMER_L * (edges.merged.size() + 1) * 100, sum_cc);
         for (uint64_t nl : edges.prev) {
-            fprintf(out, "L\tC%llu\t+\tC%llu\t+\t%dM\n", nl, lval, 100 * (LCMER_L - 1));
+            fprintf(out, "L\tC%llu\t+\tC%llu\t+\t%dM\n", nl, lval,
+                    100 * (LCMER_L - 1));
         }
         // for (uint64_t nl : edges.next) {
         //     fprintf(out, "L\tC%llu\t-\tC%llu\t-\t0M\n", lval, nl);
@@ -584,45 +838,45 @@ void print_dbg_v4(FILE *out, bidbg &dbg, lcmer_index_t &lci) {
     }
 }
 
-void simplify_dbg(bidbg &dbg) {
-    for (auto &pair : dbg) {
-        if (pair.second.cc == -176) {
-            continue;
-        }
-        while (pair.second.next.size() == 1) {
-            auto np = dbg.find(*pair.second.next.begin());
-            if (np->second.prev.size() != 1) {
-                if (np->second.prev.size() > 1 &&
-                    pair.second.merged.size() > 0) {
-                    // for(const auto &p : np->second.prev){
-                    //     std::cout << p << "\t" <<
-                    //     pair.second.merged.back().first << "\n";
-                    // }
-                    np->second.prev.erase(pair.second.merged.back().first);
-                    np->second.prev.emplace(pair.first);
-                }
-                break;
-            }
-            pair.second.merged.emplace_back(np->first, np->second.cc);
-            pair.second.merged.insert(pair.second.merged.end(),
-                                      np->second.merged.begin(),
-                                      np->second.merged.end());
-            pair.second.next = np->second.next;
+// void simplify_dbg(bidbg &dbg) {
+//     for (auto &pair : dbg) {
+//         if (pair.second.cc == -176) {
+//             continue;
+//         }
+//         while (pair.second.next.size() == 1) {
+//             auto np = dbg.find(*pair.second.next.begin());
+//             if (np->second.prev.size() != 1) {
+//                 if (np->second.prev.size() > 1 &&
+//                     pair.second.merged.size() > 0) {
+//                     // for(const auto &p : np->second.prev){
+//                     //     std::cout << p << "\t" <<
+//                     //     pair.second.merged.back().first << "\n";
+//                     // }
+//                     np->second.prev.erase(pair.second.merged.back().first);
+//                     np->second.prev.emplace(pair.first);
+//                 }
+//                 break;
+//             }
+//             pair.second.merged.emplace_back(np->first, np->second.cc);
+//             pair.second.merged.insert(pair.second.merged.end(),
+//                                       np->second.merged.begin(),
+//                                       np->second.merged.end());
+//             pair.second.next = np->second.next;
 
-            np->second.cc = -176;
-            if (np->second.merged.size() > 0) {
-                break;
-            }
-        }
-    }
-    for (auto it = dbg.begin(), end = dbg.end(); it != end;) {
-        if (it->second.cc == -176) {
-            dbg._erase(it++);
-        } else {
-            ++it;
-        }
-    }
-}
+//             np->second.cc = -176;
+//             if (np->second.merged.size() > 0) {
+//                 break;
+//             }
+//         }
+//     }
+//     for (auto it = dbg.begin(), end = dbg.end(); it != end;) {
+//         if (it->second.cc == -176) {
+//             dbg._erase(it++);
+//         } else {
+//             ++it;
+//         }
+//     }
+// }
 
 struct bgzf_sort_helper {
     int i;
@@ -651,67 +905,77 @@ void fill_seqs(gtl::vector<bgzf_sort_helper> &to_sort, int l, int r,
             break;
         }
         int rv = sam_read1(reader.fp, hdr, rec.get());
-        if(rv < 0){
-            fprintf(stderr, "Something wrong reading %d %lld %lld\n", l, seek_pos, here);
+        if (rv < 0) {
+            fprintf(stderr, "Something wrong reading %d %lld %lld\n", l,
+                    seek_pos, here);
         }
         uint8_t *sd = bam_get_seq(rec.get());
-        for(int i = l; i < r; ++i){
-            ret[to_sort[i].i] = (char*) malloc(to_sort[i].address.to-to_sort[i].address.from + 1);
-            for(int j = to_sort[i].address.from ; j < to_sort[i].address.to; ++j){
-                ret[to_sort[i].i][j-to_sort[i].address.from] = seq_nt16_str[bam_seqi(sd, j)];
+        for (int i = l; i < r; ++i) {
+            ret[to_sort[i].i] = (char *)malloc(to_sort[i].address.to -
+                                               to_sort[i].address.from + 1);
+            for (int j = to_sort[i].address.from; j < to_sort[i].address.to;
+                 ++j) {
+                ret[to_sort[i].i][j - to_sort[i].address.from] =
+                    seq_nt16_str[bam_seqi(sd, j)];
             }
         }
     }
 }
-gtl::vector<char *> unitigs2bases(bidbg &dbg, uint64_t uidx,
-                                  const BGZFCoreIndex &bgzf,
-                                  const lcmer_index_t &lci) {
-    const bidbg::value_type &val = *dbg.find(uidx);
-    BAMReader reader(bgzf.filename);
+// gtl::vector<char *> unitigs2bases(bidbg &dbg, uint64_t uidx,
+//                                   const BGZFCoreIndex &bgzf,
+//                                   const lcmer_index_t &lci) {
+//     const bidbg::value_type &val = *dbg.find(uidx);
+//     BAMReader reader(bgzf.filename);
 
-    gtl::vector<char *> ret(val.second.merged.size() + LCMER_L, NULL);
-    gtl::vector<bgzf_sort_helper> to_sort;
-    to_sort.reserve(val.second.merged.size() + LCMER_L);
-    const lcmer<LCMER_L> &lbeg = lci.rev.at(val.first);
-    int i = 0;
-    std::cout << uidx << "\n";
-    for (uint32_t v : lbeg.data) {
-        // std::cout << "\t" << v << std::endl;
-        // std::cout << "\t" << bgzf.idx.at(v).seek << "\n";
-        to_sort.emplace_back(i, bgzf.idx.at(v));
-        ++i;
-    }
-    std::sort(to_sort.begin(), to_sort.end(),
-              [](const bgzf_sort_helper &a, const bgzf_sort_helper &b) {
-                  if (a.address.seek == b.address.seek)
-                      return a.address.idx < b.address.idx;
-                  return a.address.seek < b.address.seek;
-              });
-    size_t l = 0;
-    size_t r = 0;
-    for (; r < to_sort.size(); ++r) {
-        if (to_sort[r].address.seek != to_sort[l].address.seek) {
-            fill_seqs(to_sort, l, r, bgzf, ret, reader);
-            l = r;
-        }
-    }
-    return ret;
-}
+//     gtl::vector<char *> ret(val.second.merged.size() + LCMER_L, NULL);
+//     gtl::vector<bgzf_sort_helper> to_sort;
+//     to_sort.reserve(val.second.merged.size() + LCMER_L);
+//     const lcmer<LCMER_L> &lbeg = lci.rev.at(val.first);
+//     int i = 0;
+//     std::cout << uidx << "\n";
+//     for (uint32_t v : lbeg.data) {
+//         // std::cout << "\t" << v << std::endl;
+//         // std::cout << "\t" << bgzf.idx.at(v).seek << "\n";
+//         to_sort.emplace_back(i, bgzf.idx.at(v));
+//         ++i;
+//     }
+//     std::sort(to_sort.begin(), to_sort.end(),
+//               [](const bgzf_sort_helper &a, const bgzf_sort_helper &b) {
+//                   if (a.address.seek == b.address.seek)
+//                       return a.address.idx < b.address.idx;
+//                   return a.address.seek < b.address.seek;
+//               });
+//     size_t l = 0;
+//     size_t r = 0;
+//     for (; r < to_sort.size(); ++r) {
+//         if (to_sort[r].address.seek != to_sort[l].address.seek) {
+//             fill_seqs(to_sort, l, r, bgzf, ret, reader);
+//             l = r;
+//         }
+//     }
+//     return ret;
+//
 
-void convert2basespace(FILE *out, bidbg &dbg, const BGZFCoreIndex &bgzf,
-                       const lcmer_index_t &lci) {
-    for (const auto &p : dbg) {
-        const auto &vec = unitigs2bases(dbg, p.first, bgzf, lci);
-        fprintf(out, "S\tU%llu\t", p.first);
-        int bc = 0;
-        for (char *seg : vec) {
-            int printed;
-            fprintf(out, "%s%n", seg, &printed);
-            bc += printed;
-            free(seg);
-        }
-        fprintf(out, "\tRC:i:%d\tLN:i:%d\n", p.second.cc, bc);
+enum class input_type { BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
+
+input_type identify_input(const std::string &input) {
+    std::string_view sv(input);
+    if (sv.ends_with(".bam")) {
+        return input_type::BAM;
+    } else if (sv.ends_with(".fastq") || sv.ends_with(".fq") ||
+               sv.ends_with(".fasta") || sv.ends_with(".fa") ||
+               sv.ends_with(".fna")) {
+        return input_type::FASTX;
+    } else if (sv.ends_with(".fastq.gz") || sv.ends_with(".fq.gz") ||
+               sv.ends_with(".fasta.gz") || sv.ends_with(".fa.gz") ||
+               sv.ends_with(".fna.gz")) {
+        return input_type::FASTXGZ;
+    } else if (sv.ends_with(".fastq.bz2") || sv.ends_with(".fq.bz2") ||
+               sv.ends_with(".fasta.bz2") || sv.ends_with(".fa.bz2") ||
+               sv.ends_with(".fna.bz2")) {
+        return input_type::FASTXBZ2;
     }
+    return input_type::UNKNOWN;
 }
 int run_assembly(const std::string &input, const std::string &output,
                  int threads, int lcp_level, bloom_param bpd) {
@@ -725,27 +989,63 @@ int run_assembly(const std::string &input, const std::string &output,
     // bloom_filter bfil(bparam);
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Bloom Filter setup");
 
-    auto [lci, bgzfci, ovlp, dbg] =
-        construct_dbg_v4(input, threads, lcp_level, bparam);
-    // // auto [dbg, BGZF_idx, ovlp_idx] =
-    // //     construct_dbg_v2(input, threads, lcp_level, bfil);
-    // auto [dbg, idx, ridx, BGZF_idx, ovlp_idx] = construct_dbg_v3(input,
-    // threads, lcp_level, bfil);qq
+    auto inty = identify_input(input);
+
+    if (inty == input_type::UNKNOWN) {
+        fprintf(stderr, "Unknown input type %s\n", input.c_str());
+        return -1;
+    }
+    auto [lci, dbg] = [&](const input_type &i) {
+        switch (i) {
+            case input_type::BAM:
+                return construct_dbg<BAMKit>(input, threads, lcp_level, bparam);
+            case input_type::FASTX:
+                return construct_dbg<FASTXKit>(input, threads, lcp_level,
+                                               bparam);
+            default:
+                return construct_dbg<FASTXKit>(input, threads, lcp_level,
+                                               bparam);
+                fprintf(stderr, "Unknown input type %s\n", input.c_str());
+                // return construct_dbg<BAMKit>(input, threads, lcp_level,
+                // bparam);
+        }
+    }(inty);
+
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG construction finished");
     // simplify_dbg(dbg);
-    simplify_dbg(dbg);
-    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG simplify finished");
 
-    FILE *out = fopen("temp.gfa", "w");
-    // auto idx = print_dbg(out, dbg);
-    print_dbg_v4(out, dbg, lci);
-    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG printing finished");
-    fclose(out);
-    out = fopen(output.c_str(), "w");
+    // TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG simplify finished");
+    {
+        FILE *out = fopen("temp.gfa", "w");
+        // auto idx = print_dbg(out, dbg);
+        print_dbg_v4(out, dbg, lci);
+        TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG printing finished");
+        fclose(out);
+    }
 
-    convert2basespace(out, dbg, bgzfci, lci);
-    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG to base-space finished");
-    fclose(out);
+    auto result = [&](input_type i) {
+        FILE *out = fopen(output.c_str(), "w");
+        switch (i) {
+            case input_type::BAM:
+                BAMKit::convert2basespace(input, out, dbg, lci, threads,
+                                          lcp_level);
+                break;
+            case input_type::FASTX:
+                // lci.compute_inverse();
+                FASTXKit::convert2basespace(input, out, dbg, lci, threads,
+                                            lcp_level);
+                break;
+            default:
+                fclose(out);
+                fprintf(stderr, "Unknown input type %d\n", i);
+                return -1;
+        }
+        print_dbg_seqs(out, dbg);
+        fclose(out);
+        TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG to base-space finished");
+        return 0;
+    }(inty);
+
     // auto unitig_graph = unitigs_gfatools(ridx);
     // TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Unitigs finished");
 
@@ -757,5 +1057,5 @@ int run_assembly(const std::string &input, const std::string &output,
     // topology(topo, dbg);
     // fclose(topo);
     // TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Topology finished");
-    return 0;
+    return result;
 }
