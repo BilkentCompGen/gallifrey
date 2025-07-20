@@ -166,7 +166,7 @@ struct KmerViewOnBytes {
         value <<= BIT_WIDTH;
         if constexpr (KMASK != -1) value &= KMASK;
         if constexpr (BIT_WIDTH == 2) {
-            value |= tab[data[index]];
+            value |= tab[static_cast<int>(data[index])];
         } else {
             value |= data[index];
         }

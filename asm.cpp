@@ -22,6 +22,7 @@
 #include "bgzf.h"
 #include "config.h"
 #include "ext/bloom_filter.hpp"
+
 #include "ext/kseq.h"
 #include "ext/sam_internal.h"
 #include "gtl/phmap_fwd_decl.hpp"
@@ -83,11 +84,12 @@ struct lcmer_index_t {
         return 0;
     }
     uint64_t emplace(const lcmer<LCMER_L> &l, uint64_t &idx, int tid) {
-        if (!bf.contains(l)) {
-            bf.insert(l);
+        auto new_hash = map.hash(l);
+        if (!bf.contains(new_hash)) {
+            bf.insert(new_hash);
             return 0;
         }
-        auto vv = map.try_emplace(l, idx | tid);
+        auto vv = map.try_emplace_with_hash( new_hash ,l, idx | tid);
         if (vv.second) {
             // rev.try_emplace(vv.first->second, vv.first->first);
             idx += 128;
@@ -196,17 +198,15 @@ bool validate_sam_read(int ret, const BAMReader &reader, const Chunk &chunk) {
  * @param read_index Identifier for the current read in processing.
  */
 auto process_cores(const lcp_read &lr, lcmer_index_t &lci, int thread_id,
-                   uint64_t &lcmer_index, bidbg &dbg, int64_t bgzf_here,
-                   unsigned read_index) {
+                   uint64_t &lcmer_index, bidbg &dbg) {
     lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
-    uint64_t two_cores = lr.cores[0];
 
     gtl::vector<uint64_t> ll(1, 0);
     ll.reserve(lr.cores.size() - LCMER_L + 3);
     ll.push_back(lci.emplace(l, lcmer_index, thread_id));
     for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
         uint32_t in_core = lr.cores[i];
-        uint32_t out_core = l.update_lcmer(in_core);
+        l.update_lcmer(in_core);
         ll.push_back(lci.emplace(l, lcmer_index, thread_id));
     }
     ll.push_back(0);
@@ -222,7 +222,7 @@ auto process_cores(const lcp_read &lr, lcmer_index_t &lci, int thread_id,
                 dbg.lazy_emplace_l(
                     ll[i], [&](bidbg::value_type &val) { val.second.cc++; },
                     [&](const bidbg::constructor &ctr) {
-                        ctr(ll[i], bidbg_val{{}, 1});
+                        ctr(ll[i], bidbg_val{{}, 1, {}, NULL});
                     });
             }
         } else {
@@ -234,7 +234,7 @@ auto process_cores(const lcp_read &lr, lcmer_index_t &lci, int thread_id,
                         val.second.cc++;
                     },
                     [&](const bidbg::constructor &ctr) {
-                        ctr(ll[i], bidbg_val{{ll[i - 1]}, 1, {}});
+                        ctr(ll[i], bidbg_val{{ll[i - 1]}, 1, {}, NULL});
                     });
             } else {
                 dbg.lazy_emplace_l(
@@ -244,7 +244,7 @@ auto process_cores(const lcp_read &lr, lcmer_index_t &lci, int thread_id,
                         val.second.cc++;
                     },
                     [&](const bidbg::constructor &ctr) {
-                        ctr(ll[i], bidbg_val{{ll[i - 1]}, 1, {}});
+                        ctr(ll[i], bidbg_val{{ll[i - 1]}, 1, {}, NULL});
                     });
             }
         }
@@ -316,7 +316,6 @@ struct BAMKit {
                 if (here >= chunk.vend) {
                     break;
                 }
-                auto telled = hts_utell(reader.fp);
                 int ret = sam_read1(reader.fp, hdr, rec.get());
                 ++src;
                 if (!validate_sam_read(ret, reader, chunk)) {
@@ -330,8 +329,7 @@ struct BAMKit {
                     continue;
                 }
                 ++processed_read_count;
-                process_cores(lr, lci, thread_id, lcmer_index, dbg, telled,
-                              src);
+                process_cores(lr, lci, thread_id, lcmer_index, dbg);
             }
             all_reads += src;
             // printf("%zu\n", );
@@ -349,8 +347,12 @@ struct BAMKit {
             dbg.modify_if(val, [&](bidbg::value_type &val) {
                 if (val.second.seq == NULL) {
                     if (slen > 0) {
-                        val.second.seq = (char *)malloc(slen + 1);
-                        nibble2base(seq_nibble, val.second.seq, slen);
+                        val.second.seq = (char *)malloc(slen + 2);
+                        nibble2base(seq_nibble + ovlp / 2, val.second.seq,
+                                    slen);
+                        if (ovlp % 2 == 1) {
+                            val.second.seq[0] = 'N';
+                        }
                         val.second.seq[slen] = '\0';
                     } else {
                         val.second.seq = (char *)malloc(1);
@@ -359,7 +361,7 @@ struct BAMKit {
                 }
             });
             uint32_t in_core = lr.cores[i];
-            uint32_t out_core = l.update_lcmer(in_core);
+            l.update_lcmer(in_core);
             val = lci.get(l);
         }
     }
@@ -371,8 +373,8 @@ struct BAMKit {
         gtl::vector<std::thread> workers;
         for (int i = 1; i < threads; ++i) {
             workers.emplace_back(
-                [&](int tid) {
-                    uint64_t lcmer_index = 0;
+                [&]() {
+
                     Chunk chunk;
                     BAMReader reader{input};
                     std::unique_ptr<bam1_t, decltype(&bam_destroy1)> rec(
@@ -391,15 +393,13 @@ struct BAMKit {
                                 std::exit(EXIT_FAILURE);
                             }
                         }
-                        int src = 0;
                         while (true) {
                             int64_t here = bgzf_tell(reader.fp->fp.bgzf);
                             if (here >= chunk.vend) {
                                 break;
                             }
-                            auto telled = hts_utell(reader.fp);
                             int ret = sam_read1(reader.fp, hdr, rec.get());
-                            ++src;
+        
                             if (!validate_sam_read(ret, reader, chunk)) {
                                 break;
                             }
@@ -417,8 +417,7 @@ struct BAMKit {
 
                         // printf("%zu\n", );
                     }
-                },
-                i);
+                });
         }
         generate_chunks(input, chunk_queue);
         done.store(true);
@@ -432,12 +431,11 @@ struct FASTXKit {
     KSEQ_INIT(int, read)
 
     static auto reverse_process_cores(const char *seq, const lcp_read &lr,
-                               const lcmer_index_t &lci, bidbg &dbg) {
+                                      const lcmer_index_t &lci, bidbg &dbg) {
         lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
 
         uint64_t val = lci.get(l);
         for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
-            int ovlp = lr.pos[i - 1].second - lr.pos[i].first;
             int slen = lr.pos[i].second - lr.pos[i - 1].second;
             dbg.modify_if(val, [&](bidbg::value_type &val) {
                 if (val.second.seq == NULL) {
@@ -453,7 +451,7 @@ struct FASTXKit {
                 }
             });
             uint32_t in_core = lr.cores[i];
-            uint32_t out_core = l.update_lcmer(in_core);
+            l.update_lcmer(in_core);
             val = lci.get(l);
         }
     }
@@ -519,7 +517,7 @@ struct FASTXKit {
                     continue;
                 }
                 ++processed_read_count;
-                process_cores(lr, lci, thread_id, lcmer_index, dbg, here, 0);
+                process_cores(lr, lci, thread_id, lcmer_index, dbg);
                 if (here >= chunk.vend) {
                     break;
                 }
@@ -539,8 +537,7 @@ struct FASTXKit {
         gtl::vector<std::thread> workers;
         for (int i = 1; i < threads; ++i) {
             workers.emplace_back(
-                [&](int tid) {
-                    uint64_t lcmer_index = 0;
+                [&]() {
                     Chunk chunk;
                     FILE *fp = fopen(input.c_str(), "rb");
                     int64_t here = 0;
@@ -574,8 +571,7 @@ struct FASTXKit {
                         // printf("%zu\n", );
                     }
                     kseq_destroy(seq);
-                },
-                i);
+                });
         }
         generate_chunks(input, chunk_queue);
         done.store(true);
@@ -614,7 +610,7 @@ auto construct_dbg(std::string input, int threads, int lcp_level,
     }
     fprintf(stderr, "Processed %d reads: Used %d for the dbg and skipped %d\n",
             all_reads, used_reads, all_reads - used_reads);
-    return std::make_tuple(lci, dbg);
+    return std::make_tuple(std::move(lci), std::move(dbg));
 }
 
 struct sv {
@@ -658,162 +654,17 @@ struct unitig_ar_graph_t {
     }
 };
 
-// unitig_ar_graph_t unitigs_gfatools(const reverse_lcmer_idx_t &idx) {
-//     FILE *gfatools_pipe = popen("gfatools asm -u temp.gfa", "r");
-//     char *line = NULL;
-//     size_t lwc = 0;
-//     unitig_ar_graph_t g;
-
-//     while (getline(&line, &lwc, gfatools_pipe) != -1) {
-//         sv s{line + 2, line + 2};
-//         switch (line[0]) {
-//             case 'S': {
-//                 g.add_node();
-//                 break;
-//             }
-//             case 'A': {
-//                 s.get<3, '\t'>();
-//                 int lc_idx;
-//                 std::from_chars(s.from, s.to, lc_idx);
-//                 if (g.cores.back().empty()) {
-//                     for (uint32_t core : idx.at(lc_idx)->data) {
-//                         g.expand_run(core);
-//                     }
-//                 } else {
-//                     g.expand_run(idx.at(lc_idx)->data[0]);
-//                 }
-//                 break;
-//             }
-//             case 'L': {
-//                 s.expand_until('\t');
-//                 int u1, u2;
-//                 auto result = std::from_chars(s.from + 3, s.to - 1, u1);
-//                 s.get<2, '\t'>();
-//                 result = std::from_chars(s.from + 3, s.to - 1, u2);
-//                 g.add_edge(u1 - 1, u2 - 1);
-//                 break;
-//             }
-//             default:
-//                 break;
-//         }
-//     }
-//     pclose(gfatools_pipe);
-//     return g;
-// }
-
-std::tuple<uint8_t *, int, int> find_core_seq(BAMReader &reader,
-                                              const BGZFCoreIndex &core_idx,
-                                              uint32_t core, bam1_t *rec) {
-    auto seq_location = core_idx.idx.find(core);
-    if (seq_location == core_idx.idx.end()) {
-        return {};
-    }
-    // int64_t here = bgzf_tell(reader.fp->fp.bgzf);
-    sam_hdr_t *hdr = NULL;
-    if (seq_location->second.seek > 0) {
-        if (bgzf_seek(reader.fp->fp.bgzf, seq_location->second.seek, SEEK_SET) <
-            0) {
-            std::cerr << "bgzf_seek failed on chunk vstart="
-                      << seq_location->second.seek << "\n";
-            std::exit(EXIT_FAILURE);
-        }
-    } else {
-        // reader.fp = bam_
-    }
-
-    // if(reader.seek(seq_location->second.seek) == -1){
-    //     fprintf(stderr, "Seek error\n");
-    // }
-    int ret;
-    unsigned i;
-    // for (i = 1; i < seq_location->second.idx; ++i) {
-    ret = bam_read1(reader.fp->fp.bgzf, rec);
-    if (ret == -1) {
-        fprintf(stderr, "End of stream in find_core_seq %d %u %lld\n", ret, i,
-                seq_location->second.seek);
-        return {};
-    }
-    // }
-    if (ret < -1) {
-        fprintf(stderr, "Error in find_core_seq %d %u\n", ret, core);
-        throw std::string{"BAD"};
-    }
-    if (hdr) {
-        sam_hdr_destroy(hdr);
-    }
-    return {bam_get_seq(rec), seq_location->second.from,
-            seq_location->second.to};
-}
-
-/*    bgzf_block seek;
-    uint32_t idx;
-    uint32_t from;
-    uint32_t to;
-*/
-
-void to_basespace(FILE *out, const unitig_ar_graph_t &g,
-                  const BGZFCoreIndex &core_idx,
-                  const overlap_idx_t &overlaps) {
-    BAMReader reader(core_idx.filename);
-    std::cout << "Reading from " << core_idx.filename << "\n";
-    std::unique_ptr<bam1_t, decltype(&bam_destroy1)> rec(bam_init1(),
-                                                         bam_destroy1);
-    static uint8_t alph[16] = {0,  65, 67, 0, 71, 0, 0, 0,
-                               84, 0,  0,  0, 0,  0, 0, 78};
-
-    struct seek_job_t {
-        size_t i;
-        int64_t seek;
-        size_t idx;
-        int32_t from;
-        int32_t to;
-    };
-    for (size_t i = 0; i < g.cores.size(); ++i) {
-        fprintf(out, "S\tU%zul\t", i);
-        int ovlp = 0;
-        uint64_t two_cores = g.cores[i].front();
-        int len = 0;
-        gtl::vector<char *> core_seqs(g.cores.size(), NULL);
-        gtl::vector<seek_job_t> seekj;
-        for (int j = 0; j < g.cores[i].size(); ++j) {
-            auto [_seek, _idx, _f, _t] = core_idx.idx.at(g.cores[i][j]);
-            seekj.emplace_back(j, _seek, _idx, _f, _t);
-        }
-        std::sort(seekj.begin(), seekj.end(),
-                  [](const seek_job_t &a, const seek_job_t &b) {
-                      if (a.seek == b.seek) {
-                          return a.idx < b.idx;
-                      }
-                      return a.seek < b.seek;
-                  });
-        for (auto it = g.cores[i].begin() + 1; it != g.cores[i].end(); ++it) {
-            auto [s, fro, to] = find_core_seq(reader, core_idx, *it, rec.get());
-            // fprintf(stderr, "%d\t%d\n", fro, to);
-            for (int j = ovlp + fro; j < to; ++j) {
-                fputc(alph[bam_seqi(s, j)], out);
-                ++len;
-            }
-            two_cores = (two_cores << 32) | *it;
-            auto oit = overlaps.find(two_cores);
-            if (oit != overlaps.end())
-                ovlp = oit->second;
-            else
-                ovlp = 0;
-        }
-        fprintf(out, "\tLN:i:%d\n", len);
-        auto it = g.le[i];
-        while (it != -1) {
-            fprintf(out, "L\tU%zul\t+\tU%ul\t+\t0M\n", i, g.edges[it].to);
-            it = g.edges[it].next;
-        }
-    }
-}
 
 void print_dbg_seqs(FILE *out, const bidbg &dbg) {
     for (const auto &[lval, edges] : dbg) {
+        char *s = edges.seq;
+        if (s == NULL) continue;
+        while (*s == 'N') {
+            ++s;
+        }
         fprintf(out, "S\tC%llu\t%s\tLN:i:%zu\tRC:i:%d\n", lval,
-                edges.seq == NULL ? "" : edges.seq,
-                edges.seq == NULL ? 0 : strlen(edges.seq), edges.cc);
+                s,
+                strlen(s), edges.cc);
         for (uint64_t nl : edges.prev) {
             if (dbg.contains(nl))
                 fprintf(out, "L\tC%llu\t+\tC%llu\t+\t%dM\n", nl, lval, 0);
@@ -838,123 +689,6 @@ void print_dbg_v4(FILE *out, bidbg &dbg, lcmer_index_t &lci) {
     }
 }
 
-// void simplify_dbg(bidbg &dbg) {
-//     for (auto &pair : dbg) {
-//         if (pair.second.cc == -176) {
-//             continue;
-//         }
-//         while (pair.second.next.size() == 1) {
-//             auto np = dbg.find(*pair.second.next.begin());
-//             if (np->second.prev.size() != 1) {
-//                 if (np->second.prev.size() > 1 &&
-//                     pair.second.merged.size() > 0) {
-//                     // for(const auto &p : np->second.prev){
-//                     //     std::cout << p << "\t" <<
-//                     //     pair.second.merged.back().first << "\n";
-//                     // }
-//                     np->second.prev.erase(pair.second.merged.back().first);
-//                     np->second.prev.emplace(pair.first);
-//                 }
-//                 break;
-//             }
-//             pair.second.merged.emplace_back(np->first, np->second.cc);
-//             pair.second.merged.insert(pair.second.merged.end(),
-//                                       np->second.merged.begin(),
-//                                       np->second.merged.end());
-//             pair.second.next = np->second.next;
-
-//             np->second.cc = -176;
-//             if (np->second.merged.size() > 0) {
-//                 break;
-//             }
-//         }
-//     }
-//     for (auto it = dbg.begin(), end = dbg.end(); it != end;) {
-//         if (it->second.cc == -176) {
-//             dbg._erase(it++);
-//         } else {
-//             ++it;
-//         }
-//     }
-// }
-
-struct bgzf_sort_helper {
-    int i;
-    coreaddress_in_bgzf address;
-};
-
-void fill_seqs(gtl::vector<bgzf_sort_helper> &to_sort, int l, int r,
-               const BGZFCoreIndex &bgzf, gtl::vector<char *> &ret,
-               BAMReader &reader) {
-    auto seek_pos = to_sort[l].address.seek;
-    auto seek_end = to_sort[r].address.seek;
-    if (seek_pos > 0) {
-        if (bgzf_seek(reader.fp->fp.bgzf, seek_pos, SEEK_SET) < 0) {
-            std::cerr << "bgzf_seek failed on chunk vstart=" << seek_pos
-                      << "\n";
-            std::exit(EXIT_FAILURE);
-        }
-    }
-    sam_hdr_t *hdr = NULL;
-    std::unique_ptr<bam1_t, decltype(&bam_destroy1)> rec(bam_init1(),
-                                                         bam_destroy1);
-    int ri = 0;
-    while (true) {
-        int64_t here = hts_utell(reader.fp);
-        if (here >= seek_end) {
-            break;
-        }
-        int rv = sam_read1(reader.fp, hdr, rec.get());
-        if (rv < 0) {
-            fprintf(stderr, "Something wrong reading %d %lld %lld\n", l,
-                    seek_pos, here);
-        }
-        uint8_t *sd = bam_get_seq(rec.get());
-        for (int i = l; i < r; ++i) {
-            ret[to_sort[i].i] = (char *)malloc(to_sort[i].address.to -
-                                               to_sort[i].address.from + 1);
-            for (int j = to_sort[i].address.from; j < to_sort[i].address.to;
-                 ++j) {
-                ret[to_sort[i].i][j - to_sort[i].address.from] =
-                    seq_nt16_str[bam_seqi(sd, j)];
-            }
-        }
-    }
-}
-// gtl::vector<char *> unitigs2bases(bidbg &dbg, uint64_t uidx,
-//                                   const BGZFCoreIndex &bgzf,
-//                                   const lcmer_index_t &lci) {
-//     const bidbg::value_type &val = *dbg.find(uidx);
-//     BAMReader reader(bgzf.filename);
-
-//     gtl::vector<char *> ret(val.second.merged.size() + LCMER_L, NULL);
-//     gtl::vector<bgzf_sort_helper> to_sort;
-//     to_sort.reserve(val.second.merged.size() + LCMER_L);
-//     const lcmer<LCMER_L> &lbeg = lci.rev.at(val.first);
-//     int i = 0;
-//     std::cout << uidx << "\n";
-//     for (uint32_t v : lbeg.data) {
-//         // std::cout << "\t" << v << std::endl;
-//         // std::cout << "\t" << bgzf.idx.at(v).seek << "\n";
-//         to_sort.emplace_back(i, bgzf.idx.at(v));
-//         ++i;
-//     }
-//     std::sort(to_sort.begin(), to_sort.end(),
-//               [](const bgzf_sort_helper &a, const bgzf_sort_helper &b) {
-//                   if (a.address.seek == b.address.seek)
-//                       return a.address.idx < b.address.idx;
-//                   return a.address.seek < b.address.seek;
-//               });
-//     size_t l = 0;
-//     size_t r = 0;
-//     for (; r < to_sort.size(); ++r) {
-//         if (to_sort[r].address.seek != to_sort[l].address.seek) {
-//             fill_seqs(to_sort, l, r, bgzf, ret, reader);
-//             l = r;
-//         }
-//     }
-//     return ret;
-//
 
 enum class input_type { BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 
@@ -1014,14 +748,14 @@ int run_assembly(const std::string &input, const std::string &output,
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG construction finished");
     // simplify_dbg(dbg);
 
-    // TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG simplify finished");
-    {
-        FILE *out = fopen("temp.gfa", "w");
-        // auto idx = print_dbg(out, dbg);
-        print_dbg_v4(out, dbg, lci);
-        TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG printing finished");
-        fclose(out);
-    }
+    // // TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG simplify finished");
+    // {
+    //     FILE *out = fopen("temp.gfa", "w");
+    //     // auto idx = print_dbg(out, dbg);
+    //     print_dbg_v4(out, dbg, lci);
+    //     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG printing finished");
+    //     fclose(out);
+    // }
 
     auto result = [&](input_type i) {
         FILE *out = fopen(output.c_str(), "w");
@@ -1045,17 +779,5 @@ int run_assembly(const std::string &input, const std::string &output,
         TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG to base-space finished");
         return 0;
     }(inty);
-
-    // auto unitig_graph = unitigs_gfatools(ridx);
-    // TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Unitigs finished");
-
-    // to_basespace(out, unitig_graph, BGZF_idx, ovlp_idx);
-    // fclose(out);
-    // TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Converted to base-space");
-
-    // FILE *topo = fopen("topology.txt", "w");
-    // topology(topo, dbg);
-    // fclose(topo);
-    // TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Topology finished");
     return result;
 }

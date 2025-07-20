@@ -95,7 +95,7 @@ void stdin_hist_prog(CLI::App &parent) {
     app.callback([=]() {
         int ret = run_hist_on_stdin(params->dims, params->freq);
         delete params;
-        return 0;
+        return ret;
     });
 }
 int main(int argc, char **argv) {
