@@ -451,8 +451,8 @@ pd_cleanup:
             static_cast<size_t>(threads), 1, 1};
         std::atomic<bool> done{false};
         gtl::vector<std::thread> workers;
-        int sam_threads = threads / 2;
-        for (int i = 0; i < threads / 2; ++i) {
+        int data_threads = threads / 3;
+        for (int i = 0; i < threads - data_threads; ++i) {
             workers.emplace_back([&]() {
                 bam1_t *data_p;
                 while (data_queue.size_approx() > 0 || !done.load()) {
@@ -475,7 +475,7 @@ pd_cleanup:
                 }
             });
         }
-        generate_data(input, sam_threads, data_queue, recycle_queue);
+        generate_data(input, data_threads, data_queue, recycle_queue);
         done.store(true);
         for (auto &worker : workers) {
             worker.join();
@@ -687,8 +687,8 @@ auto construct_dbgv2(std::string input, int threads, int lcp_level,
     gtl::vector<std::thread> workers;
     gtl::vector<int> rc(threads - 1, 0);
     gtl::vector<int> all_read_count(threads - 1, 0);
-    int data_threads = 3;
-    for (int i = 0; i < threads - 3; ++i) {
+    int data_threads = threads / 3;
+    for (int i = 0; i < threads-data_threads; ++i) {
         workers.emplace_back(Kit::process_data, i + 1, lcp_level,
                              std::ref(data_queue), std::ref(recycle_queue),
                              std::ref(dbg), std::ref(lci), std::ref(done),
