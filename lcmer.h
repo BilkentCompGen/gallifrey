@@ -35,10 +35,11 @@ struct lcmer {
     }
 
     bool operator==(const lcmer &other) const {
-        for (int i = 0; i < N; ++i) {
-            if (data[i] != other.data[i]) return false;
-        }
-        return true;
+        return memcmp(data.data(), other.data.data(), 16 * sizeof(uint32_t)) == 0;
+        // for (int i = 0; i < N; ++i) {
+        //     if (data[i] != other.data[i]) return false;
+        // }
+        // return true;
     }
     bool operator<(const lcmer &other) const {
         for (int i = 0; i < N; ++i) {
@@ -111,6 +112,36 @@ T reverse_complement_kmer(T kmer, int K) {
     kmer = kmer >> shift_count;
     return kmer;
 }
+
+
+template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
+struct KmerViewOnCrumbs {
+
+
+    using int_type = INT_TYPE;
+    static constexpr int k = _K;
+    int_type value;
+    static constexpr int_type KMASK = ((int_type)1 << (BIT_WIDTH * k)) - 1;
+    KmerViewOnCrumbs() : value{0} {}
+
+    int fill(const uint8_t *data_address) {
+        int i;
+        for (i = 0; i < k; i++) {
+            move_get(data_address, i);
+        }
+        return i;
+    }
+    int_type move_get(const uint8_t *data_address, int index) {
+        value <<= BIT_WIDTH;
+        if constexpr (KMASK != -1) value &= KMASK;
+        value |= data_address[index];
+    
+        value = value & KMER_SPACE_MASK;
+        return value;
+    }
+
+    constexpr int_type get() const noexcept { return value & KMER_SPACE_MASK; }
+};
 
 template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
 struct KmerViewOnNibbles {
@@ -199,6 +230,9 @@ void init_core_kmer_xor(struct core *cr, _T Kval, uint64_t si, uint64_t ei) {
     cr->bit_rep = 0x8000000000000000 | cr->label;
     cr->bit_size = 2 * SYNCMER_K;
 }
+
+uint8_t *onehotto2bitDNA(const uint8_t *data, size_t len);
+uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len);
 
 uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
                              struct core *cores);

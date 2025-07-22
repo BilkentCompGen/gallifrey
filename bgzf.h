@@ -69,32 +69,37 @@ struct Block {
     }
 };
 
-class BlockIterator {
-   public:
-    BlockIterator(htsFile *hts_fp) {
-        bgzf_ = hts_fp->fp.bgzf;
-        hfp_ = bgzf_->fp;
+
+class BlockIterator{
+public:
+    BlockIterator(const std::string& filename) {
+        hfp_ = hopen(filename.c_str(), "r");
+        if (!hfp_) {
+            std::perror("hopen");
+            valid_ = false;
+            return;
+        }
         if (hseek(hfp_, 0, SEEK_SET) < 0) {
             std::perror("hseek");
             valid_ = false;
         }
     }
 
-    bool next(Block &block) {
+    ~BlockIterator() {
+        if (hfp_) hclose(hfp_);
+    }
+
+    bool next(Block& block) {
         if (!valid_) return false;
-        // use htell to get current hFILE offset
         off_t start = htell(hfp_);
         unsigned char hdr[18];
         ssize_t got = hread(hfp_, hdr, sizeof(hdr));
         if (got < static_cast<ssize_t>(sizeof(hdr))) return false;
-        if (hdr[0] != 0x1f || hdr[1] != 0x8b || hdr[2] != 0x08 ||
-            hdr[3] != 0x04)
-            return false;
-        uint16_t bsize = le16toh(*reinterpret_cast<uint16_t *>(hdr + 16));
+        if (hdr[0]!=0x1f || hdr[1]!=0x8b || hdr[2]!=0x08 || hdr[3]!=0x04) return false;
+        uint16_t bsize = le16toh(*reinterpret_cast<uint16_t*>(hdr + 16));
         uint32_t block_len = bsize + 1;
         block.start = start;
-        block.len = block_len;
-        // skip raw file pointer to next block
+        block.len   = block_len;
         if (hseek(hfp_, start + block_len, SEEK_SET) < 0) {
             valid_ = false;
             return false;
@@ -102,10 +107,9 @@ class BlockIterator {
         return true;
     }
 
-   private:
-    BGZF *bgzf_ = nullptr;
-    hFILE *hfp_ = nullptr;
-    bool valid_ = true;
+private:
+    hFILE*  hfp_    = nullptr;
+    bool    valid_  = true;
 };
 
 #endif
