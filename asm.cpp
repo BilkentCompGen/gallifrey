@@ -4,7 +4,7 @@
 #include <string_view>
 
 // #include <algorithm>
-#include <_strings.h>
+// #include <_strings.h>
 #include <concurrentqueue.h>
 #include <htslib/bgzf.h>
 #include <htslib/hfile.h>
