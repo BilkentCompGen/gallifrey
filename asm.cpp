@@ -24,6 +24,7 @@
 #include <tuple>
 
 #include "bgzf.h"
+#include "cascadingbloom.h"
 #include "config.h"
 #include "ext/bloom_filter.hpp"
 #include "ext/kseq.h"
@@ -69,8 +70,8 @@ using reverse_lcmer_idx_t = gtl::parallel_node_hash_map<
 struct lcmer_index_t {
     lcmer_index_map_t map;
     reverse_lcmer_idx_t rev;
-    bloom_filter bf;
-    lcmer_index_t(const bloom_parameters &bparam) : bf{bparam} {}
+    cascadebloom<bloom_filter, bloom_filter, bloom_filter, bloom_filter> bf;
+    lcmer_index_t(const bloom_parameters &bparam) : bf{bloom_filter{bparam}, bloom_filter{bparam}, bloom_filter{bparam}, bloom_filter{bparam}} {}
 
     void compute_inverse() {
         for (const auto &[k, v] : map) {
@@ -722,31 +723,7 @@ auto construct_dbgv2(std::string input, int threads, int lcp_level,
     return std::make_tuple(std::move(lci), std::move(dbg));
 }
 
-struct sv {
-    char *from;
-    char *to;
-    sv() : from(0), to(0) {}
-    sv(char *from, char *to) : from(from), to(to) {}
 
-    void expand_until(char c) {
-        while (*to != 0 && *to != c) {
-            to++;
-        }
-    }
-    void skip_next(char c) {
-        expand_until(c);
-        if (*to) ++to;
-        from = to;
-    }
-    template <int N, char DEL>
-    void get() {
-        for (int i = 0; i < N; ++i) {
-            skip_next(DEL);
-        }
-        expand_until(DEL);
-    }
-    operator std::string() { return {from, to}; }
-};
 
 struct unitig_ar_graph_t {
     gtl::vector<edge> edges;
@@ -851,13 +828,15 @@ input_type identify_input(const std::string &input) {
 int run_assembly(const std::string &input, const std::string &output,
                  int threads, int lcp_level, bloom_param bpd) {
     INIT_TIMERS(HIFI_ASSEMBLY);
+
+
     // return test_bamseq_conversion(input);
     bloom_parameters bparam;
     bparam.false_positive_probability = bpd.false_positive_rate;
     bparam.projected_element_count = bpd.projected_count;
     bparam.random_seed = bpd.seed;
-
     bparam.compute_optimal_parameters();
+
     // bloom_filter bfil(bparam);
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Bloom Filter setup");
 

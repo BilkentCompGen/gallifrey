@@ -13,6 +13,32 @@
 
 uint32_t MurmurHash3_32(const void *key, int len, uint32_t seed);
 
+struct sv {
+    char *from;
+    char *to;
+    sv() : from(0), to(0) {}
+    sv(char *from, char *to) : from(from), to(to) {}
+
+    void expand_until(char c) {
+        while (*to != 0 && *to != c) {
+            to++;
+        }
+    }
+    void skip_next(char c) {
+        expand_until(c);
+        if (*to) ++to;
+        from = to;
+    }
+    template <int N, char DEL>
+    void get() {
+        for (int i = 0; i < N; ++i) {
+            skip_next(DEL);
+        }
+        expand_until(DEL);
+    }
+    // operator std::string() { return {from, to}; }
+};
+
 struct lcp_read {
     gtl::vector<uint32_t> cores;
     gtl::vector<std::pair<uint32_t, uint32_t>> pos;
