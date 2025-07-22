@@ -267,3 +267,25 @@ TEST_CASE("K-mer view on Crumbs") {
         }
     }
 }
+
+TEST_CASE("Character table on kmerview on bytes"){
+    using kv = KmerViewOnBytes<16, uint32_t, 2>;
+
+    CHECK_EQ(kv::tab['A'], 0);
+    CHECK_EQ(kv::tab['G'], 2);
+    CHECK_EQ(kv::tab['C'], 1);
+    CHECK_EQ(kv::tab['T'], 3);
+
+    CHECK_EQ(kv::tab['a'], 0);
+    CHECK_EQ(kv::tab['g'], 2);
+    CHECK_EQ(kv::tab['c'], 1);
+    CHECK_EQ(kv::tab['t'], 3);
+
+
+    CHECK_EQ(kv::tab['u'], 3);
+    CHECK_EQ(kv::tab['U'],3);
+
+    CHECK_EQ(kv::tab['N'], 4);
+        CHECK_EQ(kv::tab['Z'], 4);
+    
+}

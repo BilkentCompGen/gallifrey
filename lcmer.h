@@ -35,7 +35,8 @@ struct lcmer {
     }
 
     bool operator==(const lcmer &other) const {
-        return memcmp(data.data(), other.data.data(), 16 * sizeof(uint32_t)) == 0;
+        return memcmp(data.data(), other.data.data(), 16 * sizeof(uint32_t)) ==
+               0;
         // for (int i = 0; i < N; ++i) {
         //     if (data[i] != other.data[i]) return false;
         // }
@@ -113,11 +114,8 @@ T reverse_complement_kmer(T kmer, int K) {
     return kmer;
 }
 
-
 template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
 struct KmerViewOnCrumbs {
-
-
     using int_type = INT_TYPE;
     static constexpr int k = _K;
     int_type value;
@@ -135,7 +133,7 @@ struct KmerViewOnCrumbs {
         value <<= BIT_WIDTH;
         if constexpr (KMASK != -1) value &= KMASK;
         value |= data_address[index];
-    
+
         value = value & KMER_SPACE_MASK;
         return value;
     }
@@ -178,8 +176,18 @@ struct KmerViewOnNibbles {
 
 template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
 struct KmerViewOnBytes {
-    static constexpr int tab[] = {['A']=0, ['C']=1, ['G']=2, ['T']=3, ['N']=0, ['a'] = 0, ['c']=1, ['g']=2, ['t'] = 3};
-
+    static constexpr const int tab[256] = {
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 4, 1, 4,
+        4, 4, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 4, 4, 4, 4, 4, 4,
+        4, 4, 4, 4, 4, 0, 4, 1, 4, 4, 4, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4};
     using int_type = INT_TYPE;
     static constexpr int k = _K;
     int_type value;
@@ -245,6 +253,5 @@ void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len);
 lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
                                      int lcp_level);
 
-lcp_read parse_cores_from_kseq(const char *data, size_t len,
-                                     int lcp_level);
+lcp_read parse_cores_from_kseq(const char *data, size_t len, int lcp_level);
 #endif
