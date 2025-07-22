@@ -5,31 +5,7 @@
 #include "syncmer.h"
 
 
-struct sv {
-    char *from;
-    char *to;
-    sv() : from(0), to(0) {}
-    sv(char *from, char *to) : from(from), to(to) {}
 
-    void expand_until(char c) {
-        while (*to != 0 && *to != c) {
-            to++;
-        }
-    }
-    void skip_next(char c) {
-        expand_until(c);
-        if (*to) ++to;
-        from = to;
-    }
-    template <int N, char DEL>
-    void get() {
-        for (int i = 0; i < N; ++i) {
-            skip_next(DEL);
-        }
-        expand_until(DEL);
-    }
-    operator std::string() { return {from, to}; }
-};
 
 void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
                    uint64_t si, uint64_t ei) {
