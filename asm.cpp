@@ -406,7 +406,7 @@ struct BAMKit {
             }
             ++processed_read_count;
             process_cores(lr, lci, thread_id, lcmer_index, dbg);
-pd_cleanup:
+        pd_cleanup:
             if (!recycle_queue.try_dequeue(data_p)) {
                 bam_destroy1(data_p);
                 data_p = NULL;
@@ -464,10 +464,11 @@ pd_cleanup:
                     lcp_read lr = parse_cores_from_bam_record(
                         bam_get_seq(data_p), data_p->core.l_qseq, lcp_level);
                     if (lr.cores.size() < LCMER_L + 2) {
-                        goto c2bs_end;
+                        continue;
+                    } else {
+                        reverse_process_cores(bam_get_seq(data_p), lr, lci,
+                                              dbg);
                     }
-                    reverse_process_cores(bam_get_seq(data_p), lr, lci, dbg);
-                c2bs_end:
                     if (!recycle_queue.try_dequeue(data_p)) {
                         bam_destroy1(data_p);
                         data_p = NULL;
@@ -688,7 +689,7 @@ auto construct_dbgv2(std::string input, int threads, int lcp_level,
     gtl::vector<int> rc(threads - 1, 0);
     gtl::vector<int> all_read_count(threads - 1, 0);
     int data_threads = threads / 3;
-    for (int i = 0; i < threads-data_threads; ++i) {
+    for (int i = 0; i < threads - data_threads; ++i) {
         workers.emplace_back(Kit::process_data, i + 1, lcp_level,
                              std::ref(data_queue), std::ref(recycle_queue),
                              std::ref(dbg), std::ref(lci), std::ref(done),
