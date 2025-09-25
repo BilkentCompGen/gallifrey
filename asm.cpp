@@ -70,8 +70,8 @@ using reverse_lcmer_idx_t = gtl::parallel_node_hash_map<
 struct lcmer_index_t {
     lcmer_index_map_t map;
     reverse_lcmer_idx_t rev;
-    cascadebloom<bloom_filter, bloom_filter, bloom_filter, bloom_filter> bf;
-    lcmer_index_t(const bloom_parameters &bparam) : bf{bloom_filter{bparam}, bloom_filter{bparam}, bloom_filter{bparam}, bloom_filter{bparam}} {}
+    bloom_filter bf;
+    lcmer_index_t(const bloom_parameters &bparam) : bf{bparam} {}
 
     void compute_inverse() {
         for (const auto &[k, v] : map) {

@@ -4,8 +4,7 @@
 #include "gtl/phmap.hpp"
 #include "syncmer.h"
 
-
-
+#include "ext/lcptools/lcptools_ho.h" 
 
 void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
                    uint64_t si, uint64_t ei) {
@@ -286,9 +285,9 @@ TEST_CASE("Character table on kmerview on bytes"){
 
 
     CHECK_EQ(kv::tab['u'], 3);
-    CHECK_EQ(kv::tab['U'],3);
+    CHECK_EQ(kv::tab['U'], 3);
 
     CHECK_EQ(kv::tab['N'], 4);
-        CHECK_EQ(kv::tab['Z'], 4);
+    CHECK_EQ(kv::tab['Z'], 4);
     
 }

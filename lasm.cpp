@@ -1,11 +1,15 @@
 #include <CLI/CLI.hpp>
 #include <string>
 
+
+#define LCPTOOLS_IMPL
+#include "ext/lcptools/lcptools_ho.h" 
+
 #include "asm.h"
 #include "stats.h"
 #include "sthist.h"
-#define LCPTOOLS_IMPL
-#include "ext/lcptools/lcptools_ho.h" 
+#include "bamdoctor.h"
+
 
 using std::string;
 
@@ -29,7 +33,7 @@ int asm_program(CLI::App &parent) {
 
     bloom_param *bparam = new bloom_param;
     bparam->projected_count = 100'000'000;
-    bparam->false_positive_rate = 0.0001;
+    bparam->false_positive_rate = 0.01;
     bparam->seed = 0xA5A5A5A5;
     auto bfg =
         app.add_option_group("bloomfilter", "Parameters to setup bloom filter");
@@ -76,6 +80,43 @@ void stats_program(CLI::App &parent) {
         return ret;
     });
 }
+
+int sam_read_testing(CLI::App &parent) {
+    struct parameters {
+        string input;
+        int lcp_level;
+        int threads;
+        SamReadTestingMode mode;
+        string job;
+    };
+    auto *app_ = parent.add_subcommand("bamdoctor", "read bam file fast");
+    auto &app = *app_;
+    parameters *p = new parameters{"", 5, 8, SamReadTestingMode::BASIC, "read_count"};  
+    app.add_option("input", p->input, "Input bam file")->required();
+    app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
+        ->capture_default_str();
+    app.add_option("-t,--threads", p->threads, "Number of threads")
+        ->capture_default_str();
+
+    std::map<std::string, SamReadTestingMode> SamReadTestingMode_map = {
+        {"basic", SamReadTestingMode::BASIC},
+        {"pool", SamReadTestingMode::POOL},
+    };
+
+    std::map<std::string, std::string> job_map = {
+        {"read_count", "read_count"},
+        {"core_count", "core_count"},
+    };
+    app.add_option("--job", p->job, "Job to run")->required()->transform(CLI::CheckedTransformer(job_map, CLI::ignore_case));
+    app.add_option("--mode", p->mode, "Mode to run")->required()->transform(CLI::CheckedTransformer(SamReadTestingMode_map, CLI::ignore_case));
+    app.callback([=]() {
+        int ret = run_sam_read_testing(p->input, p->threads, p->lcp_level, p->mode, p->job);
+        delete p;
+        return ret;
+    });
+    return 0;
+}
+
 
 void stdin_hist_prog(CLI::App &parent) {
     auto *app_ = parent.add_subcommand("mephisto",
@@ -139,7 +180,7 @@ int main(int argc, char **argv) {
     asm_program(app);
     stats_program(app);
     stdin_hist_prog(app);
-    
+    sam_read_testing(app);
     CLI11_PARSE(app, argc, argv);
     return 0;
 }
