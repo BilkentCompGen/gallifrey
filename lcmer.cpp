@@ -30,11 +30,7 @@ uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
     // find lcp cores
     for (; it1 + SYNCMER_K < len; it1++) {
         // printf("%d\t%d\n", kmer_view.get(), table[kmer_view.get()]);
-#if SYNCMER_RULE == DensitySyncmerRule
-        if ( kmer_view.get() < ((double)SYNCMER_S / SYNCMER_T)) 
-#else
         if ( table[kmer_view.get()]) 
-#endif
         {
             if (core_index >= str->capacity){
                 str->cores = (struct core *)realloc(str->cores, (core_index * 2) * sizeof(struct core));
