@@ -277,7 +277,7 @@ uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores);
 void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len);
 
 lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
-                                     int lcp_level);
+                                     int lcp_level, lps *str);
 
 lcp_read parse_cores_from_kseq(const char *data, size_t len, int lcp_level);
 #endif

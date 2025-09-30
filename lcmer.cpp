@@ -23,15 +23,24 @@ syncmer::syncmer_precomputed<
     syncmer::SYNCMER_RULE<SYNCMER_K, SYNCMER_S, SYNCMER_T>>
     table;
 uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
-                             struct core *cores) {
+                             struct lps *str) {
     int core_index = 0;
     KmerViewOnCrumbs<SYNCMER_K, uint32_t, 2> kmer_view;
     int64_t it1 = kmer_view.fill(data);
     // find lcp cores
     for (; it1 + SYNCMER_K < len; it1++) {
         // printf("%d\t%d\n", kmer_view.get(), table[kmer_view.get()]);
-        if (table[kmer_view.get()]) {
-            init_core_kmer<uint32_t, 2>(&(cores[core_index]), kmer_view.get(),
+#if SYNCMER_RULE == DensitySyncmerRule
+        if ( kmer_view.get() < ((double)SYNCMER_S / SYNCMER_T)) 
+#else
+        if ( table[kmer_view.get()]) 
+#endif
+        {
+            if (core_index >= str->capacity){
+                str->cores = (struct core *)realloc(str->cores, (core_index * 2) * sizeof(struct core));
+                str->capacity = core_index * 2;
+            }
+            init_core_kmer<uint32_t, 2>(&(str->cores[core_index]), kmer_view.get(),
                                         it1, it1 + SYNCMER_K);
             core_index++;
         }
@@ -124,16 +133,26 @@ uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores) {
 void init_lps_bam_old(lps *lps_ptr, const uint8_t *data, size_t len) {
     lps_ptr->level = 1;
     lps_ptr->size = 0;
+    lps_ptr->capacity = (len / CONSTANT_FACTOR);
     lps_ptr->cores =
         (struct core *)malloc((len / CONSTANT_FACTOR) * sizeof(struct core));
     lps_ptr->size = parse1_bam_syncmers_old(data, len, lps_ptr->cores);
 }
 void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len) {
     lps_ptr->level = 1;
-    lps_ptr->size = 0;
-    lps_ptr->cores =
-        (struct core *)malloc((len / CONSTANT_FACTOR) * sizeof(struct core));
-    lps_ptr->size = parse1_bam_syncmers(data, len, lps_ptr->cores);
+    if(lps_ptr->cores == nullptr){
+        lps_ptr->size = 0;
+        lps_ptr->capacity = (len / CONSTANT_FACTOR);
+        lps_ptr->cores =
+            (struct core *)malloc((len / CONSTANT_FACTOR) * sizeof(struct core));
+    }
+    else{
+        if (lps_ptr->capacity < len / CONSTANT_FACTOR){
+            lps_ptr->capacity = len / CONSTANT_FACTOR;
+            lps_ptr->cores = (struct core *)realloc(lps_ptr->cores, (len / CONSTANT_FACTOR) * sizeof(struct core));
+        }
+    }
+    lps_ptr->size = parse1_bam_syncmers(data, len, lps_ptr);
 }
 
 void init_lps_kseq(lps *lps_ptr, const char *data, size_t len) {
@@ -166,22 +185,21 @@ uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len) {
 }
 
 lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
-                                     int lcp_level) {
+                                     int lcp_level, lps *str) {
     // uint64_t estimated_core_size = (int)(len / std::pow(1.5, lcp_level));
 
-    lps str;
     uint8_t *two_bit_encoded =
         onehotto2bitDNA_bivec(data, len);  // TODO Make this not allocate work
                                            // on a scratch space per thread.
-    init_lps_bam(&str, two_bit_encoded, len);
-    lps_deepen(&str, lcp_level);
+    init_lps_bam(str, two_bit_encoded, len);
+    lps_deepen(str, lcp_level);
     lcp_read lr;
-    lr.reserve(str.size);
-    for (int i = 0; i < str.size; ++i) {
-        lr.cores.emplace_back(str.cores[i].label);
-        lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
+    lr.reserve(str->size);
+    for (int i = 0; i < str->size; ++i) {
+        lr.cores.emplace_back(str->cores[i].label);
+        lr.pos.emplace_back(str->cores[i].start, str->cores[i].end);
     }
-    free_lps(&str);
+    // free_lps(&str);
     free(two_bit_encoded);
     return lr;
 }

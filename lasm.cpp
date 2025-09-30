@@ -79,6 +79,7 @@ void stats_program(CLI::App &parent) {
         delete params;
         return ret;
     });
+    
 }
 
 int sam_read_testing(CLI::App &parent) {

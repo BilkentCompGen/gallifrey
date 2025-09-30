@@ -53,10 +53,10 @@ int run_stats(const std::string &input, int update_frequency, int lcmer_level){
             "{:.2f}");
 
         struct tb_event ev;
-
+        lps str = {0};
         while (reader.read(bamdata)) {
             lcp_read lcps = parse_cores_from_bam_record(
-                bam_get_seq(bamdata), bamdata->core.l_qseq, lcmer_level);
+                bam_get_seq(bamdata), bamdata->core.l_qseq, lcmer_level, &str);
             stats["length"].update(bamdata->core.l_qseq);
             stats["core-count"].update(lcps.cores.size());
             for (const auto &len : lcps.pos) {
@@ -89,6 +89,6 @@ int run_stats(const std::string &input, int update_frequency, int lcmer_level){
             if (ev.type == TB_EVENT_KEY)
                 goto enough;
         }
-    
+        lps_clear(&str);
         return 0;
 }

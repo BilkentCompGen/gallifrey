@@ -64,41 +64,46 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     gtl::vector<std::thread> workers;
     std::atomic<bool> done{false};
     int counts[1024] = {0};
-
-    auto job = [&]() -> std::function<int(bam1_t *)> {
+    
+    auto job = [&]() -> std::function<int(bam1_t *, lps *)> {
         if (job_type == "read_count"){
-            return [](bam1_t *bamdata) -> int {
+            return [](bam1_t *bamdata, lps *str) -> int {
                 return 1;
             };
         }
         else if (job_type == "core_count"){
-            return [lcp_level](bam1_t *bamdata) -> int {
-                lcp_read lr = parse_cores_from_bam_record(bam_get_seq(bamdata), bamdata->core.l_qseq, lcp_level);
+            return [&, lcp_level](bam1_t *bamdata, lps *str) -> int {
+                
+                lcp_read lr = parse_cores_from_bam_record(bam_get_seq(bamdata), bamdata->core.l_qseq, lcp_level, str);
                 // if (lr.cores.size() < LCMER_L + 2) {
                 //     return 0;
                 // }
+                
                 return (int)lr.cores.size();
             };
         }
-        return [](bam1_t *bamdata) -> int {
+        return [](bam1_t *bamdata, lps *str) -> int {
             return 0;
         };
     }();
 
-
     for(int i = 0; i < threads; ++i){
         workers.emplace_back([&, i](){
             bam1_t *bamdata = NULL;
+            lps str = {0, 0, 0, nullptr};
             while(!done.load() || data_queue.size_approx() > 0){
                 if(!data_queue.try_dequeue(bamdata)){
                     std::this_thread::sleep_for(std::chrono::nanoseconds(100));
                     continue;
                 }
-                counts[i] += job(bamdata);
+                counts[i] += job(bamdata, &str);
                 // ++counts[i];
                 if(!recycle_queue.try_enqueue(bamdata)){
                     bam_destroy1(bamdata);
                 }
+            }
+            if(str.cores != nullptr){
+                free_lps(&str);
             }
         });
     }
@@ -133,6 +138,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     // bam_destroy1(bamdata);
     sam_hdr_destroy(hdr);
     sam_close(fp);
+  
     return 0;
 }
 

@@ -173,6 +173,7 @@ struct assembler {
         int &all_reads) {
         uint64_t lcmer_index = 0;
         bam1_t *data_p = NULL;
+        lps str = {0};
         while (true) {
             if (!data_queue.try_dequeue(data_p)) {
                 if (done.load()) {
@@ -183,7 +184,7 @@ struct assembler {
             }
             all_reads++;
             lcp_read lr = parse_cores_from_bam_record(
-                bam_get_seq(data_p), data_p->core.l_qseq, lcp_level);
+                bam_get_seq(data_p), data_p->core.l_qseq, lcp_level, &str);
             if (lr.cores.size() < LCMER_L + 2) {
                 // printf("Skipping read %lld, cores.size()=%zu\n", here,
                 // lr.cores.size());
@@ -197,6 +198,7 @@ struct assembler {
                 data_p = NULL;
             }
         }
+        free_lps(&str);
     }
 
     auto generate_chunks(
