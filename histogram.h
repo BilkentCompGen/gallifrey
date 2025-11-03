@@ -54,7 +54,7 @@ class TextCell : public Cell {
     static auto my_mfa(Args const &...args) {
         return std::make_format_args(args...);
     }
-    void draw(int top, int left, int height, int width) override {
+    void draw(int top, int left, int height [[maybe_unused]], int width [[maybe_unused]]) override {
         // prepare arg store
 
         std::string text = std::vformat(fmt, std::apply(my_mfa, store));
@@ -64,7 +64,7 @@ class TextCell : public Cell {
         int y = 0;
         std::string line;
         while (getline(ss, line, '\n')) {
-            int pos = y * width;
+            // Note: pos variable was removed as it was unused
             // std::string line = (pos < (int)text.size())
             //                        ? text.substr(pos, width)
             //                        : std::string();

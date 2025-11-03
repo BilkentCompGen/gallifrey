@@ -7,14 +7,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_USING_LINKER_mold)
 if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release)
+    set(CMAKE_BUILD_TYPE Release)
 endif()
 enable_testing()
 # Compiler flags
 # Debug flags
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG -Wall -Wextra -Wpedantic")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -pg -O0 -DDEBUG -Wall -Wextra -Wpedantic")
 # Release flags
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -ftree-vectorize -DNDEBUG -Wall -Wextra -Wpedantic")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -pg -march=native -ftree-vectorize -DNDEBUG -Wall -Wextra -Wpedantic")
 # RelWithDebInfo flags
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG -Wall -Wextra")
 # MinSizeRel flags
@@ -33,7 +33,7 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(HTS REQUIRED htslib)
 include_directories(${HTS_INCLUDE_DIRS})
-link_directories(${HTS_LIBRARY_DIRS}) 
+link_directories(${HTS_LIBRARY_DIRS})
 add_definitions(${HTS_CFLAGS_OTHER})
 
 set(SOURCE_FILES lasm.cpp asm2.cpp stats.cpp lcmer.cpp sthist.cpp)
@@ -99,19 +99,19 @@ add_custom_target(debug-bamdoctor
 )
 
 # Compile definitions
-target_compile_definitions(${PROJECT_NAME} PUBLIC 
-    SYNCMER_RULE=DensitySyncmerRule 
-    LCMER_L=24 
-    SYNCMER_S=3 
-    SYNCMER_T=55 
+target_compile_definitions(${PROJECT_NAME} PUBLIC
+    SYNCMER_RULE=DensitySyncmerRule
+    LCMER_L=8
+    SYNCMER_S=7
+    SYNCMER_T=80
     SYNCMER_K=8
 )
 
-target_compile_definitions(bamdoctor PUBLIC 
-    SYNCMER_RULE=DensitySyncmerRule 
-    LCMER_L=24 
-    SYNCMER_S=3 
-    SYNCMER_T=55 
+target_compile_definitions(bamdoctor PUBLIC
+    SYNCMER_RULE=DensitySyncmerRule
+    LCMER_L=24
+    SYNCMER_S=3
+    SYNCMER_T=55
     SYNCMER_K=8
 )
 

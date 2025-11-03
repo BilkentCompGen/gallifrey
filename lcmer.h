@@ -1,7 +1,9 @@
 #pragma once
-#include <iterator>
+
+#include <thread>
 #ifndef LCMER_H
 #define LCMER_H
+#include <iterator>
 #include <htslib/sam.h>
 
 #include <algorithm>
@@ -10,9 +12,29 @@
 
 #include "config.h"
 #include "ext/lcptools/lcptools_ho.h"
+#include "ext/btllib/nthash_kmer.hpp"
+#include "nibble2base.hpp"
 
-uint32_t MurmurHash3_32(const void *key, int len, uint32_t seed);
-
+// Makes sure we have enough scratch space
+template<class T, double GF=2>
+struct charsi_base{
+    T *data;
+    size_t capacity;
+    charsi_base () : data{NULL}, capacity{0} {}
+    ~charsi_base(){
+        free(data);
+    }
+    int require(size_t cap){
+        if (cap > capacity){
+            capacity = cap * GF;
+            free(data);
+            data = (decltype(data)) malloc(capacity * sizeof(T));
+        }
+        return data == NULL;
+    }
+};
+using charsi = charsi_base<uint8_t, 2.0>;
+int onehotto2bitDNA2(const uint8_t *data, char *ret);
 struct sv {
     char *from;
     char *to;
@@ -42,6 +64,7 @@ struct sv {
 struct lcp_read {
     gtl::vector<uint32_t> cores;
     gtl::vector<std::pair<uint32_t, uint32_t>> pos;
+    const uint8_t *data;
     void reserve(size_t size) {
         cores.reserve(size);
         pos.reserve(size);
@@ -61,7 +84,7 @@ struct lcmer {
     }
 
     bool operator==(const lcmer &other) const {
-        return memcmp(data.data(), other.data.data(), 16 * sizeof(uint32_t)) ==
+        return memcmp(data.data(), other.data.data(), N * sizeof(uint32_t)) ==
                0;
         // for (int i = 0; i < N; ++i) {
         //     if (data[i] != other.data[i]) return false;
@@ -160,12 +183,14 @@ struct KmerViewOnCrumbs {
         if constexpr (KMASK != -1) value &= KMASK;
         value |= data_address[index];
 
-        value = value & KMER_SPACE_MASK;
+        // value = value & KMER_SPACE_MASK;
         return value;
     }
 
-    constexpr int_type get() const noexcept { return value & KMER_SPACE_MASK; }
+    constexpr int_type get() const noexcept { return value; }
 };
+
+
 
 template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
 struct KmerViewOnNibbles {
@@ -267,17 +292,116 @@ void init_core_kmer_xor(struct core *cr, _T Kval, uint64_t si, uint64_t ei) {
 
 uint8_t *onehotto2bitDNA(const uint8_t *data, size_t len);
 uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len);
+void onehotto2bitDNA_bivec_chs(const uint8_t *data, size_t len, charsi &c);
 
-uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
-                             struct core *cores);
+inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
+                             struct lps *str, const auto &syncmer_functor) {
+    int core_index = 0;
+    KmerViewOnCrumbs<SYNCMER_K, uint32_t, 2> kmer_view;
+    int64_t it1 = kmer_view.fill(data);
+    // find lcp cores
+    // if(str->capacity < )
+    if (str->capacity < len * CONSTANT_FACTOR) {
+        str->capacity = 1.5 * len * CONSTANT_FACTOR;
+        str->cores = (struct core *)realloc(
+            str->cores, (str->capacity) * sizeof(struct core));
+    }
+    for (; it1 + SYNCMER_K < len; it1++) {
+        // printf("%d\t%d\n", kmer_view.get(), table[kmer_view.get()]);
+        if (syncmer_functor(kmer_view.get())) {
+            // if (core_index >= str->capacity){
+            //     str->cores = (struct core *)realloc(str->cores,
+            //     (str->capacity * 2 + 1) * sizeof(struct core)); str->capacity
+            //     = str->capacity * 2 + 1;
+            // }
+            init_core_kmer<uint32_t, 2>(&(str->cores[core_index]),
+                                        kmer_view.get(), it1, it1 + SYNCMER_K);
+            core_index++;
+        }
+        kmer_view.move_get(data, it1);
+        // cout << "None\n";
+    }
+    // cout << "CORESSS" << it1 << "\t" << it2 << "\n";
+    return core_index;
+}
+
+inline uint64_t parse1_bam_syncmers_nthash(const uint8_t *data, int64_t len,
+                             struct lps *str, const auto &syncmer_functor) {
+    int core_index = 0;
+    btllib::NtHash nthasher((const char *) data, 1, SYNCMER_K);
+
+
+    if (str->capacity < len * CONSTANT_FACTOR) {
+        str->capacity = 1.5 * len * CONSTANT_FACTOR;
+        str->cores = (struct core *)realloc(
+            str->cores, (str->capacity) * sizeof(struct core));
+    }
+    while(nthasher.roll()){
+        auto fh = nthasher.get_forward_hash();
+        auto rh = nthasher.get_reverse_hash();
+        auto h = std::min(fh, rh);
+
+        if (syncmer_functor(h)) {
+            // if (core_index >= str->capacity){
+            //     str->cores = (struct core *)realloc(str->cores,
+            //     (str->capacity * 2 + 1) * sizeof(struct core)); str->capacity
+            //     = str->capacity * 2 + 1;
+            // }
+            init_core_kmer<uint32_t, 4>(&(str->cores[core_index]),
+                                        h, nthasher.get_pos(), nthasher.get_pos() + SYNCMER_K);
+            core_index++;
+        }
+    }
+
+    return core_index;
+}
 
 uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores);
 
 /// @brief Initializes an lps struct with a given sequence in the bam compressed
-void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len);
+// void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len);
+inline void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len, const auto &syncmer_functor) {
+    lps_ptr->level = 1;
+    if (lps_ptr->cores == nullptr) {
+        lps_ptr->size = 0;
+        lps_ptr->capacity = (len / CONSTANT_FACTOR);
+        lps_ptr->cores = (struct core *)malloc((len / CONSTANT_FACTOR) *
+                                               sizeof(struct core));
+    } else {
+        if (lps_ptr->capacity < len / CONSTANT_FACTOR) {
+            lps_ptr->capacity = len / CONSTANT_FACTOR;
+            lps_ptr->cores = (struct core *)realloc(
+                lps_ptr->cores, (len / CONSTANT_FACTOR) * sizeof(struct core));
+        }
+    }
 
-lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
-                                     int lcp_level, lps *str);
+//    lps_ptr->size = parse1_bam_syncmers_nthash(data, len, lps_ptr, syncmer_functor);
+    lps_ptr->size = parse1_bam_syncmers(data, len, lps_ptr, syncmer_functor);
+}
+
+
+inline lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
+                                     int lcp_level, lps *str, const auto &syncmer_functor, charsi &chs) {
+    // uint64_t estimated_core_size = (int)(len / std::pow(1.5, lcp_level));
+
+    //onehotto2bitDNA_bivec_chs(data, len, chs);  // TODO Make this not allocate work
+                                           // on a scratch space per thread.
+                                           //
+    chs.require(len);
+//    nibble2base((uint8_t *)data, (char *)chs.data, (int)len);
+
+    onehotto2bitDNA_bivec_chs(data, len, chs);  // TODO Make this not allocate work
+    init_lps_bam(str, chs.data, len, syncmer_functor);
+    lps_deepen(str, lcp_level);
+    lcp_read lr;
+    lr.reserve(str->size);
+    for (int i = 0; i < str->size; ++i) {
+        lr.cores.emplace_back(str->cores[i].label);
+        lr.pos.emplace_back(str->cores[i].start, str->cores[i].end);
+    }
+    lr.data = data;
+    return lr;
+}
 
 lcp_read parse_cores_from_kseq(const char *data, size_t len, int lcp_level);
 #endif

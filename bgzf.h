@@ -11,7 +11,7 @@ struct BAMReader {
     samFile *fp;
     sam_hdr_t *hdr;
 
-    BAMReader(const std::string &filename, int threads = 2)
+    BAMReader(const std::string &filename, int threads [[maybe_unused]] = 2)
         : fp{sam_open(filename.c_str(), "rb")} {
         this->filename = filename;
         // bgzf_mt(fp->fp.bgzf, 2, 0);
@@ -86,7 +86,10 @@ public:
     }
 
     ~BlockIterator() {
-        if (hfp_) hclose(hfp_);
+        if (hfp_) {
+            int result = hclose(hfp_);
+            (void)result; // Suppress unused result warning
+        }
     }
 
     bool next(Block& block) {

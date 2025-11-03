@@ -24,7 +24,6 @@
 #include <tuple>
 
 #include "bgzf.h"
-#include "cascadingbloom.h"
 #include "config.h"
 #include "ext/bloom_filter.hpp"
 #include "ext/kseq.h"
@@ -298,7 +297,7 @@ struct BAMKit {
         std::unique_ptr<bam1_t, decltype(&bam_destroy1)> rec(bam_init1(),
                                                              bam_destroy1);
         sam_hdr_t *hdr = NULL;
-
+        lps str = {0,0, 0, 0};
         while (chunk_queue.size_approx() > 0 || !done.load()) {
             if (!chunk_queue.try_dequeue(chunk)) {
                 continue;
@@ -323,7 +322,7 @@ struct BAMKit {
                     break;
                 }
                 lcp_read lr = parse_cores_from_bam_record(
-                    bam_get_seq(rec.get()), rec->core.l_qseq, lcp_level);
+                    bam_get_seq(rec.get()), rec->core.l_qseq, lcp_level, &str);
                 if (lr.cores.size() < LCMER_L + 2) {
                     // printf("Skipping read %lld, cores.size()=%zu\n", here,
                     // lr.cores.size());
@@ -335,6 +334,7 @@ struct BAMKit {
             all_reads += src;
             // printf("%zu\n", );
         }
+        free_lps(&str);
     }
 
     static auto generate_data(
@@ -389,6 +389,7 @@ struct BAMKit {
         int &all_reads) {
         uint64_t lcmer_index = 0;
         bam1_t *data_p = NULL;
+        lps str = {0,0,0,0};
         while (true) {
             if (!data_queue.try_dequeue(data_p)) {
                 if (done.load()) {
@@ -399,7 +400,7 @@ struct BAMKit {
             }
             all_reads++;
             lcp_read lr = parse_cores_from_bam_record(
-                bam_get_seq(data_p), data_p->core.l_qseq, lcp_level);
+                bam_get_seq(data_p), data_p->core.l_qseq, lcp_level, &str);
             if (lr.cores.size() < LCMER_L + 2) {
                 // printf("Skipping read %lld, cores.size()=%zu\n", here,
                 // lr.cores.size());
@@ -413,6 +414,7 @@ struct BAMKit {
                 data_p = NULL;
             }
         }
+        free_lps(&str);
     }
     static auto reverse_process_cores(uint8_t *seq_nibble, const lcp_read &lr,
                                       const lcmer_index_t &lci, bidbg &dbg) {
@@ -453,6 +455,7 @@ struct BAMKit {
         std::atomic<bool> done{false};
         gtl::vector<std::thread> workers;
         int data_threads = threads / 3;
+        lps str = {0,0,0,0};
         for (int i = 0; i < threads - data_threads; ++i) {
             workers.emplace_back([&]() {
                 bam1_t *data_p;
@@ -463,7 +466,7 @@ struct BAMKit {
                         continue;
                     }
                     lcp_read lr = parse_cores_from_bam_record(
-                        bam_get_seq(data_p), data_p->core.l_qseq, lcp_level);
+                        bam_get_seq(data_p), data_p->core.l_qseq, lcp_level, &str);
                     if (lr.cores.size() < LCMER_L + 2) {
                         continue;
                     } else {
@@ -475,6 +478,7 @@ struct BAMKit {
                         data_p = NULL;
                     }
                 }
+                free_lps(&str);
             });
         }
         generate_data(input, data_threads, data_queue, recycle_queue);

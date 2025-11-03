@@ -12,6 +12,9 @@
 #include <concurrentqueue.h>
 #include <gtl/vector.hpp>
 #include "lcmer.h"
+
+#include "syncmer.h"
+
 enum class SamReadTestingMode {
     BASIC,
     POOL,
@@ -25,7 +28,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     printf("LCP level: %d\n", lcp_level);
     printf("Mode: %s\n", mode == SamReadTestingMode::BASIC ? "BASIC" : "POOL");
 
-    
+
     // Read bam file with htslib
     samFile *fp = sam_open(input.c_str(), "r");
     if(!fp){
@@ -46,7 +49,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     if(mode == SamReadTestingMode::BASIC){
         hts_set_threads(fp, threads);
     }else if(mode == SamReadTestingMode::POOL){
-        
+
         if(threads > 1){
             pool.pool = hts_tpool_init(threads);
             if(!pool.pool){
@@ -64,7 +67,8 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     gtl::vector<std::thread> workers;
     std::atomic<bool> done{false};
     int counts[1024] = {0};
-    
+    syncmer::DensitySyncmerRule<uint32_t, syncmer::MurMur> sr{double{SYNCMER_S}/SYNCMER_T, 423};
+    charsi chs;
     auto job = [&]() -> std::function<int(bam1_t *, lps *)> {
         if (job_type == "read_count"){
             return [](bam1_t *bamdata, lps *str) -> int {
@@ -73,12 +77,12 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
         }
         else if (job_type == "core_count"){
             return [&, lcp_level](bam1_t *bamdata, lps *str) -> int {
-                
-                lcp_read lr = parse_cores_from_bam_record(bam_get_seq(bamdata), bamdata->core.l_qseq, lcp_level, str);
+
+                lcp_read lr = parse_cores_from_bam_record(bam_get_seq(bamdata), bamdata->core.l_qseq, lcp_level, str, sr, chs);
                 // if (lr.cores.size() < LCMER_L + 2) {
                 //     return 0;
                 // }
-                
+
                 return (int)lr.cores.size();
             };
         }
@@ -93,7 +97,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
             lps str = {0, 0, 0, nullptr};
             while(!done.load() || data_queue.size_approx() > 0){
                 if(!data_queue.try_dequeue(bamdata)){
-                    std::this_thread::sleep_for(std::chrono::nanoseconds(100));
+                    std::this_thread::sleep_for(std::chrono::nanoseconds(10));
                     continue;
                 }
                 counts[i] += job(bamdata, &str);
@@ -107,7 +111,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
             }
         });
     }
-    
+
     while(sam_read1(fp, hdr, bamdata) >= 0){
         while(!data_queue.try_enqueue(bamdata)){
             std::this_thread::sleep_for(std::chrono::nanoseconds(100));
@@ -138,7 +142,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     // bam_destroy1(bamdata);
     sam_hdr_destroy(hdr);
     sam_close(fp);
-  
+
     return 0;
 }
 

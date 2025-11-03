@@ -19,7 +19,7 @@ int run_hist_on_stdin(int dims, int freq = 10) {
     Screen screen {h,w};
     // w = 0;
     // h = 0;
-    int histograms [dims];
+    std::vector<int> histograms(dims);
     int idx = 0;
     for(int i = 0; i< w; ++i){
         for (int j = 0; j <h;++j){

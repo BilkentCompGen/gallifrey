@@ -1,68 +1,81 @@
 
 #include <concurrentqueue.h>
-#include <stdio.h>
-
-#include <chrono>
-#include <gtl/phmap.hpp>
-#include <gtl/phmap_fwd_decl.hpp>
-#include <gtl/vector.hpp>
-#include <string>
-#include <iostream>
-#include <mutex>
-
-
-
 #include <htslib/bgzf.h>
 #include <htslib/hfile.h>
 #include <htslib/hts.h>
 #include <htslib/sam.h>
 #include <htslib/thread_pool.h>
+#include <stdio.h>
+
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <gtl/phmap.hpp>
+#include <gtl/phmap_fwd_decl.hpp>
+#include <gtl/vector.hpp>
+#include <iostream>
+#include <mutex>
+#include <string>
+
 #include "asm.h"
 #include "bgzf.h"
-#include "config.h"
 #include "bloomfilter.h"
+#include "config.h"
 #include "lcmer.h"
-
-
+#include "nibble2base.hpp"
+#include "syncmer.h"
 
 using u64 = uint64_t;
 
 using std::string;
 enum class input_type { BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 
-#define NPH_BLOCKS 12
+#define HT_SHARD_BC 8
 struct dbg_index {
     using mutex_type = std::mutex;
     struct bidbg_val {
         gtl::flat_hash_set<u64> prev;
-        int cc;
-        char *seq = NULL;
+        unsigned cc;
+        bam_nibble_data seq;
     };
     using dbg_map_t = gtl::parallel_flat_hash_map<
         u64, bidbg_val, std::hash<u64>, gtl::priv::hash_default_eq<u64>,
-        std::allocator<std::pair<const u64, bidbg_val>>, NPH_BLOCKS,
+        std::allocator<std::pair<const u64, bidbg_val>>, HT_SHARD_BC,
         mutex_type>;
     using lcmer_index_t = gtl::parallel_flat_hash_map<
         lcmer<LCMER_L>, u64, std::hash<lcmer<LCMER_L>>,
         gtl::priv::hash_default_eq<lcmer<LCMER_L>>,
-        std::allocator<std::pair<const lcmer<LCMER_L>, u64>>, NPH_BLOCKS,
+        std::allocator<std::pair<const lcmer<LCMER_L>, u64>>, HT_SHARD_BC,
         mutex_type>;
 
     dbg_map_t dbg;
     lcmer_index_t lci;
-    bloom_interface<bloom_ext::RegisterBlockedBloomFilter<1>> bf;
+    bloom_interface<bloom_ext::RegisterBlockedBloomFilter<1>, std::mutex> bf;
 
-    dbg_index(bloom_param bparam) : bf{bparam.false_positive_rate, bparam.projected_count, bparam.seed} {}
-
+    dbg_index(double false_positive_rate, uint64_t projected_count,
+              uint64_t seed)
+        : bf{false_positive_rate, projected_count, seed} {}
+    // dbg_index(const dbg_index &other)
     u64 get(const lcmer<LCMER_L> &l) const {
         auto it = lci.find(l);
-        if (it != lci.end()) {
-            return it->second;
-        }
-        return 0;
+        return it == lci.end() ? 0 : it->second;
+        // if (lci.contains(l)) {
+        //     return lci.at(l);
+        // }
+        // // lci.if_contains(l,[&ret](const lcmer_index_t::value_type &v){ ret
+        // = v.second;}); return 0;
     }
 
     u64 emplace(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
+        auto vv = lci.try_emplace(l, idx | tid);
+        if (vv.second) {  // Means new item on the table
+            idx += 128;   // TODO: change this to next power of two from the
+                          // threadcount.
+        }
+        return vv.first->second;
+    }
+    u64 emplace2(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
         auto new_hash = lci.hash(l);
         if (!bf.contains(new_hash)) {
             bf.insert(new_hash);
@@ -70,7 +83,8 @@ struct dbg_index {
         }
         auto vv = lci.try_emplace_with_hash(new_hash, l, idx | tid);
         if (vv.second) {  // Means new item on the table
-            idx += 128;
+            idx += 128;   // TODO: change this to next power of two from the
+                          // threadcount.
         }
         return vv.first->second;
     }
@@ -81,117 +95,182 @@ struct assembler {
     string output;
     int threads;
     int lcp_level;
-    bloom_param bparam;
-    assembler(const string &input, const string &output, int threads,
-              int lcp_level, bloom_param bparam)
-        : input{input},
-          output{output},
-          threads{threads},
-          lcp_level{lcp_level},
-          bparam{bparam} {}
-  static auto process_cores(const lcp_read &lr, dbg_index &dbgi, int thread_id,
-                   uint64_t &lcmer_index) {
-    lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
+    double density;
+    uint64_t projected_count;
+    double false_positive_rate;
+    uint64_t random_seed;
+    using SYNCMER_HASHER = syncmer::MurMur;
+    syncmer::DensitySyncmerRule<uint32_t, SYNCMER_HASHER> syncmer_functor;
+    assembler(const asm_parameters &param)
+        : input{param.input},
+          output{param.output},
+          threads{param.threads},
+          lcp_level{param.lcp_level},
+          density{param.density},
+          projected_count{param.bloom.projected_count},
+          false_positive_rate{param.bloom.false_positive_rate},
+          random_seed{param.random_seed},
+          syncmer_functor{density, static_cast<unsigned int>(random_seed)} {}
+    static void process_cores(const lcp_read &lr, dbg_index &dbgi,
+                              int thread_id, uint64_t &lcmer_index) {
+        lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
 
-    gtl::vector<uint64_t> ll(1, 0);
-    ll.reserve(lr.cores.size() - LCMER_L + 3);
-    ll.push_back(dbgi.emplace(l, lcmer_index, thread_id));
-    for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
-        uint32_t in_core = lr.cores[i];
-        l.update_lcmer(in_core);
+        gtl::vector<uint64_t> ll(1, 0);
+        ll.reserve(lr.cores.size() - LCMER_L + 3);
         ll.push_back(dbgi.emplace(l, lcmer_index, thread_id));
-    }
-    ll.push_back(0);
-
-    for (size_t i = 1; i < ll.size() - 1; ++i) {
-        if (ll[i] == 0) {
-            continue;
+        for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
+            uint32_t in_core = lr.cores[i];
+            l.update_lcmer(in_core);
+            ll.push_back(dbgi.emplace(l, lcmer_index, thread_id));
         }
-        if (ll[i - 1] == 0) {
-            if (ll[i + 1] == 0) {
+        ll.push_back(0);
+
+        for (size_t i = 1; i < ll.size() - 1; ++i) {
+            if (ll[i] == 0) {
                 continue;
-            } else {
-                dbgi.dbg.lazy_emplace_l(
-                    ll[i], [&](dbg_index::dbg_map_t::value_type &val) { val.second.cc++; },
-                    [&](const dbg_index::dbg_map_t::constructor &ctr) {
-                        ctr(ll[i], dbg_index::bidbg_val{{}, 1, NULL});
-                    });
             }
-        } else {
-        if (ll[i + 1] == 0) {
-                dbgi.dbg.lazy_emplace_l(
-                    ll[i],
-                    [&](dbg_index::dbg_map_t::value_type &val) {
-                        val.second.prev.emplace(ll[i - 1]);
-                        val.second.cc++;
-                    },
-                    [&](const dbg_index::dbg_map_t::constructor &ctr) {
-                        ctr(ll[i], dbg_index::bidbg_val{{ll[i - 1]}, 1, NULL});
-                    });
+            if (ll[i - 1] == 0) {
+                if (ll[i + 1] == 0) {
+                    continue;
+                } else {
+                    dbgi.dbg.lazy_emplace_l(
+                        ll[i],
+                        [&](dbg_index::dbg_map_t::value_type &val) {
+                            val.second.cc++;
+                        },
+                        [&](const dbg_index::dbg_map_t::constructor &ctr) {
+                            ctr(ll[i], dbg_index::bidbg_val{{}, 1, {}});
+                        });
+                }
             } else {
-                dbgi.dbg.lazy_emplace_l(
-                    ll[i],
-                    [&]( dbg_index::dbg_map_t::value_type &val) {
-                        val.second.prev.emplace(ll[i - 1]);
-                        val.second.cc++;
-                    },
-                    [&](const dbg_index::dbg_map_t::constructor &ctr) {
-                        ctr(ll[i], dbg_index::bidbg_val{{ll[i - 1]}, 1, NULL});
-                    });
+                if (ll[i + 1] == 0) {
+                    dbgi.dbg.lazy_emplace_l(
+                        ll[i],
+                        [&](dbg_index::dbg_map_t::value_type &val) {
+                            val.second.prev.emplace(ll[i - 1]);
+                            // val.second.cc++;
+                        },
+                        [&](const dbg_index::dbg_map_t::constructor &ctr) {
+                            ctr(ll[i],
+                                dbg_index::bidbg_val{{ll[i - 1]}, 0, {}});
+                        });
+                } else {
+                    dbgi.dbg.lazy_emplace_l(
+                        ll[i],
+                        [&](dbg_index::dbg_map_t::value_type &val) {
+                            val.second.prev.emplace(ll[i - 1]);
+                            val.second.cc++;
+                        },
+                        [&](const dbg_index::dbg_map_t::constructor &ctr) {
+                            ctr(ll[i],
+                                dbg_index::bidbg_val{{ll[i - 1]}, 1, {}});
+                        });
+                }
             }
         }
     }
-}
+    static void process_cores_for_basespace(const lcp_read &lr, dbg_index &dbgi,
+                                            int thread_id,
+                                            uint64_t &lcmer_index) {
+        lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
 
+        uint64_t val = dbgi.get(l);
 
+        for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
+
+            uint64_t from = lr.pos[i - 1].second;
+            uint64_t to = lr.pos[i].second;
+
+            dbgi.dbg.modify_if(val, [&](dbg_index::dbg_map_t::value_type &val) {
+                // Lets copy the one-hot representation instead of decoding it
+                // here.
+                //  we need to copy from lr.pos[i-1].second to lr.pos[i].second.
+                //  We need to pay attention to odd values (
+                //   we need to keep some slack and make sure it is communicated
+                //   to downstream
+                //  )
+
+                if (val.second.seq.len == 0) {
+                    if (to - from > 0) {
+                       val.second.seq = bam_nibble_data{lr.data, from, to};
+                        // val.second.seq.data = (decltype(val.second.seq.data))malloc(
+                        //     ((to>>1) - (from>>1)) + 1);
+                        // memcpy(val.second.seq.data, lr.data + (from >> 1 ), (to>>1) - (from>>1) + 1);
+                        // val.second.seq.data[(to>>1) - (from>>1)] = 0;
+                        // val.second.seq.skip_first = from & 1;
+                        // // val.second.seq =
+                        // //     (uint8_t *)((uint64_t)val.second.seq | (from & 1));
+                        // // val.second.seq = (uint8_t *)((uint64_t)val.second.seq |
+                        // //                              ((to & 1) << 1));
+                        // val.second.seq.len = (to - from) + 1;
+
+                        // val.second.seq = (decltype(val.second.seq))malloc(
+                        //     (_to_byte - _from_byte) + 1);
+                        // memcpy(val.second.seq, lr.data + _from_byte, _to_byte - _from_byte+1);
+                        // val.second.seq[_to_byte - _from_byte] = 0;
+                        // val.second.seq =
+                        //     (uint8_t *)((uint64_t)val.second.seq | (from & 1));
+                        // val.second.seq = (uint8_t *)((uint64_t)val.second.seq |
+                        //                              ((to & 1) << 1));
+                        // val.second.len = slen + 1;
+                    }
+                }
+            });
+            uint32_t in_core = lr.cores[i];
+            l.update_lcmer(in_core);
+            val = dbgi.get(l);
+        }
+    }
 
     static std::pair<int, int> get_thread_dist(int threads) {
         if (threads == 0) {
             return {0, 0};
         }
-        if (threads < 4) {
-            return {1, threads - 1};
+        if (threads < 16) {
+            int sam_threads = threads / 2;
+            return {sam_threads, threads - sam_threads};
         }
-        return {threads / 2, threads - threads / 2};
+        return {8, threads - 8};
     }
     using cqt = moodycamel::ConcurrentQueue<Chunk>;
     using dqt = moodycamel::ConcurrentQueue<bam1_t *>;
 
-    static auto process_data_from_chunks(
-        int thread_id, int lcp_level,
-        string filename, cqt &chunk_queue,
-        dbg_index &dbgi, std::atomic<bool> &done, int &processed_read_count,
-        int &all_reads) {
+    static auto process_data_from_chunks(int thread_id, int lcp_level,
+                                         string filename, cqt &chunk_queue,
+                                         dbg_index &dbgi,
+                                         std::atomic<bool> &done,
+                                         int &processed_read_count,
+                                         int &all_reads) {
         uint64_t lcmer_index = 0;
-        
-
     }
-   static auto process_data(
-        int thread_id, int lcp_level,
-        dqt &data_queue,
-        dqt &recycle_queue, dbg_index &dbgi, std::atomic<bool> &done, int &processed_read_count,
-        int &all_reads) {
+    static auto process_data(
+        int thread_id, int lcp_level, dqt &data_queue, dqt &recycle_queue,
+        dbg_index &dbgi, std::atomic<bool> &done, int &processed_read_count,
+        int &all_reads, decltype(assembler::process_cores) Process_Func,
+        syncmer::DensitySyncmerRule<uint32_t, SYNCMER_HASHER> syncmer_functor) {
         uint64_t lcmer_index = 0;
         bam1_t *data_p = NULL;
-        lps str = {0};
+        lps str = {0, 0, 0, 0};
+        charsi chs;
         while (true) {
             if (!data_queue.try_dequeue(data_p)) {
                 if (done.load()) {
                     break;
                 }
-                std::this_thread::sleep_for(std::chrono::nanoseconds(100));
+                // std::this_thread::sleep_for(std::chrono::nanoseconds(100));
                 continue;
             }
             all_reads++;
             lcp_read lr = parse_cores_from_bam_record(
-                bam_get_seq(data_p), data_p->core.l_qseq, lcp_level, &str);
+                bam_get_seq(data_p), data_p->core.l_qseq, lcp_level, &str,
+                syncmer_functor, chs);
             if (lr.cores.size() < LCMER_L + 2) {
                 // printf("Skipping read %lld, cores.size()=%zu\n", here,
                 // lr.cores.size());
                 goto pd_cleanup;
             }
             ++processed_read_count;
-            process_cores(lr, dbgi, thread_id, lcmer_index);
+            Process_Func(lr, dbgi, thread_id, lcmer_index);
         pd_cleanup:
             if (!recycle_queue.try_dequeue(data_p)) {
                 bam_destroy1(data_p);
@@ -201,8 +280,7 @@ struct assembler {
         free_lps(&str);
     }
 
-    auto generate_chunks(
-        std::string input, cqt &chunk_queue) {
+    auto generate_chunks(std::string input, cqt &chunk_queue) {
         BlockIterator iter(input);
         Block blk;
         // fetch chunks until no more blocks
@@ -227,14 +305,14 @@ struct assembler {
             std::cerr << "Error: Could not open " << input << std::endl;
             return;
         }
-        // Use htslib's thread pool for fast background decompression
-        htsThreadPool pool = {NULL, 0};
-        if (threads > 1) {
-            pool.pool = hts_tpool_init(threads);
-            // hts_set_thread_pool(fp, &pool);
-            hts_set_cache_size(fp, 1024 * 1024 * 1024);
-            hts_set_opt(fp, HTS_OPT_THREAD_POOL, &pool);
-        }
+        hts_set_threads(fp, threads);
+        // htsThreadPool pool = {NULL, 0};
+        // if (threads > 1) {
+        //     pool.pool = hts_tpool_init(threads);
+        //     // hts_set_thread_pool(fp, &pool);
+        //     hts_set_cache_size(fp, 1024 * 1024 * 1024);
+        //     hts_set_opt(fp, HTS_OPT_THREAD_POOL, &pool);
+        // }
 
         bam_hdr_t *hdr = sam_hdr_read(fp);
         bam1_t *rec = nullptr;
@@ -248,27 +326,27 @@ struct assembler {
 
             if (sam_read1(fp, hdr, rec) >= 0) {
                 while (!data_queue.try_enqueue(rec)) {
-                    std::this_thread::sleep_for(std::chrono::nanoseconds(100));
+                    std::this_thread::sleep_for(std::chrono::nanoseconds(10));
                 }
                 rec = nullptr;
             } else {
-                // End of file or error. Recycle the unused record and exit.
+                // End of file or error. Destroy the unused record and exit.
                 bam_destroy1(rec);
                 break;
             }
         }
         bam_hdr_destroy(hdr);
         sam_close(fp);
-        if (pool.pool) {
-            hts_tpool_destroy(pool.pool);
-        }
+        // if (pool.pool) {
+        //     hts_tpool_destroy(pool.pool);
+        // }
     }
     auto construct_dbg() {
         dqt data_queue{static_cast<size_t>(threads) * 1024, 1, 1};
         dqt recycle_queue{static_cast<size_t>(threads) * 1024, 1, 1};
         std::atomic<bool> done{false};
 
-        dbg_index dbgi{bparam};
+        dbg_index dbgi{false_positive_rate, projected_count, random_seed};
 
         gtl::vector<std::thread> workers;
         auto [data_thread_count, worker_thread_count] =
@@ -277,10 +355,12 @@ struct assembler {
         gtl::vector<int> all_read_counts(worker_thread_count, 0);
 
         for (int tid = 1; tid <= worker_thread_count; ++tid) {
-           workers.emplace_back(process_data, tid, lcp_level,
-                             std::ref(data_queue), std::ref(recycle_queue),
-                             std::ref(dbgi), std::ref(done),
-                             std::ref(valid_read_counts[tid-1]), std::ref(all_read_counts[tid-1]));
+            workers.emplace_back(process_data, tid, lcp_level,
+                                 std::ref(data_queue), std::ref(recycle_queue),
+                                 std::ref(dbgi), std::ref(done),
+                                 std::ref(valid_read_counts[tid - 1]),
+                                 std::ref(all_read_counts[tid - 1]),
+                                 process_cores, std::cref(syncmer_functor));
         }
 
         generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
@@ -291,13 +371,57 @@ struct assembler {
             worker.join();
         }
 
-        return  dbgi;
+        int valid_sum = 0;
+        int all_sum = 0;
+        for (size_t i = 0; i < valid_read_counts.size(); ++i) {
+            valid_sum += valid_read_counts[i];
+            all_sum += all_read_counts[i];
+        }
+
+        fprintf(stderr, "%d processed\n%d total reads\n", valid_sum, all_sum);
+        return dbgi;
     }
 
-    auto convert2basespace() -> int { return 0; }
+    auto convert2basespace(dbg_index &dbgi) -> int {
+        dqt data_queue{static_cast<size_t>(threads) * 1024, 1, 1};
+        dqt recycle_queue{static_cast<size_t>(threads) * 1024, 1, 1};
+        std::atomic<bool> done{false};
+
+        gtl::vector<std::thread> workers;
+        auto [data_thread_count, worker_thread_count] =
+            get_thread_dist(threads);
+        gtl::vector<int> valid_read_counts(worker_thread_count, 0);
+        gtl::vector<int> all_read_counts(worker_thread_count, 0);
+
+        for (int tid = 1; tid <= worker_thread_count; ++tid) {
+            workers.emplace_back(
+                process_data, tid, lcp_level, std::ref(data_queue),
+                std::ref(recycle_queue), std::ref(dbgi), std::ref(done),
+                std::ref(valid_read_counts[tid - 1]),
+                std::ref(all_read_counts[tid - 1]), process_cores_for_basespace,
+                std::cref(syncmer_functor));
+        }
+        generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
+                      data_thread_count);
+
+        done.store(true);
+        for (auto &worker : workers) {
+            worker.join();
+        }
+
+        int valid_sum = 0;
+        int all_sum = 0;
+        for (size_t i = 0; i < valid_read_counts.size(); ++i) {
+            valid_sum += valid_read_counts[i];
+            all_sum += all_read_counts[i];
+        }
+
+        fprintf(stderr, "%d processed\n%d total reads\n", valid_sum, all_sum);
+        return 0;
+    }
 };
 
-//TODO do not use extensions to identify input type.
+// TODO do not use extensions to identify input type.
 input_type identify_input(const std::string &input) {
     std::string_view sv(input);
     if (sv.ends_with(".bam")) {
@@ -320,7 +444,8 @@ input_type identify_input(const std::string &input) {
 
 void print_raw_dbg(FILE *out, const dbg_index &dbgi) {
     for (const auto &[lval, edges] : dbgi.dbg) {
-        fprintf(out, "S\tC%llu\t%s\tLN:i:%d\tRC:i:%d\n", lval, "*", 100, edges.cc);
+        fprintf(out, "S\tC%llu\t%s\tLN:i:%d\tRC:i:%d\n", lval, "*", 100,
+                edges.cc);
     }
 
     for (const auto &[lval, edges] : dbgi.dbg) {
@@ -328,27 +453,55 @@ void print_raw_dbg(FILE *out, const dbg_index &dbgi) {
             fprintf(out, "L\tC%llu\t+\tC%llu\t+\t%dM\n", p, lval, 1);
         }
     }
-
 }
 
-int run_assembly(const std::string &input, const std::string &output,
-                 int threads, int lcp_level, bloom_param bpd) {
+void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
+    char buffer[1024 * 8];
+    for (const auto &[lval, edges] : dbgi.dbg) {
+        if (edges.cc == 0 && edges.prev.size() == 0) {
+            continue;
+        }
+        const bam_nibble_data &s = edges.seq;
+
+//        __builtin_debugtrap();
+        if (s.len == 0) {
+            fprintf(out, "S\tC%llu\t%s\tLN:i:%d\tRC:i:%lu\n", lval, "", 0,
+                    edges.cc + edges.prev.size());
+        } else {
+//            int i = onehotto2bitDNA2(s, buffer);
+            s.convert_to_ascii(buffer);
+            fprintf(out, "S\tC%llu\t%s\tLN:i:%d\tRC:i:%lu\tQF:s:%s\n", lval,
+                    buffer + (buffer[0] == 'N' ? 1 : 0), s.len + (s.skip_first ? 1 : 0),
+                    edges.cc + edges.prev.size(), s.skip_first ? "S" : "N");
+        }
+
+        for (uint64_t nl : edges.prev) {
+            if (dbgi.dbg.contains(nl))
+                fprintf(out, "L\tC%llu\t+\tC%llu\t+\t%dM\n", nl, lval, 0);
+        }
+    }
+}
+int run_assembly(const asm_parameters &param) {
     INIT_TIMERS(HIFI_ASSEMBLY);
 
-    auto inty = identify_input(input);
+    auto inty = identify_input(param.input);
 
     if (inty == input_type::UNKNOWN) {
-        fprintf(stderr, "Unknown input type %s\n", input.c_str());
+        fprintf(stderr, "Unknown input type %s\n", param.input.c_str());
         return -1;
     }
-    assembler as(input, output, threads, lcp_level, bpd);
+    assembler as(param);
     auto dbg = as.construct_dbg();
 
-    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG construction finished");
+    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG construction done.");
 
-    FILE *out = fopen(output.c_str(), "w");
-    print_raw_dbg(out, dbg);
+    as.convert2basespace(dbg);
+    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Converting to basespace done.");
 
+    FILE *out = fopen(param.output.c_str(), "w");
+    print_dbg_seqs(out, dbg);
+
+    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG printing done.");
     fclose(out);
 
     return 0;
