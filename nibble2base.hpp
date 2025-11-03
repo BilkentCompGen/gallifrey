@@ -122,7 +122,8 @@ static void nibble2base_neon(uint8_t *nib, char *seq, int len);
 inline void (*htslibx_nibble2base)(uint8_t *nib, char *seq, int len) = nibble2base_default;
 
 #if defined __x86_64__
-
+#include <emmintrin.h>
+#include <tmmintrin.h>
 /*
  * Convert a nibble encoded BAM sequence to a string of bases.
  *
@@ -230,6 +231,9 @@ static __attribute__((constructor)) CPUType nibble2base_resolve(void) {
     return CPUType::UNKNOWN;
 }
 
+#endif
+
+
 
 
 struct bam_nibble_data{
@@ -270,7 +274,5 @@ struct bam_nibble_data{
         buffer[ len + (skip_first ? 1: 0)] = 0;
     }
 };
-#endif
-
 #endif // BUILDING_SIMD_NIBBLE2BASE
 #endif

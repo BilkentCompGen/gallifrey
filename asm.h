@@ -1,5 +1,5 @@
 #pragma once
-#include <sys/_types/_u_int64_t.h>
+
 #ifndef _ASM_H_
 #define _ASM_H_
 #include <stdint.h>

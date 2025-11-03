@@ -221,7 +221,7 @@ struct RegisterBlockedBloomFilter
     int k;
     std::vector<uint64_t> bv;
 };
-
+#if 0
 struct SimdBloomFilter
 {
     SimdBloomFilter(int n, float eps) : n(n), epsilon(eps)
@@ -532,3 +532,5 @@ struct PatternedSimdBloomFilter
     static constexpr int mask_idx_bits = MaskTable::log_num_masks;
     static constexpr int rotate_bits = 6;
 };
+
+#endif

@@ -12,7 +12,7 @@
 
 #include "config.h"
 #include "ext/lcptools/lcptools_ho.h"
-#include "ext/btllib/nthash_kmer.hpp"
+
 #include "nibble2base.hpp"
 
 // Makes sure we have enough scratch space
@@ -325,36 +325,7 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
     return core_index;
 }
 
-inline uint64_t parse1_bam_syncmers_nthash(const uint8_t *data, int64_t len,
-                             struct lps *str, const auto &syncmer_functor) {
-    int core_index = 0;
-    btllib::NtHash nthasher((const char *) data, 1, SYNCMER_K);
 
-
-    if (str->capacity < len * CONSTANT_FACTOR) {
-        str->capacity = 1.5 * len * CONSTANT_FACTOR;
-        str->cores = (struct core *)realloc(
-            str->cores, (str->capacity) * sizeof(struct core));
-    }
-    while(nthasher.roll()){
-        auto fh = nthasher.get_forward_hash();
-        auto rh = nthasher.get_reverse_hash();
-        auto h = std::min(fh, rh);
-
-        if (syncmer_functor(h)) {
-            // if (core_index >= str->capacity){
-            //     str->cores = (struct core *)realloc(str->cores,
-            //     (str->capacity * 2 + 1) * sizeof(struct core)); str->capacity
-            //     = str->capacity * 2 + 1;
-            // }
-            init_core_kmer<uint32_t, 4>(&(str->cores[core_index]),
-                                        h, nthasher.get_pos(), nthasher.get_pos() + SYNCMER_K);
-            core_index++;
-        }
-    }
-
-    return core_index;
-}
 
 uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores);
 
