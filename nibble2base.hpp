@@ -118,7 +118,7 @@ static inline void nibble2base(uint8_t *nib, char *seq, int len) {
 
 #endif
 #ifdef BUILDING_SIMD_NIBBLE2BASE
-static void nibble2base_neon(uint8_t *nib, char *seq, int len);
+
 inline void (*htslibx_nibble2base)(uint8_t *nib, char *seq, int len) = nibble2base_default;
 
 #if defined __x86_64__

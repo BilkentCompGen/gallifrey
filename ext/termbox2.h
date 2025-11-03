@@ -27,7 +27,7 @@ SOFTWARE.
 #define TERMBOX_H_INCL
 
 #ifndef _XOPEN_SOURCE
-#define _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
 #endif
 
 #ifndef _DEFAULT_SOURCE
