@@ -67,7 +67,7 @@ struct dbg_index {
         // = v.second;}); return 0;
     }
 
-    u64 emplace(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
+    u64 emplace2(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
         auto vv = lci.try_emplace(l, idx | tid);
         if (vv.second) {  // Means new item on the table
             idx += 128;   // TODO: change this to next power of two from the
@@ -75,7 +75,7 @@ struct dbg_index {
         }
         return vv.first->second;
     }
-    u64 emplace2(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
+    u64 emplace(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
         auto new_hash = lci.hash(l);
         if (!bf.contains(new_hash)) {
             bf.insert(new_hash);
