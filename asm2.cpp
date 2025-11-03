@@ -470,8 +470,8 @@ void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
         } else {
 //            int i = onehotto2bitDNA2(s, buffer);
             s.convert_to_ascii(buffer);
-            fprintf(out, "S\tC%llu\t%s\tLN:i:%d\tRC:i:%lu\tQF:s:%s\n", lval,
-                    buffer + (buffer[0] == 'N' ? 1 : 0), s.len + (s.skip_first ? 1 : 0),
+            fprintf(out, "S\tC%llu\t%s\tLN:i:%zu\tRC:i:%lu\tQF:s:%s\n", lval,
+                    buffer + (buffer[0] == 'N' ? 1 : 0), s.len ,
                     edges.cc + edges.prev.size(), s.skip_first ? "S" : "N");
         }
 
