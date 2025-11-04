@@ -48,7 +48,7 @@ int asm_program(CLI::App &parent) {
     gcg->add_option("--max-tip-length", p->graph_cleaning.max_tip_length,
                     "Maximum tip length to cut in terms of cores")
         ->capture_default_str();
-    gcg->add_option("--max-bubble-length", p->graph_cleaning.max_bubble_length,
+    gcg->add_option("--min-bubble-length-difference", p->graph_cleaning.min_bubble_length_difference,
                     "Maximum bubble length to pop in terms of cores")
         ->capture_default_str();
     app.callback([=]() {

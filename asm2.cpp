@@ -114,7 +114,8 @@ struct dbg_index {
             }
         }
     }
-    void simplify_graph(int max_iterations = 1, size_t max_tip_length = 5, size_t bubble_diff_eps = 2) {
+    void simplify_graph(int max_iterations = 1, size_t max_tip_length = 5,
+                        size_t bubble_diff_eps = 2) {
         gtl::flat_hash_map<u64, u64> redirect_deleted;
         auto try_simplify_simple_path = [&](u64 id, auto current) -> bool {
             // Find a node we cannot simplify
@@ -281,38 +282,41 @@ struct dbg_index {
                     continue;
                 }
 
-                if(current->second.prev.size() == 2){ // Simple case with 2 should expand later to many case
+                if (current->second.prev.size() ==
+                    2) {  // Simple case with 2 should expand later to many case
                     auto p1 = dbg.find(current->second.prev[0]);
                     auto p2 = dbg.find(current->second.prev[1]);
-                    if(p1 != dbg.end() && p2 != dbg.end()){
-                        if(p1->second.prev.size() == 1 && p2->second.prev.size() == 1){
-                            if(p1->second.prev[0] == p2->second.prev[0]){
-                               //BUBBLE FOUND
-                               if(p1->second.cc - p2->second.cc > bubble_diff_eps){
-                                   // Remove p2
-                                   dbg.erase(p2);
-                                   current->second.prev.pop_back();
-                                   auto nn = dbg.find(p1->second.prev[0]);
-                                   if(nn != dbg.end()){
-                                       nn->second.fec --;
-                                   }
+                    if (p1 != dbg.end() && p2 != dbg.end()) {
+                        if (p1->second.prev.size() == 1 &&
+                            p2->second.prev.size() == 1) {
+                            if (p1->second.prev[0] == p2->second.prev[0]) {
+                                // BUBBLE FOUND
+                                if (p1->second.cc - p2->second.cc >
+                                    bubble_diff_eps) {
+                                    // Remove p2
+                                    dbg.erase(p2);
+                                    current->second.prev.pop_back();
+                                    auto nn = dbg.find(p1->second.prev[0]);
+                                    if (nn != dbg.end()) {
+                                        nn->second.fec--;
+                                    }
 
-                               }else if (- p1->second.cc + p2->second.cc < bubble_diff_eps){
-                                   // Remove p1
-                                   dbg.erase(p1);
-                                   current->second.prev[0] = current->second.prev[1];
-                                   current->second.prev.pop_back();
-                                   auto nn = dbg.find(p2->second.prev[0]);
-                                   if(nn != dbg.end()){
-                                       nn->second.fec --;
-                                   }
-                               }
+                                } else if (-p1->second.cc + p2->second.cc <
+                                           bubble_diff_eps) {
+                                    // Remove p1
+                                    dbg.erase(p1);
+                                    current->second.prev[0] =
+                                        current->second.prev[1];
+                                    current->second.prev.pop_back();
+                                    auto nn = dbg.find(p2->second.prev[0]);
+                                    if (nn != dbg.end()) {
+                                        nn->second.fec--;
+                                    }
+                                }
                             }
                         }
                     }
-
                 }
-
             }
 
             redirect_deleted.clear();
@@ -440,47 +444,6 @@ struct assembler {
 
         for (size_t i = 1; i < ll.size() - 1; ++i) {
             insert_lcmer_helper(ll, i, dbgi);
-            // if (ll[i] == 0) {
-            //     continue;
-            // }
-            // if (ll[i - 1] == 0) {
-            //     if (ll[i + 1] == 0) {
-            //         continue;
-            //     } else {
-            //         dbgi.dbg.lazy_emplace_l(
-            //             ll[i],
-            //             [&](dbg_index::dbg_map_t::value_type &val) {
-            //                 val.second.cc++;
-            //             },
-            //             [&](const dbg_index::dbg_map_t::constructor &ctr) {
-            //                 ctr(ll[i], dbg_index::bidbg_val{1, {}, {}});
-            //             });
-            //     }
-            // } else {
-            //     if (ll[i + 1] == 0) {
-            //         dbgi.dbg.lazy_emplace_l(
-            //             ll[i],
-            //             [&](dbg_index::dbg_map_t::value_type &val) {
-            //                 val.second.emplace_prev(ll[i - 1]);
-            //                 // val.second.cc++;
-            //             },
-            //             [&](const dbg_index::dbg_map_t::constructor &ctr) {
-            //                 ctr(ll[i],
-            //                     dbg_index::bidbg_val{0, {}, {ll[i - 1]}});
-            //             });
-            //     } else {
-            //         dbgi.dbg.lazy_emplace_l(
-            //             ll[i],
-            //             [&](dbg_index::dbg_map_t::value_type &val) {
-            //                 val.second.emplace_prev(ll[i - 1]);
-            //                 val.second.cc++;
-            //             },
-            //             [&](const dbg_index::dbg_map_t::constructor &ctr) {
-            //                 ctr(ll[i],
-            //                     dbg_index::bidbg_val{1, {}, {ll[i - 1]}});
-            //             });
-            //     }
-            // }
         }
     }
     static void process_cores_for_basespace(
@@ -506,32 +469,6 @@ struct assembler {
                 if (val.second.seq.size() == 0) {
                     if (to - from > 0) {
                         val.second.seq.emplace_back(lr.data, from, to);
-                        // val.second.seq.data =
-                        // (decltype(val.second.seq.data))malloc(
-                        //     ((to>>1) - (from>>1)) + 1);
-                        // memcpy(val.second.seq.data, lr.data + (from >> 1 ),
-                        // (to>>1) - (from>>1) + 1); val.second.seq.data[(to>>1)
-                        // - (from>>1)] = 0; val.second.seq.skip_first = from &
-                        // 1;
-                        // // val.second.seq =
-                        // //     (uint8_t *)((uint64_t)val.second.seq | (from &
-                        // 1));
-                        // // val.second.seq = (uint8_t
-                        // *)((uint64_t)val.second.seq |
-                        // //                              ((to & 1) << 1));
-                        // val.second.seq.len = (to - from) + 1;
-
-                        // val.second.seq = (decltype(val.second.seq))malloc(
-                        //     (_to_byte - _from_byte) + 1);
-                        // memcpy(val.second.seq, lr.data + _from_byte, _to_byte
-                        // - _from_byte+1); val.second.seq[_to_byte -
-                        // _from_byte] = 0; val.second.seq =
-                        //     (uint8_t *)((uint64_t)val.second.seq | (from &
-                        //     1));
-                        // val.second.seq = (uint8_t *)((uint64_t)val.second.seq
-                        // |
-                        //                              ((to & 1) << 1));
-                        // val.second.len = slen + 1;
                     }
                 }
             });
@@ -859,7 +796,9 @@ int run_assembly(const asm_parameters &param) {
     as.convert2basespace(dbg);
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Converting to basespace done.");
 
-    dbg.simplify_graph(1);
+    dbg.simplify_graph(param.graph_cleaning.iterations,
+                       param.graph_cleaning.max_tip_length,
+                       param.graph_cleaning.min_bubble_length_difference);
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Simplify graph done.");
     FILE *out = fopen(param.output.c_str(), "w");
     print_dbg_seqs(out, dbg);
@@ -1008,7 +947,6 @@ TEST_CASE("Graph simplification Bubble") {
         CAPTURE(dbgi.dbg.size());
         CHECK(dbgi.dbg.size() == 1);
     }
-
 
     print_dbg_dot(dbgi, 2);
 }

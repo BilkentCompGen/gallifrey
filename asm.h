@@ -24,7 +24,7 @@ struct asm_parameters {
         struct {
             int iterations = 2;
             int max_tip_length = LCMER_L * 2;
-            int max_bubble_length = LCMER_L * 2;
+            int min_bubble_length_difference = 2;
         } graph_cleaning;
 };
 
