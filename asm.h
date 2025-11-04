@@ -21,6 +21,11 @@ struct asm_parameters {
             uint64_t projected_count = 100'000'000;
             double false_positive_rate = 0.001;
         } bloom;
+        struct {
+            int iterations = 2;
+            int max_tip_length = LCMER_L * 2;
+            int max_bubble_length = LCMER_L * 2;
+        } graph_cleaning;
 };
 
 int run_assembly(const asm_parameters &param);

@@ -40,7 +40,17 @@ int asm_program(CLI::App &parent) {
     bfg->add_option("--false-positive-probability",
                     p->bloom.false_positive_rate, "False positive probability")
         ->capture_default_str();
-
+    auto gcg = app.add_option_group("graphcleaning",
+                                    "Parameters to setup graph cleaning");
+    gcg->add_option("--iterations", p->graph_cleaning.iterations,
+                    "Number of iterations")
+        ->capture_default_str();
+    gcg->add_option("--max-tip-length", p->graph_cleaning.max_tip_length,
+                    "Maximum tip length to cut in terms of cores")
+        ->capture_default_str();
+    gcg->add_option("--max-bubble-length", p->graph_cleaning.max_bubble_length,
+                    "Maximum bubble length to pop in terms of cores")
+        ->capture_default_str();
     app.callback([=]() {
         int ret = run_assembly(*p);
         delete p;
@@ -166,12 +176,12 @@ int tests(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-    if (string{argv[1]} == "tests") {
+    if (argc > 1 && string{argv[1]} == "tests") {
         return tests(argc - 1, argv + 1);
     }
     CLI::App app("lasm");
     app.require_subcommand(1);
-    app.set_help_all_flag("--help-all", "Expand all help");
+    // app.set_help_all_flag("--help-all", "Expand all help");
     asm_program(app);
     stats_program(app);
     stdin_hist_prog(app);

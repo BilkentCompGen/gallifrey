@@ -106,11 +106,15 @@ struct dbg_index {
     void count_forward_edges() {
         for (auto &node : dbg) {
             for (auto &edge : node.second.prev) {
-                dbg[edge].fec++;
+                auto it = dbg.find(edge);
+                if (it == dbg.end()) {
+                    continue;
+                }
+                it->second.fec++;
             }
         }
     }
-    void simplify_graph(int max_iterations = 1, size_t max_tip_length = 5) {
+    void simplify_graph(int max_iterations = 1, size_t max_tip_length = 5, size_t bubble_diff_eps = 2) {
         gtl::flat_hash_map<u64, u64> redirect_deleted;
         auto try_simplify_simple_path = [&](u64 id, auto current) -> bool {
             // Find a node we cannot simplify
@@ -127,7 +131,8 @@ struct dbg_index {
             while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
                    prev_it->second.fec == 1) {
                 if (prev_it != dbg.end()) {
-                    for (auto it = current->second.seq.begin(); it != current->second.seq.end(); ++it){
+                    for (auto it = current->second.seq.begin();
+                         it != current->second.seq.end(); ++it) {
                         merged.emplace_back(std::move(*it));
                     }
                     dbg.erase(current->first);
@@ -146,7 +151,7 @@ struct dbg_index {
             }
 
             current->second.fec = first_fec;
-            for(auto it = merged.rbegin(); it != merged.rend(); ++it){
+            for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
                 current->second.seq.emplace_back(std::move(*it));
             }
 
@@ -157,6 +162,9 @@ struct dbg_index {
 
             for (auto &dn : lci) {
                 auto current = dbg.find(dn.second.id);
+                if (current == dbg.end()) {
+                    continue;
+                }
                 // Simple paths
                 if ((current->second.fec != 1 &&
                      current->second.prev.size() == 1)) {
@@ -201,13 +209,16 @@ struct dbg_index {
                 // We have non-zero forward edges, and more than one prev
                 // edges
                 if (current->second.fec > 0 &&
-                    current->second.prev.size() > 1) {
+                    current->second.prev.size() > 0) {
                     // Check if one of the prev edges is not terminating
                     bool non_terminating_exists = false;
                     size_t min_edge_len = INT_MAX;
                     size_t max_edge_len = INT_MIN;
                     for (auto &prev_id : current->second.prev) {
                         auto prev_it = dbg.find(prev_id);
+                        if (prev_it == dbg.end()) {
+                            continue;
+                        }
                         if (prev_it->second.prev.size() > 0) {
                             non_terminating_exists = true;
                         }
@@ -262,6 +273,48 @@ struct dbg_index {
                     }
                 }
             }
+
+            // Buubles
+            for (auto &dn : lci) {
+                auto current = dbg.find(dn.second.id);
+                if (current == dbg.end()) {
+                    continue;
+                }
+
+                if(current->second.prev.size() == 2){ // Simple case with 2 should expand later to many case
+                    auto p1 = dbg.find(current->second.prev[0]);
+                    auto p2 = dbg.find(current->second.prev[1]);
+                    if(p1 != dbg.end() && p2 != dbg.end()){
+                        if(p1->second.prev.size() == 1 && p2->second.prev.size() == 1){
+                            if(p1->second.prev[0] == p2->second.prev[0]){
+                               //BUBBLE FOUND
+                               if(p1->second.cc - p2->second.cc > bubble_diff_eps){
+                                   // Remove p2
+                                   dbg.erase(p2);
+                                   current->second.prev.pop_back();
+                                   auto nn = dbg.find(p1->second.prev[0]);
+                                   if(nn != dbg.end()){
+                                       nn->second.fec --;
+                                   }
+
+                               }else if (- p1->second.cc + p2->second.cc < bubble_diff_eps){
+                                   // Remove p1
+                                   dbg.erase(p1);
+                                   current->second.prev[0] = current->second.prev[1];
+                                   current->second.prev.pop_back();
+                                   auto nn = dbg.find(p2->second.prev[0]);
+                                   if(nn != dbg.end()){
+                                       nn->second.fec --;
+                                   }
+                               }
+                            }
+                        }
+                    }
+
+                }
+
+            }
+
             redirect_deleted.clear();
         }
 
@@ -736,9 +789,9 @@ void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
             //            int i = onehotto2bitDNA2(s, buffer);
             fprintf(out, "S\tC%llu\t", lval);
             size_t sofar = 0;
-//            for (const bam_nibble_data &s : edges.seq) {
-            //reversed
-            for(auto it = edges.seq.begin(); it != edges.seq.end(); ++it) {
+            //            for (const bam_nibble_data &s : edges.seq) {
+            // reversed
+            for (auto it = edges.seq.begin(); it != edges.seq.end(); ++it) {
                 const bam_nibble_data &s = *it;
                 buf.require(s.len + 1);
                 s.convert_to_ascii((char *)buf.data);
@@ -817,8 +870,8 @@ int run_assembly(const asm_parameters &param) {
     return 0;
 }
 
-void tests_mock_fill_seq(dbg_index &dbgi){
-    for(auto &node : dbgi.dbg){
+void tests_mock_fill_seq(dbg_index &dbgi) {
+    for (auto &node : dbgi.dbg) {
         node.second.seq.emplace_back();
     }
 }
@@ -906,7 +959,7 @@ TEST_CASE("Graph simplification Bubble") {
     gtl::vector<u64> ll(1, 0);
     ll.reserve(MOCK_CORE_COUNT - LCMER_L + 3);
     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-    for (int i = LCMER_L + 1; i < MOCK_CORE_COUNT - 1; ++i) {
+    for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
         uint32_t in_core = mock_cores[i];
         l.update_lcmer(in_core);
         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
@@ -921,7 +974,7 @@ TEST_CASE("Graph simplification Bubble") {
     l = lcmer<LCMER_L>(mock_cores.begin());
 
     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-    for (int i = LCMER_L + 1; i < MOCK_CORE_COUNT - 1; ++i) {
+    for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
         uint32_t in_core = mock_cores[i];
         l.update_lcmer(in_core);
         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
@@ -934,22 +987,33 @@ TEST_CASE("Graph simplification Bubble") {
     dbgi.count_forward_edges();
 
     tests_mock_fill_seq(dbgi);
-    print_dbg_dot(dbgi, 1);
+    print_dbg_dot(dbgi, 0);
 
     dbgi.simplify_graph(1);
+    print_dbg_dot(dbgi, 1);
 
     SUBCASE("Post simplify dbg") {
         for (auto &node : dbgi.dbg) {
             INFO(node.first, "\t.\t.\t", node.second.seq.size());
         }
         CAPTURE(dbgi.dbg.size());
-        CHECK(dbgi.dbg.size() == 4);
+        CHECK(dbgi.dbg.size() == 3);
     }
+    dbgi.simplify_graph(1);
+
+    SUBCASE("Post simplify dbg iter 2") {
+        for (auto &node : dbgi.dbg) {
+            INFO(node.first, "\t.\t.\t", node.second.seq.size());
+        }
+        CAPTURE(dbgi.dbg.size());
+        CHECK(dbgi.dbg.size() == 1);
+    }
+
 
     print_dbg_dot(dbgi, 2);
 }
 
-TEST_CASE("Graph simplification Tips") {
+TEST_CASE("Graph simplification Tips (Outgoing)") {
     dbg_index dbgi{0.95, 10, 0};
     gtl::vector<u32> mock_cores;
     int MOCK_CORE_COUNT = 30;
@@ -962,7 +1026,7 @@ TEST_CASE("Graph simplification Tips") {
     gtl::vector<u64> ll(1, 0);
     ll.reserve(MOCK_CORE_COUNT - LCMER_L + 3);
     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-    for (int i = LCMER_L + 1; i < MOCK_CORE_COUNT - 1; ++i) {
+    for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
         uint32_t in_core = mock_cores[i];
         l.update_lcmer(in_core);
         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
@@ -973,11 +1037,11 @@ TEST_CASE("Graph simplification Tips") {
     }
 
     ll.clear();
-    mock_cores[MOCK_CORE_COUNT / 2] = 123123123;
+    mock_cores[12] = 123123123;
     l = lcmer<LCMER_L>(mock_cores.begin());
 
     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-    for (int i = LCMER_L + 1; i < MOCK_CORE_COUNT - 1; ++i) {
+    for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
         uint32_t in_core = mock_cores[i];
         l.update_lcmer(in_core);
         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
@@ -998,8 +1062,63 @@ TEST_CASE("Graph simplification Tips") {
             INFO(node.first, "\t.\t.\t", node.second.seq.size());
         }
         CAPTURE(dbgi.dbg.size());
-        CHECK(dbgi.dbg.size() == 3);
+        CHECK(dbgi.dbg.size() == 2);
     }
 
     print_dbg_dot(dbgi, 4);
+}
+TEST_CASE("Graph simplification Tips (Incoming)") {
+    dbg_index dbgi{0.95, 10, 0};
+    gtl::vector<u32> mock_cores;
+    int MOCK_CORE_COUNT = 30;
+    for (int i = 0; i < MOCK_CORE_COUNT; i++) {
+        mock_cores.push_back(MurmurHash3_32(&i, sizeof(int), 156));
+    }
+    lcmer<LCMER_L> l(mock_cores.begin());
+    u64 idx = 0;
+
+    gtl::vector<u64> ll(1, 0);
+    ll.reserve(MOCK_CORE_COUNT - LCMER_L + 3);
+    ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
+        uint32_t in_core = mock_cores[i];
+        l.update_lcmer(in_core);
+        ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    }
+    ll.push_back(0);
+    for (size_t i = 1; i <= ll.size() - 1; i++) {
+        assembler::insert_lcmer_helper(ll, i, dbgi);
+    }
+
+    ll.clear();
+
+    mock_cores[8] = 123123123;
+    l = lcmer<LCMER_L>(mock_cores.begin() + 7);
+
+    ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    for (int i = LCMER_L + 7; i < MOCK_CORE_COUNT - 1; ++i) {
+        uint32_t in_core = mock_cores[i];
+        l.update_lcmer(in_core);
+        ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    }
+    ll.push_back(0);
+    for (size_t i = 1; i <= ll.size() / 2 - 1; i++) {
+        assembler::insert_lcmer_helper(ll, i, dbgi);
+    }
+
+    dbgi.count_forward_edges();
+
+    tests_mock_fill_seq(dbgi);
+    print_dbg_dot(dbgi, 5);
+
+    SUBCASE("Post simplify dbg") {
+        dbgi.simplify_graph(2);
+        for (auto &node : dbgi.dbg) {
+            INFO(node.first, "\t.\t.\t", node.second.seq.size());
+        }
+        CAPTURE(dbgi.dbg.size());
+        CHECK(dbgi.dbg.size() == 2);
+    }
+
+    print_dbg_dot(dbgi, 6);
 }
