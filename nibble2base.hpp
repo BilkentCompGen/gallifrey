@@ -266,12 +266,13 @@ struct bam_nibble_data{
         }
         return *this;
     }
-    void convert_to_ascii(char *buffer)const {
+    char *convert_to_ascii(char *buffer)const {
         nibble2base(data, buffer, len + (skip_first ? 1 : 0));
         if(skip_first){
             buffer[0] = 'N';
         }
         buffer[ len + (skip_first ? 1: 0)] = 0;
+        return buffer + len + (skip_first ? 1 : 0);
     }
 };
 #endif // BUILDING_SIMD_NIBBLE2BASE

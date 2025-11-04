@@ -22,36 +22,73 @@
 #include "bgzf.h"
 #include "bloomfilter.h"
 #include "config.h"
+#include "ext/doctest.h"
 #include "lcmer.h"
+#include "lcptools/lcptools_ho.h"
 #include "nibble2base.hpp"
 #include "syncmer.h"
 
 using u64 = uint64_t;
+using u32 = uint32_t;
 
 using std::string;
 enum class input_type { BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 
+#define PREV_WITH_VEC
 #define HT_SHARD_BC 8
 struct dbg_index {
     using mutex_type = std::mutex;
     struct bidbg_val {
-        gtl::flat_hash_set<u64> prev;
         unsigned cc;
-        bam_nibble_data seq;
+        unsigned fec;
+        gtl::vector<bam_nibble_data> seq;
+#ifdef PREV_WITH_SET
+        gtl::flat_hash_set<u64> prev;
+        void emplace_prev(u64 val) { prev.emplace(val); }
+#else
+#ifdef PREV_WITH_VEC
+        gtl::vector<u64> prev;
+
+        void emplace_prev(u64 val) {
+            auto it = std::find(prev.begin(), prev.end(), val);
+            if (it == prev.end()) {
+                prev.push_back(val);
+            }
+        }
+#endif
+#endif
     };
     using dbg_map_t = gtl::parallel_flat_hash_map<
         u64, bidbg_val, std::hash<u64>, gtl::priv::hash_default_eq<u64>,
         std::allocator<std::pair<const u64, bidbg_val>>, HT_SHARD_BC,
         mutex_type>;
+
+    struct lci_type {
+        u64 id;
+        u64 pos;
+        lci_type() : id(0), pos(-1) {}
+        lci_type(u64 _id, u64 _pos) : id(_id), pos(_pos) {}
+        lci_type(u64 _id) : id(_id), pos(-1) {}
+    };
     using lcmer_index_t = gtl::parallel_flat_hash_map<
-        lcmer<LCMER_L>, u64, std::hash<lcmer<LCMER_L>>,
+        lcmer<LCMER_L>, lci_type, std::hash<lcmer<LCMER_L>>,
         gtl::priv::hash_default_eq<lcmer<LCMER_L>>,
-        std::allocator<std::pair<const lcmer<LCMER_L>, u64>>, HT_SHARD_BC,
+        std::allocator<std::pair<const lcmer<LCMER_L>, lci_type>>, HT_SHARD_BC,
+        mutex_type>;
+
+    struct merge_info_t {
+        u64 id;
+        u64 pos;
+    };
+    using merge_info_map_t = gtl::parallel_flat_hash_map<
+        u64, merge_info_t, std::hash<u64>, gtl::priv::hash_default_eq<u64>,
+        std::allocator<std::pair<const u64, merge_info_t>>, HT_SHARD_BC,
         mutex_type>;
 
     dbg_map_t dbg;
     lcmer_index_t lci;
-    bloom_interface<bloom_ext::RegisterBlockedBloomFilter<1>, std::mutex> bf;
+    // merge_info_map_t merge_map;
+    bloom_interface<bloom_ext::RegisterBlockedBloomFilter<1>, null_mutex> bf;
 
     dbg_index(double false_positive_rate, uint64_t projected_count,
               uint64_t seed)
@@ -59,21 +96,202 @@ struct dbg_index {
     // dbg_index(const dbg_index &other)
     u64 get(const lcmer<LCMER_L> &l) const {
         auto it = lci.find(l);
-        return it == lci.end() ? 0 : it->second;
+        return it == lci.end() ? 0 : it->second.id;
         // if (lci.contains(l)) {
         //     return lci.at(l);
         // }
         // // lci.if_contains(l,[&ret](const lcmer_index_t::value_type &v){ ret
         // = v.second;}); return 0;
     }
+    void count_forward_edges() {
+        for (auto &node : dbg) {
+            for (auto &edge : node.second.prev) {
+                dbg[edge].fec++;
+            }
+        }
+    }
+    void simplify_graph(int max_iterations = 1, size_t max_tip_length = 5) {
+        gtl::flat_hash_map<u64, u64> redirect_deleted;
+        auto try_simplify_simple_path = [&](u64 id, auto current) -> bool {
+            // Find a node we cannot simplify
+            // Iterate backwards and merge until we cannot simplify
+            // o->o->o->o->o->o -> o->o
 
-    u64 emplace2(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
+            if (current == dbg.end()) {
+                return false;
+            }
+            unsigned first_fec = current->second.fec;
+            bool simplified = false;
+            auto prev_it = dbg.find(current->second.prev[0]);
+            gtl::vector<bam_nibble_data> merged;
+            while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
+                   prev_it->second.fec == 1) {
+                if (prev_it != dbg.end()) {
+                    for (auto it = current->second.seq.begin(); it != current->second.seq.end(); ++it){
+                        merged.emplace_back(std::move(*it));
+                    }
+                    dbg.erase(current->first);
+                    simplified = true;
+                } else {  // Prev is erased
+                }
+                current = prev_it;
+                if (prev_it->second.prev.size() > 0) {
+                    prev_it = dbg.find(current->second.prev[0]);
+                } else {
+                    break;
+                }
+            }
+            if (current->first != id) {
+                redirect_deleted[id] = current->first;
+            }
+
+            current->second.fec = first_fec;
+            for(auto it = merged.rbegin(); it != merged.rend(); ++it){
+                current->second.seq.emplace_back(std::move(*it));
+            }
+
+            return simplified;
+        };
+        for (int iter = 0; iter < max_iterations; ++iter) {
+            // Remove simple paths
+
+            for (auto &dn : lci) {
+                auto current = dbg.find(dn.second.id);
+                // Simple paths
+                if ((current->second.fec != 1 &&
+                     current->second.prev.size() == 1)) {
+                    try_simplify_simple_path(dn.second.id, current);
+                } else if (current->second.prev.size() > 1) {
+                    for (auto &prev_id : current->second.prev) {
+                        auto prev_it = dbg.find(prev_id);
+                        if (prev_it != dbg.end() &&
+                            prev_it->second.prev.size() == 1) {
+                            try_simplify_simple_path(prev_id, prev_it);
+                        }
+                    }
+                }
+
+                // auto prev_it = dbg.find(node.prev[0]);
+                // if (prev_it != dbg.end()) {
+                //     auto &prev_node = prev_it->second;
+                //     dn.second.pos = prev_node.merged.size();
+                //     prev_node.merged.push_back(dn.second.id);
+                //     prev_node.cc = node.cc;
+                //     dbg.erase(dn.second.id);
+                // } else {  // Prev is erased
+                // }
+                // merge_map.emplace(dn.second, node.prev[0], prev_node)
+            }
+            for (auto &node : dbg) {
+                for (auto &p : node.second.prev) {
+                    auto it = redirect_deleted.find(p);
+                    if (it != redirect_deleted.end()) {
+                        p = it->second;
+                    }
+                }
+            }
+
+            // Tips
+
+            for (auto &dn : lci) {
+                auto current = dbg.find(dn.second.id);
+                if (current == dbg.end()) {
+                    continue;
+                }
+                // We have non-zero forward edges, and more than one prev
+                // edges
+                if (current->second.fec > 0 &&
+                    current->second.prev.size() > 1) {
+                    // Check if one of the prev edges is not terminating
+                    bool non_terminating_exists = false;
+                    size_t min_edge_len = INT_MAX;
+                    size_t max_edge_len = INT_MIN;
+                    for (auto &prev_id : current->second.prev) {
+                        auto prev_it = dbg.find(prev_id);
+                        if (prev_it->second.prev.size() > 0) {
+                            non_terminating_exists = true;
+                        }
+                        min_edge_len =
+                            std::min(min_edge_len, prev_it->second.seq.size());
+                        max_edge_len =
+                            std::max(max_edge_len, prev_it->second.seq.size());
+                    }
+                    // Remove every tipe if non_terminating_exists
+
+                    if (non_terminating_exists) {
+                        for (auto &prev_id : current->second.prev) {
+                            auto prev_it = dbg.find(prev_id);
+                            if (prev_it == dbg.end()) {
+                                // delete from prev
+                                current->second.prev.erase(
+                                    std::remove(current->second.prev.begin(),
+                                                current->second.prev.end(),
+                                                prev_id),
+                                    current->second.prev.end());
+                                continue;
+                            }
+                            if (prev_it->second.prev.size() == 0 &&
+                                prev_it->second.fec == 1 &&
+                                prev_it->second.seq.size() < max_tip_length) {
+                                // Erase the node from the current->second.prev
+                                current->second.prev.erase(
+                                    std::remove(current->second.prev.begin(),
+                                                current->second.prev.end(),
+                                                prev_id),
+                                    current->second.prev.end());
+                                dbg.erase(prev_it);
+                            }
+                        }
+                    } else if (max_edge_len - min_edge_len > max_tip_length) {
+                        for (auto &prev_id : current->second.prev) {
+                            auto prev_it = dbg.find(prev_id);
+                            if (prev_it->second.prev.size() == 0 &&
+                                prev_it->second.fec == 1 &&
+                                prev_it->second.seq.size() <
+                                    max_tip_length - max_tip_length) {
+                                // Erase the node from the current->second.prev
+
+                                current->second.prev.erase(
+                                    std::remove(current->second.prev.begin(),
+                                                current->second.prev.end(),
+                                                prev_id),
+                                    current->second.prev.end());
+                                dbg.erase(prev_it);
+                            }
+                        }
+                    }
+                }
+            }
+            redirect_deleted.clear();
+        }
+
+        // // Remove bubbles and tips
+        // for (auto &node : dbg) {
+        //     if (node.second.prev.size() == 2) {  // can be simplified.
+        //         u64 p1 = node.second.prev[0];
+        //         u64 p2 = node.second.prev[1];
+        //         if (dbg[p1].cc == 1 && dbg[p2].cc == 1 &&
+        //             dbg[p1].prev.size() == 1 && dbg[p2].prev.size() == 1 &&
+        //             dbg[p1].prev[0] == dbg[p2].prev[0]) {
+        //             ///     o
+        //             ///   o< >o -> o->o->o
+        //             ///     o
+        //         } else if (node.second.prev.size() == 0) {
+        //             // Remove tips
+        //             /// ..o->o->o..       o->o->o
+        //             ///       \     ->
+        //             ///        o
+        //         }
+        //     }
+        // }
+    }
+    u64 emplace_nobloomfilter(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
         auto vv = lci.try_emplace(l, idx | tid);
         if (vv.second) {  // Means new item on the table
             idx += 128;   // TODO: change this to next power of two from the
                           // threadcount.
         }
-        return vv.first->second;
+        return vv.first->second.id;
     }
     u64 emplace(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
         auto new_hash = lci.hash(l);
@@ -86,7 +304,7 @@ struct dbg_index {
             idx += 128;   // TODO: change this to next power of two from the
                           // threadcount.
         }
-        return vv.first->second;
+        return vv.first->second.id;
     }
 };
 
@@ -111,6 +329,48 @@ struct assembler {
           false_positive_rate{param.bloom.false_positive_rate},
           random_seed{param.random_seed},
           syncmer_functor{density, static_cast<unsigned int>(random_seed)} {}
+    static inline void insert_lcmer_helper(const gtl::vector<uint64_t> &ll,
+                                           const uint32_t &i, dbg_index &dbgi) {
+        if (ll[i] == 0) {
+            return;
+        }
+        if (ll[i - 1] == 0) {
+            if (ll[i + 1] == 0) {
+                return;
+            } else {
+                dbgi.dbg.lazy_emplace_l(
+                    ll[i],
+                    [&](dbg_index::dbg_map_t::value_type &val) {
+                        val.second.cc++;
+                    },
+                    [&](const dbg_index::dbg_map_t::constructor &ctr) {
+                        ctr(ll[i], dbg_index::bidbg_val{1, 0, {}, {}});
+                    });
+            }
+        } else {
+            if (ll[i + 1] == 0) {
+                dbgi.dbg.lazy_emplace_l(
+                    ll[i],
+                    [&](dbg_index::dbg_map_t::value_type &val) {
+                        val.second.emplace_prev(ll[i - 1]);
+                        // val.second.cc++;
+                    },
+                    [&](const dbg_index::dbg_map_t::constructor &ctr) {
+                        ctr(ll[i], dbg_index::bidbg_val{0, 0, {}, {ll[i - 1]}});
+                    });
+            } else {
+                dbgi.dbg.lazy_emplace_l(
+                    ll[i],
+                    [&](dbg_index::dbg_map_t::value_type &val) {
+                        val.second.emplace_prev(ll[i - 1]);
+                        val.second.cc++;
+                    },
+                    [&](const dbg_index::dbg_map_t::constructor &ctr) {
+                        ctr(ll[i], dbg_index::bidbg_val{1, 0, {}, {ll[i - 1]}});
+                    });
+            }
+        }
+    }
     static void process_cores(const lcp_read &lr, dbg_index &dbgi,
                               int thread_id, uint64_t &lcmer_index) {
         lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
@@ -126,58 +386,58 @@ struct assembler {
         ll.push_back(0);
 
         for (size_t i = 1; i < ll.size() - 1; ++i) {
-            if (ll[i] == 0) {
-                continue;
-            }
-            if (ll[i - 1] == 0) {
-                if (ll[i + 1] == 0) {
-                    continue;
-                } else {
-                    dbgi.dbg.lazy_emplace_l(
-                        ll[i],
-                        [&](dbg_index::dbg_map_t::value_type &val) {
-                            val.second.cc++;
-                        },
-                        [&](const dbg_index::dbg_map_t::constructor &ctr) {
-                            ctr(ll[i], dbg_index::bidbg_val{{}, 1, {}});
-                        });
-                }
-            } else {
-                if (ll[i + 1] == 0) {
-                    dbgi.dbg.lazy_emplace_l(
-                        ll[i],
-                        [&](dbg_index::dbg_map_t::value_type &val) {
-                            val.second.prev.emplace(ll[i - 1]);
-                            // val.second.cc++;
-                        },
-                        [&](const dbg_index::dbg_map_t::constructor &ctr) {
-                            ctr(ll[i],
-                                dbg_index::bidbg_val{{ll[i - 1]}, 0, {}});
-                        });
-                } else {
-                    dbgi.dbg.lazy_emplace_l(
-                        ll[i],
-                        [&](dbg_index::dbg_map_t::value_type &val) {
-                            val.second.prev.emplace(ll[i - 1]);
-                            val.second.cc++;
-                        },
-                        [&](const dbg_index::dbg_map_t::constructor &ctr) {
-                            ctr(ll[i],
-                                dbg_index::bidbg_val{{ll[i - 1]}, 1, {}});
-                        });
-                }
-            }
+            insert_lcmer_helper(ll, i, dbgi);
+            // if (ll[i] == 0) {
+            //     continue;
+            // }
+            // if (ll[i - 1] == 0) {
+            //     if (ll[i + 1] == 0) {
+            //         continue;
+            //     } else {
+            //         dbgi.dbg.lazy_emplace_l(
+            //             ll[i],
+            //             [&](dbg_index::dbg_map_t::value_type &val) {
+            //                 val.second.cc++;
+            //             },
+            //             [&](const dbg_index::dbg_map_t::constructor &ctr) {
+            //                 ctr(ll[i], dbg_index::bidbg_val{1, {}, {}});
+            //             });
+            //     }
+            // } else {
+            //     if (ll[i + 1] == 0) {
+            //         dbgi.dbg.lazy_emplace_l(
+            //             ll[i],
+            //             [&](dbg_index::dbg_map_t::value_type &val) {
+            //                 val.second.emplace_prev(ll[i - 1]);
+            //                 // val.second.cc++;
+            //             },
+            //             [&](const dbg_index::dbg_map_t::constructor &ctr) {
+            //                 ctr(ll[i],
+            //                     dbg_index::bidbg_val{0, {}, {ll[i - 1]}});
+            //             });
+            //     } else {
+            //         dbgi.dbg.lazy_emplace_l(
+            //             ll[i],
+            //             [&](dbg_index::dbg_map_t::value_type &val) {
+            //                 val.second.emplace_prev(ll[i - 1]);
+            //                 val.second.cc++;
+            //             },
+            //             [&](const dbg_index::dbg_map_t::constructor &ctr) {
+            //                 ctr(ll[i],
+            //                     dbg_index::bidbg_val{1, {}, {ll[i - 1]}});
+            //             });
+            //     }
+            // }
         }
     }
-    static void process_cores_for_basespace(const lcp_read &lr, dbg_index &dbgi,
-                                            int thread_id,
-                                            uint64_t &lcmer_index) {
+    static void process_cores_for_basespace(
+        const lcp_read &lr, dbg_index &dbgi, [[maybe_unused]] int thread_id,
+        [[maybe_unused]] uint64_t &lcmer_index) {
         lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
 
         uint64_t val = dbgi.get(l);
 
         for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
-
             uint64_t from = lr.pos[i - 1].second;
             uint64_t to = lr.pos[i].second;
 
@@ -190,27 +450,33 @@ struct assembler {
                 //   to downstream
                 //  )
 
-                if (val.second.seq.len == 0) {
+                if (val.second.seq.size() == 0) {
                     if (to - from > 0) {
-                       val.second.seq = bam_nibble_data{lr.data, from, to};
-                        // val.second.seq.data = (decltype(val.second.seq.data))malloc(
+                        val.second.seq.emplace_back(lr.data, from, to);
+                        // val.second.seq.data =
+                        // (decltype(val.second.seq.data))malloc(
                         //     ((to>>1) - (from>>1)) + 1);
-                        // memcpy(val.second.seq.data, lr.data + (from >> 1 ), (to>>1) - (from>>1) + 1);
-                        // val.second.seq.data[(to>>1) - (from>>1)] = 0;
-                        // val.second.seq.skip_first = from & 1;
+                        // memcpy(val.second.seq.data, lr.data + (from >> 1 ),
+                        // (to>>1) - (from>>1) + 1); val.second.seq.data[(to>>1)
+                        // - (from>>1)] = 0; val.second.seq.skip_first = from &
+                        // 1;
                         // // val.second.seq =
-                        // //     (uint8_t *)((uint64_t)val.second.seq | (from & 1));
-                        // // val.second.seq = (uint8_t *)((uint64_t)val.second.seq |
+                        // //     (uint8_t *)((uint64_t)val.second.seq | (from &
+                        // 1));
+                        // // val.second.seq = (uint8_t
+                        // *)((uint64_t)val.second.seq |
                         // //                              ((to & 1) << 1));
                         // val.second.seq.len = (to - from) + 1;
 
                         // val.second.seq = (decltype(val.second.seq))malloc(
                         //     (_to_byte - _from_byte) + 1);
-                        // memcpy(val.second.seq, lr.data + _from_byte, _to_byte - _from_byte+1);
-                        // val.second.seq[_to_byte - _from_byte] = 0;
-                        // val.second.seq =
-                        //     (uint8_t *)((uint64_t)val.second.seq | (from & 1));
-                        // val.second.seq = (uint8_t *)((uint64_t)val.second.seq |
+                        // memcpy(val.second.seq, lr.data + _from_byte, _to_byte
+                        // - _from_byte+1); val.second.seq[_to_byte -
+                        // _from_byte] = 0; val.second.seq =
+                        //     (uint8_t *)((uint64_t)val.second.seq | (from &
+                        //     1));
+                        // val.second.seq = (uint8_t *)((uint64_t)val.second.seq
+                        // |
                         //                              ((to & 1) << 1));
                         // val.second.len = slen + 1;
                     }
@@ -235,14 +501,14 @@ struct assembler {
     using cqt = moodycamel::ConcurrentQueue<Chunk>;
     using dqt = moodycamel::ConcurrentQueue<bam1_t *>;
 
-    static auto process_data_from_chunks(int thread_id, int lcp_level,
-                                         string filename, cqt &chunk_queue,
-                                         dbg_index &dbgi,
-                                         std::atomic<bool> &done,
-                                         int &processed_read_count,
-                                         int &all_reads) {
-        uint64_t lcmer_index = 0;
-    }
+    // static auto process_data_from_chunks(int thread_id, int lcp_level,
+    //                                      string filename, cqt &chunk_queue,
+    //                                      dbg_index &dbgi,
+    //                                      std::atomic<bool> &done,
+    //                                      int &processed_read_count,
+    //                                      int &all_reads) {
+    //     uint64_t lcmer_index = 0;
+    // }
     static auto process_data(
         int thread_id, int lcp_level, dqt &data_queue, dqt &recycle_queue,
         dbg_index &dbgi, std::atomic<bool> &done, int &processed_read_count,
@@ -456,23 +722,31 @@ void print_raw_dbg(FILE *out, const dbg_index &dbgi) {
 }
 
 void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
-    char buffer[1024 * 8];
+    charsi buf;
     for (const auto &[lval, edges] : dbgi.dbg) {
         if (edges.cc == 0 && edges.prev.size() == 0) {
             continue;
         }
-        const bam_nibble_data &s = edges.seq;
 
-//        __builtin_debugtrap();
-        if (s.len == 0) {
+        //        __builtin_debugtrap();
+        if (edges.seq.size() == 0) {
             fprintf(out, "S\tC%llu\t%s\tLN:i:%d\tRC:i:%lu\n", lval, "", 0,
                     edges.cc + edges.prev.size());
         } else {
-//            int i = onehotto2bitDNA2(s, buffer);
-            s.convert_to_ascii(buffer);
-            fprintf(out, "S\tC%llu\t%s\tLN:i:%zu\tRC:i:%lu\tQF:s:%s\n", lval,
-                    buffer + (buffer[0] == 'N' ? 1 : 0), s.len ,
-                    edges.cc + edges.prev.size(), s.skip_first ? "S" : "N");
+            //            int i = onehotto2bitDNA2(s, buffer);
+            fprintf(out, "S\tC%llu\t", lval);
+            size_t sofar = 0;
+//            for (const bam_nibble_data &s : edges.seq) {
+            //reversed
+            for(auto it = edges.seq.begin(); it != edges.seq.end(); ++it) {
+                const bam_nibble_data &s = *it;
+                buf.require(s.len + 1);
+                s.convert_to_ascii((char *)buf.data);
+                fprintf(out, "%s", buf.data + (buf.data[0] == 'N' ? 1 : 0));
+                sofar += s.len;
+            }
+            fprintf(out, "\tLN:i:%zu\tRC:i:%lu\n", sofar,
+                    edges.cc + edges.prev.size());
         }
 
         for (uint64_t nl : edges.prev) {
@@ -481,6 +755,38 @@ void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
         }
     }
 }
+
+void print_dbg_dot(const dbg_index &dbgi, int i) {
+    string filename = string{"graph"} + std::to_string(i) + ".dot";
+    FILE *dot_file = fopen(filename.c_str(), "w");
+    if (dot_file) {
+        // print_raw_dbg(dot_file, dbgi);
+        fprintf(dot_file, "digraph G {\n");
+        // Legend
+        fprintf(dot_file, "\tlegend [shape=none, label=<\n");
+        fprintf(
+            dot_file,
+            "\t\t<table border=\"0\" cellborder=\"1\" cellspacing=\"0\">\n");
+        fprintf(dot_file,
+                "\t\t\t<tr><td bgcolor=\"lightgrey\">Node ID</td><td "
+                "bgcolor=\"lightgrey\">Forward</td><td "
+                "bgcolor=\"lightgrey\">Prev</td><td "
+                "bgcolor=\"lightgrey\">Merged count</td></tr>\n");
+        fprintf(dot_file, "\t\t</table>\n");
+        fprintf(dot_file, "\t>];\n");
+        for (auto &node : dbgi.dbg) {
+            fprintf(dot_file, "\t%llu [label=\"%llu->%u,%zu,%zu\"];\n",
+                    node.first, node.first, node.second.fec,
+                    node.second.prev.size(), node.second.seq.size());
+            for (auto &prev : node.second.prev) {
+                fprintf(dot_file, "\t%llu -> %llu;\n", prev, node.first);
+            }
+        }
+        fprintf(dot_file, "}\n");
+        fclose(dot_file);
+    }
+}
+
 int run_assembly(const asm_parameters &param) {
     INIT_TIMERS(HIFI_ASSEMBLY);
 
@@ -494,15 +800,206 @@ int run_assembly(const asm_parameters &param) {
     auto dbg = as.construct_dbg();
 
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG construction done.");
+    dbg.count_forward_edges();
 
+    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Count forward edges done.");
     as.convert2basespace(dbg);
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Converting to basespace done.");
 
+    dbg.simplify_graph(1);
+    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Simplify graph done.");
     FILE *out = fopen(param.output.c_str(), "w");
     print_dbg_seqs(out, dbg);
-
+    // print_raw_dbg(out, dbg);
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG printing done.");
     fclose(out);
 
     return 0;
+}
+
+void tests_mock_fill_seq(dbg_index &dbgi){
+    for(auto &node : dbgi.dbg){
+        node.second.seq.emplace_back();
+    }
+}
+
+TEST_CASE("Graph simplification simple") {
+    dbg_index dbgi{0.95, 10, 0};
+    gtl::vector<u32> mock_cores;
+    int MOCK_CORE_COUNT = 40;
+    for (int i = 0; i < MOCK_CORE_COUNT; i++) {
+        mock_cores.push_back(MurmurHash3_32(&i, sizeof(int), 156));
+    }
+    lcmer<LCMER_L> l(mock_cores.begin());
+    u64 idx = 0;
+
+    gtl::vector<u64> ll(1, 0);
+    ll.reserve(MOCK_CORE_COUNT - LCMER_L + 3);
+    ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    for (int i = LCMER_L + 1; i < MOCK_CORE_COUNT - 1; ++i) {
+        uint32_t in_core = mock_cores[i];
+        l.update_lcmer(in_core);
+        ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    }
+    ll.push_back(0);
+
+    for (size_t i = 1; i <= ll.size() - 1; i++) {
+        assembler::insert_lcmer_helper(ll, i, dbgi);
+    }
+
+    SUBCASE("Check ll vec") {
+        for (size_t i = 1; i < ll.size() - 1; ++i) {
+            CHECK(ll[i] == (i - 1) * 128);
+        }
+    }
+    SUBCASE("Pre simplify dbg") {
+        for (auto &node : dbgi.dbg) {
+            INFO(node.first, "\t.\t.\t", node.second.seq.size());
+            CHECK(node.second.cc < 2);
+            CHECK(node.second.prev.size() < 2);
+        }
+        CAPTURE(dbgi.dbg.size());
+        CHECK(dbgi.lci.size() == MOCK_CORE_COUNT - 2 - LCMER_L + 1);
+    }
+
+    tests_mock_fill_seq(dbgi);
+
+    dbgi.count_forward_edges();
+    dbgi.simplify_graph(1);
+    SUBCASE("Post simplify dbg") {
+        for (auto &node : dbgi.dbg) {
+            INFO(node.first, "\t.\t.\t", node.second.seq.size());
+        }
+        CAPTURE(dbgi.dbg.size());
+        CHECK(dbgi.dbg.size() == 1);
+        CHECK(dbgi.dbg.begin()->second.seq.size() == 30);
+    }
+
+    // // Write Dot file
+    // FILE *dot_file = fopen("graph.dot", "w");
+
+    // if (dot_file) {
+    //     // print_raw_dbg(dot_file, dbgi);
+    //     fprintf(dot_file, "digraph G {\n");
+    //     for (auto &node : dbgi.dbg) {
+    //         fprintf(dot_file, "\t%llu [label=\"%llu\"];\n", node.first,
+    //                 node.first);
+    //         for (auto &prev : node.second.prev) {
+    //             fprintf(dot_file, "\t%llu -> %llu;\n", prev, node.first);
+    //         }
+    //     }
+    //     fprintf(dot_file, "}\n");
+    //     fclose(dot_file);
+    // }
+}
+
+TEST_CASE("Graph simplification Bubble") {
+    dbg_index dbgi{0.95, 10, 0};
+    gtl::vector<u32> mock_cores;
+    int MOCK_CORE_COUNT = 40;
+    for (int i = 0; i < MOCK_CORE_COUNT; i++) {
+        mock_cores.push_back(MurmurHash3_32(&i, sizeof(int), 156));
+    }
+    lcmer<LCMER_L> l(mock_cores.begin());
+    u64 idx = 0;
+
+    gtl::vector<u64> ll(1, 0);
+    ll.reserve(MOCK_CORE_COUNT - LCMER_L + 3);
+    ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    for (int i = LCMER_L + 1; i < MOCK_CORE_COUNT - 1; ++i) {
+        uint32_t in_core = mock_cores[i];
+        l.update_lcmer(in_core);
+        ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    }
+    ll.push_back(0);
+    for (size_t i = 1; i <= ll.size() - 1; i++) {
+        assembler::insert_lcmer_helper(ll, i, dbgi);
+    }
+
+    ll.clear();
+    mock_cores[MOCK_CORE_COUNT / 2] = 123123123;
+    l = lcmer<LCMER_L>(mock_cores.begin());
+
+    ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    for (int i = LCMER_L + 1; i < MOCK_CORE_COUNT - 1; ++i) {
+        uint32_t in_core = mock_cores[i];
+        l.update_lcmer(in_core);
+        ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    }
+    ll.push_back(0);
+    for (size_t i = 1; i <= ll.size() - 1; i++) {
+        assembler::insert_lcmer_helper(ll, i, dbgi);
+    }
+
+    dbgi.count_forward_edges();
+
+    tests_mock_fill_seq(dbgi);
+    print_dbg_dot(dbgi, 1);
+
+    dbgi.simplify_graph(1);
+
+    SUBCASE("Post simplify dbg") {
+        for (auto &node : dbgi.dbg) {
+            INFO(node.first, "\t.\t.\t", node.second.seq.size());
+        }
+        CAPTURE(dbgi.dbg.size());
+        CHECK(dbgi.dbg.size() == 4);
+    }
+
+    print_dbg_dot(dbgi, 2);
+}
+
+TEST_CASE("Graph simplification Tips") {
+    dbg_index dbgi{0.95, 10, 0};
+    gtl::vector<u32> mock_cores;
+    int MOCK_CORE_COUNT = 30;
+    for (int i = 0; i < MOCK_CORE_COUNT; i++) {
+        mock_cores.push_back(MurmurHash3_32(&i, sizeof(int), 156));
+    }
+    lcmer<LCMER_L> l(mock_cores.begin());
+    u64 idx = 0;
+
+    gtl::vector<u64> ll(1, 0);
+    ll.reserve(MOCK_CORE_COUNT - LCMER_L + 3);
+    ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    for (int i = LCMER_L + 1; i < MOCK_CORE_COUNT - 1; ++i) {
+        uint32_t in_core = mock_cores[i];
+        l.update_lcmer(in_core);
+        ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    }
+    ll.push_back(0);
+    for (size_t i = 1; i <= ll.size() - 1; i++) {
+        assembler::insert_lcmer_helper(ll, i, dbgi);
+    }
+
+    ll.clear();
+    mock_cores[MOCK_CORE_COUNT / 2] = 123123123;
+    l = lcmer<LCMER_L>(mock_cores.begin());
+
+    ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    for (int i = LCMER_L + 1; i < MOCK_CORE_COUNT - 1; ++i) {
+        uint32_t in_core = mock_cores[i];
+        l.update_lcmer(in_core);
+        ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+    }
+    ll.push_back(0);
+    for (size_t i = 1; i <= ll.size() / 2 - 1; i++) {
+        assembler::insert_lcmer_helper(ll, i, dbgi);
+    }
+
+    dbgi.count_forward_edges();
+
+    tests_mock_fill_seq(dbgi);
+    print_dbg_dot(dbgi, 3);
+
+    SUBCASE("Post simplify dbg") {
+        dbgi.simplify_graph(1);
+        for (auto &node : dbgi.dbg) {
+            INFO(node.first, "\t.\t.\t", node.second.seq.size());
+        }
+        CAPTURE(dbgi.dbg.size());
+        CHECK(dbgi.dbg.size() == 3);
+    }
+
+    print_dbg_dot(dbgi, 4);
 }

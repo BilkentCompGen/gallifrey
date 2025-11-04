@@ -17,7 +17,7 @@ namespace bloom_ext{
 }
 
 template<class BF>
-concept BF_Insert_Query_Concept = 
+concept BF_Insert_Query_Concept =
     requires  (BF bf) {
         { bf.Query(uint32_t{}, uint32_t{}) } -> std::same_as<bool>;
         { bf.Insert(uint32_t{}, uint32_t{}) } -> std::same_as<void>;
@@ -62,7 +62,7 @@ struct bloom_interface<bloom_ext::bloom_filter, mutex> {
     mutable mutex m;
 
 
-    bloom_interface(double false_positive_rate, size_t projected_element_count, uint64_t random_seed) 
+    bloom_interface(double false_positive_rate, size_t projected_element_count, uint64_t random_seed)
     {
         parameters.false_positive_probability = false_positive_rate;
         parameters.projected_element_count = projected_element_count;
@@ -85,7 +85,7 @@ struct bloom_interface<BF, mutex>{
     BF implementation;
     uint64_t random_seed;
     mutable mutex m;
-    bloom_interface(double false_positive_rate, size_t projected_element_count, uint64_t random_seed) : 
+    bloom_interface(double false_positive_rate, size_t projected_element_count, uint64_t random_seed) :
         implementation(projected_element_count, false_positive_rate), random_seed(random_seed){}
     bloom_interface(const bloom_interface<BF, mutex> &other) : implementation(other.implementation), random_seed{other.random_seed} {}
     bool contains(const auto &element) const{
@@ -95,7 +95,7 @@ struct bloom_interface<BF, mutex>{
         return implementation.Query(h >> 32, h & 0xFFFFFFFF);
     }
     void insert(const auto &element){
-        // std::lock_guard<mutex> lock{m};
+        std::lock_guard<mutex> lock{m};
         uint64_t h = komihash::komihash(&element, sizeof(element), random_seed);
         implementation.Insert(h >> 32, h & 0xFFFFFFFF);
     }
