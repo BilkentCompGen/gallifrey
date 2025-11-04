@@ -73,12 +73,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(libbloom)
 
-# Create bamdoctor standalone executable
-add_executable(bamdoctor bamdoctor.cpp lcmer.cpp)
 
 # Link libraries
 target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue pthread deflate z)
-target_link_libraries(bamdoctor ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue pthread deflate z)
+
 
 # Tests and custom targets
 add_test(NAME test COMMAND lasm hifi test/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8)
@@ -92,11 +90,6 @@ add_custom_target(debug
     COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target ${PROJECT_NAME}
 )
 
-add_custom_target(debug-bamdoctor
-    COMMENT "Building bamdoctor in debug mode"
-    COMMAND ${CMAKE_COMMAND} -DCMAKE_BUILD_TYPE=Debug ${CMAKE_SOURCE_DIR}
-    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target bamdoctor
-)
 
 # Compile definitions
 target_compile_definitions(${PROJECT_NAME} PUBLIC
@@ -107,19 +100,12 @@ target_compile_definitions(${PROJECT_NAME} PUBLIC
     SYNCMER_K=8
 )
 
-target_compile_definitions(bamdoctor PUBLIC
-    SYNCMER_RULE=DensitySyncmerRule
-    LCMER_L=24
-    SYNCMER_S=3
-    SYNCMER_T=55
-    SYNCMER_K=8
-)
 
 # Debug-specific definitions
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_definitions(${PROJECT_NAME} PUBLIC DEBUG_MODE=1)
-    target_compile_definitions(bamdoctor PUBLIC DEBUG_MODE=1)
+
     # Enable additional debug features
     target_compile_definitions(${PROJECT_NAME} PUBLIC ENABLE_DEBUG_LOGGING=1)
-    target_compile_definitions(bamdoctor PUBLIC ENABLE_DEBUG_LOGGING=1)
+
 endif()
