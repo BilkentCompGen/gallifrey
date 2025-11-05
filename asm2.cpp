@@ -17,6 +17,7 @@
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <inttypes.h>
 
 #include "asm.h"
 #include "bgzf.h"
@@ -702,13 +703,13 @@ input_type identify_input(const std::string &input) {
 
 void print_raw_dbg(FILE *out, const dbg_index &dbgi) {
     for (const auto &[lval, edges] : dbgi.dbg) {
-        fprintf(out, "S\tC%llu\t%s\tLN:i:%d\tRC:i:%d\n", lval, "*", 100,
-                edges.cc);
+        fprintf(out, "S\tC%" PRIu64 "\t%s\tLN:i:%d\tRC:i:%d",
+                lval, "*", 100, edges.cc);
     }
 
     for (const auto &[lval, edges] : dbgi.dbg) {
         for (const auto &p : edges.prev) {
-            fprintf(out, "L\tC%llu\t+\tC%llu\t+\t%dM\n", p, lval, 1);
+            fprintf(out, "L\tC%" PRIu64 "\t+\tC%" PRIu64 "\t+\t%dM\n", p, lval, 1);
         }
     }
 }
@@ -722,11 +723,11 @@ void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
 
         //        __builtin_debugtrap();
         if (edges.seq.size() == 0) {
-            fprintf(out, "S\tC%llu\t%s\tLN:i:%d\tRC:i:%lu\n", lval, "", 0,
+            fprintf(out, "S\tC%" PRIu64 "\t%s\tLN:i:%d\tRC:i:%lu\n", lval, "", 0,
                     edges.cc + edges.prev.size());
         } else {
             //            int i = onehotto2bitDNA2(s, buffer);
-            fprintf(out, "S\tC%llu\t", lval);
+            fprintf(out, "S\tC%" PRIu64 "\t", lval);
             size_t sofar = 0;
             //            for (const bam_nibble_data &s : edges.seq) {
             // reversed
@@ -743,7 +744,7 @@ void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
 
         for (uint64_t nl : edges.prev) {
             if (dbgi.dbg.contains(nl))
-                fprintf(out, "L\tC%llu\t+\tC%llu\t+\t%dM\n", nl, lval, 0);
+                fprintf(out, "L\tC%" PRIu64 "\t+\tC%" PRIu64 "\t+\t%dM\n", nl, lval, 0);
         }
     }
 }
@@ -767,11 +768,11 @@ void print_dbg_dot(const dbg_index &dbgi, int i) {
         fprintf(dot_file, "\t\t</table>\n");
         fprintf(dot_file, "\t>];\n");
         for (auto &node : dbgi.dbg) {
-            fprintf(dot_file, "\t%llu [label=\"%llu->%u,%zu,%zu\"];\n",
+            fprintf(dot_file, "\t%" PRIu64 " [label=\"%" PRIu64 "->%u,%zu,%zu\"];\n",
                     node.first, node.first, node.second.fec,
                     node.second.prev.size(), node.second.seq.size());
             for (auto &prev : node.second.prev) {
-                fprintf(dot_file, "\t%llu -> %llu;\n", prev, node.first);
+                fprintf(dot_file, "\t%" PRIu64 " -> %" PRIu64 ";\n", prev, node.first);
             }
         }
         fprintf(dot_file, "}\n");
@@ -876,10 +877,10 @@ TEST_CASE("Graph simplification simple") {
     //     // print_raw_dbg(dot_file, dbgi);
     //     fprintf(dot_file, "digraph G {\n");
     //     for (auto &node : dbgi.dbg) {
-    //         fprintf(dot_file, "\t%llu [label=\"%llu\"];\n", node.first,
+    //         fprintf(dot_file, "\t%" PRIu64 " [label=\"%" PRIu64 "\"];\n", node.first,
     //                 node.first);
     //         for (auto &prev : node.second.prev) {
-    //             fprintf(dot_file, "\t%llu -> %llu;\n", prev, node.first);
+    //             fprintf(dot_file, "\t%" PRIu64 " -> %" PRIu64 ";\n", prev, node.first);
     //         }
     //     }
     //     fprintf(dot_file, "}\n");
