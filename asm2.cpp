@@ -32,7 +32,7 @@ using u64 = uint64_t;
 using u32 = uint32_t;
 
 using std::string;
-enum class input_type { BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
+enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 
 #define PREV_WITH_VEC
 #define HT_SHARD_BC 8
@@ -381,7 +381,7 @@ struct assembler {
           output{param.output},
           threads{param.threads},
           lcp_level{param.lcp_level},
-          density{param.density},
+          density{param.syncmer.density},
           projected_count{param.bloom.projected_count},
           false_positive_rate{param.bloom.false_positive_rate},
           random_seed{param.random_seed},
@@ -682,7 +682,9 @@ input_type identify_input(const std::string &input) {
     std::string_view sv(input);
     if (sv.ends_with(".bam")) {
         return input_type::BAM;
-    } else if (sv.ends_with(".fastq") || sv.ends_with(".fq") ||
+    } else if (sv.ends_with(".sam")){
+        return input_type::SAM;
+    }else if (sv.ends_with(".fastq") || sv.ends_with(".fq") ||
                sv.ends_with(".fasta") || sv.ends_with(".fa") ||
                sv.ends_with(".fna")) {
         return input_type::FASTX;

@@ -20,15 +20,16 @@ struct charsi_base {
     T *data;
     size_t capacity;
     charsi_base() : data{NULL}, capacity{0} {}
-    //Rule of 3 just delete
-    charsi_base(const charsi_base&) = delete;
-    charsi_base& operator=(const charsi_base&) = delete;
-    //Rule of 5
-    charsi_base(charsi_base&& other) noexcept : data{other.data}, capacity{other.capacity} {
+    // Rule of 3 just delete
+    charsi_base(const charsi_base &) = delete;
+    charsi_base &operator=(const charsi_base &) = delete;
+    // Rule of 5
+    charsi_base(charsi_base &&other) noexcept
+        : data{other.data}, capacity{other.capacity} {
         other.data = nullptr;
         other.capacity = 0;
     }
-    charsi_base& operator=(charsi_base&& other) noexcept {
+    charsi_base &operator=(charsi_base &&other) noexcept {
         if (this != &other) {
             free(data);
             data = other.data;
@@ -40,7 +41,7 @@ struct charsi_base {
     }
 
     ~charsi_base() { free(data); }
-    int require(size_t cap, bool keep_when_realloc=false) {
+    int require(size_t cap, bool keep_when_realloc = false) {
         if (cap > capacity) {
             capacity = cap * GF;
             if (keep_when_realloc) {

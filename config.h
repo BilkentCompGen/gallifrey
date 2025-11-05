@@ -23,7 +23,7 @@
 
 #ifndef KMER_SPACE_MASK
 #define KMER_SPACE_MASK 0xFFFFFFFFFFFFFFFF
-#endif 
+#endif
 
 #ifndef BAMREAD_CHUNK_SIZE
 #define BAMREAD_CHUNK_SIZE 256ULL
@@ -51,7 +51,7 @@
         double name##_interval_util = (name##_interval_elapsed > 0) ? (name##_interval_cpu / name##_interval_elapsed) * 100.0 : 0.0; \
         \
         fprintf(stream, "[Checkpoint: %s] ", #name); \
-        fprintf(stream, fmt, ##__VA_ARGS__); \
+        fprintf(stream, fmt __VA_OPT__(,) __VA_ARGS__); \
         fprintf(stream, "\n"); \
         fprintf(stream, "  Total:   Wall = %lld ms, CPU = %.2f ms, Utilization = %.2f%%\n", name##_total_elapsed, name##_total_cpu, name##_total_util); \
         fprintf(stream, "  Current: Wall = %lld ms, CPU = %.2f ms, Utilization = %.2f%%\n\n", name##_interval_elapsed, name##_interval_cpu, name##_interval_util); \

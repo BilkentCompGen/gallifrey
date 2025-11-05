@@ -25,6 +25,10 @@
 #pragma once
 
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <vector>
 struct BasicBloomFilter
 {
     BasicBloomFilter(int n, float eps) : n(n), epsilon(eps)
@@ -104,7 +108,7 @@ struct BlockedBloomFilter
         return static_cast<int>(-std::log2(epsilon) + 0.5);
     }
 
-    uint8_t *GetBlock(uint32_t h1, uint32_t h2)
+    uint8_t *GetBlock(uint32_t h1, uint32_t )
     {
         uint32_t block_idx = h1 % num_blocks;
         uint32_t byte_idx = block_idx * CACHE_LINE_BYTES;
@@ -173,18 +177,18 @@ struct RegisterBlockedBloomFilter
         return static_cast<int>(-std::log2(epsilon) + 0.5);
     }
 
-    uint64_t *GetBlock(uint32_t h1, uint32_t h2)
+    uint64_t *GetBlock(uint32_t h1, uint32_t)
     {
         uint32_t block_idx = h1 % num_blocks;
         return &bv[block_idx];
     }
-    const uint64_t *GetBlock(uint32_t h1, uint32_t h2) const
+    const uint64_t *GetBlock(uint32_t h1, uint32_t) const
     {
         uint32_t block_idx = h1 % num_blocks;
         return &bv.at(block_idx);
     }
 
-    uint64_t ConstructMask(uint32_t h1, uint32_t h2) const 
+    uint64_t ConstructMask(uint32_t h1, uint32_t h2) const
     {
         uint64_t mask = 0;
         for(int i = 1; i < k; i++)
@@ -527,7 +531,7 @@ struct PatternedSimdBloomFilter
     uint64_t num_blocks;
     uint64_t m;
     MaskTable masks;
-    std::vector<uint64_t> bv;    
+    std::vector<uint64_t> bv;
 
     static constexpr int mask_idx_bits = MaskTable::log_num_masks;
     static constexpr int rotate_bits = 6;

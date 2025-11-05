@@ -71,7 +71,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     charsi chs;
     auto job = [&]() -> std::function<int(bam1_t *, lps *)> {
         if (job_type == "read_count"){
-            return [](bam1_t *bamdata, lps *str) -> int {
+            return [](bam1_t *, lps *) -> int {
                 return 1;
             };
         }
@@ -86,7 +86,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
                 return (int)lr.cores.size();
             };
         }
-        return [](bam1_t *bamdata, lps *str) -> int {
+        return [](bam1_t *, lps *) -> int {
             return 0;
         };
     }();
@@ -126,7 +126,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
         worker.join();
     }
     bam1_t *item;
-    int count =  0;
+    size_t count =  0;
     while(data_queue.try_dequeue(item)){
         ++count;
         // bam_destroy1(item);
@@ -137,7 +137,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     // while(recycle_queue.try_dequeue(item)){
     //     bam_destroy1(item);
     // }
-    TIME_CHECKPOINT(BAM_READING, stderr, "Read %llu reads", count);
+    TIME_CHECKPOINT(BAM_READING, stderr, "Read %zu reads", count);
 
     // bam_destroy1(bamdata);
     sam_hdr_destroy(hdr);

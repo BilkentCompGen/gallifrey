@@ -1,4 +1,5 @@
 #include "lcmer.h"
+
 #include <cstdint>
 
 #include "CLI/CLI.hpp"
@@ -171,7 +172,6 @@ uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len) {
     }
     return ret;
 }
-
 
 // lcp_read parse_cores_from_kseq(const char *s, size_t len, int lcp_level) {
 //     // uint64_t estimated_core_size = (int)(len / std::pow(1.5, lcp_level));
@@ -349,17 +349,18 @@ TEST_CASE("BAM Read Parsing") {
             int seqlen = strlen(seq_gt);
             srand(time(NULL));
             for (int casei = 0; casei < 50; ++casei) {
-                int to = rand() %( seqlen - 100) + 100;
-                int from = rand() % (to-100);
+                int to = rand() % (seqlen - 100) + 100;
+                int from = rand() % (to - 100);
                 char *seq = (char *)malloc(to - from + 2);
 
-                if(from % 2 == 0){
+                if (from % 2 == 0) {
                     nibble2base(bam_get_seq(rec) + from / 2, seq, to - from);
-                    seq[to - from ] = '\0';
+                    seq[to - from] = '\0';
                     CHECK_EQ(std::string{seq_gt}.substr(from, to - from),
                              std::string{seq});
                 } else {
-                    nibble2base(bam_get_seq(rec) + from / 2, seq, to - from + 1);
+                    nibble2base(bam_get_seq(rec) + from / 2, seq,
+                                to - from + 1);
                     seq[to - from + 1] = '\0';
                     CHECK_EQ(std::string{seq_gt}.substr(from, to - from),
                              std::string{seq}.substr(1));
@@ -368,7 +369,7 @@ TEST_CASE("BAM Read Parsing") {
             }
         }
     }
-    SUBCASE("Copying Nibble-encoded data and decoding it to bases"){
+    SUBCASE("Copying Nibble-encoded data and decoding it to bases") {
         int seqlen = strlen(seq_gt);
         srand(time(NULL));
         int N_RANDOM_CASES = 50;
@@ -377,21 +378,21 @@ TEST_CASE("BAM Read Parsing") {
         std::vector<size_t> froms;
         std::vector<size_t> tos;
         for (int casei = 0; casei < N_RANDOM_CASES; ++casei) {
-            int to = rand() %( seqlen - 100) + 100;
-            int from = rand() % (to-100);
+            int to = rand() % (seqlen - 100) + 100;
+            int from = rand() % (to - 100);
             copied.emplace_back(bam_get_seq(rec), from, to);
             froms.push_back(from);
             tos.push_back(to);
         }
-        char buffer[1024*1024];
-        for(int casei = 0; casei < N_RANDOM_CASES; ++casei){
+        char buffer[1024 * 1024];
+        for (int casei = 0; casei < N_RANDOM_CASES; ++casei) {
             auto &seq = copied[casei];
             size_t from = froms[casei];
             size_t to = tos[casei];
             seq.convert_to_ascii(buffer);
             INFO("from: ", from, " to: ", to, "seq.len: ", seq.len);
             CHECK_EQ(std::string{seq_gt}.substr(from, to - from),
-                     std::string{buffer}.substr(seq.skip_first?1:0));
+                     std::string{buffer}.substr(seq.skip_first ? 1 : 0));
         }
     }
     bam_hdr_destroy(hdr);

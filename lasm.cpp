@@ -30,7 +30,7 @@ int asm_program(CLI::App &parent) {
         ->capture_default_str();
     app.add_option("--random-seed", p->random_seed, "Random seed")
         ->capture_default_str();
-    app.add_option("--density", p->density, "Density of selected k-mers")
+    app.add_option("--density", p->syncmer.density, "Density of selected k-mers")
         ->capture_default_str();
     auto bfg =
         app.add_option_group("bloomfilter", "Parameters to setup bloom filter");
@@ -48,7 +48,8 @@ int asm_program(CLI::App &parent) {
     gcg->add_option("--max-tip-length", p->graph_cleaning.max_tip_length,
                     "Maximum tip length to cut in terms of cores")
         ->capture_default_str();
-    gcg->add_option("--min-bubble-length-difference", p->graph_cleaning.min_bubble_length_difference,
+    gcg->add_option("--min-bubble-length-difference",
+                    p->graph_cleaning.min_bubble_length_difference,
                     "Maximum bubble length to pop in terms of cores")
         ->capture_default_str();
     app.callback([=]() {
