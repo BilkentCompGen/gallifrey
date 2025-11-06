@@ -5,8 +5,7 @@
 #include <htslib/hts.h>
 #include <htslib/sam.h>
 #include <htslib/thread_pool.h>
-#include <inttypes.h>
-#include <stdio.h>
+
 
 #include <chrono>
 #include <cstdint>
@@ -19,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <inttypes.h>
+#include <stdio.h>
 
 #include "asm.h"
 #include "bgzf.h"
@@ -381,15 +381,15 @@ struct assembler {
     uint64_t random_seed;
     using SYNCMER_HASHER = syncmer::MurMur;
     syncmer::DensitySyncmerRule<uint32_t, SYNCMER_HASHER> syncmer_functor;
-    assembler(const asm_parameters &param)
-        : input{param.input},
-          output{param.output},
-          threads{param.threads},
-          lcp_level{param.lcp_level},
-          density{param.syncmer.density},
-          projected_count{param.bloom.projected_count},
-          false_positive_rate{param.bloom.false_positive_rate},
-          random_seed{param.random_seed},
+    assembler(const asm_config &cfg)
+        : input{cfg.input},
+          output{cfg.output},
+          threads{cfg.threads},
+          lcp_level{cfg.lcp_level},
+          density{cfg.syncmer.param.density},
+          projected_count{cfg.bloom.projected_count},
+          false_positive_rate{cfg.bloom.false_positive_rate},
+          random_seed{cfg.random_seed},
           syncmer_functor{density, static_cast<unsigned int>(random_seed)} {}
     static inline void insert_lcmer_helper(const gtl::vector<uint64_t> &ll,
                                            const uint32_t &i, dbg_index &dbgi) {
@@ -788,16 +788,16 @@ void print_dbg_dot(const dbg_index &dbgi, int i) {
     }
 }
 
-int run_assembly(const asm_parameters &param) {
+int run_assembly(const asm_config &cfg) {
     INIT_TIMERS(HIFI_ASSEMBLY);
 
-    auto inty = identify_input(param.input);
+    auto inty = identify_input(cfg.input);
 
     if (inty == input_type::UNKNOWN) {
-        fprintf(stderr, "Unknown input type %s\n", param.input.c_str());
+        fprintf(stderr, "Unknown input type %s\n", cfg.input.c_str());
         return -1;
     }
-    assembler as(param);
+    assembler as(cfg);
     auto dbg = as.construct_dbg();
 
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG construction done.");
@@ -807,11 +807,11 @@ int run_assembly(const asm_parameters &param) {
     as.convert2basespace(dbg);
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Converting to basespace done.");
 
-    dbg.simplify_graph(param.graph_cleaning.iterations,
-                       param.graph_cleaning.max_tip_length,
-                       param.graph_cleaning.min_bubble_length_difference);
+    dbg.simplify_graph(cfg.graph_cleaning.iterations,
+                       cfg.graph_cleaning.max_tip_length,
+                       cfg.graph_cleaning.min_bubble_length_difference);
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Simplify graph done.");
-    FILE *out = fopen(param.output.c_str(), "w");
+    FILE *out = fopen(cfg.output.c_str(), "w");
     print_dbg_seqs(out, dbg);
     // print_raw_dbg(out, dbg);
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG printing done.");

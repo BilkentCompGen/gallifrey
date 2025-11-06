@@ -6,7 +6,7 @@
 
 #include <string>
 
-struct asm_parameters {
+struct asm_config {
     std::string input;
     std::string output;
     int lcp_level = 3;
@@ -14,11 +14,13 @@ struct asm_parameters {
     size_t random_seed = 1453;
     struct {
         int k;
-        union {
+        union param{
             double density = 0.03;
-            int s;
-            int t;
-        };
+            struct {
+                int s;
+                int t;
+            } mincode;
+        } param;
     } syncmer;
     struct {
         uint64_t projected_count = 100'000'000;
@@ -31,5 +33,5 @@ struct asm_parameters {
     } graph_cleaning;
 };
 
-int run_assembly(const asm_parameters &param);
+int run_assembly(const asm_config &param);
 #endif

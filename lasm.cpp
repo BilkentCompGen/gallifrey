@@ -21,7 +21,7 @@ struct bloom_parameters;
 int asm_program(CLI::App &parent) {
     auto *app_ = parent.add_subcommand("hifi", "run hifi assembly");
     auto &app = *app_;
-    asm_parameters *p = new asm_parameters;
+    asm_config *p = new asm_config;
     app.add_option("input", p->input, "Input bam file")->required();
     app.add_option("output", p->output, "Output gfa file")->required();
     app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
@@ -30,7 +30,7 @@ int asm_program(CLI::App &parent) {
         ->capture_default_str();
     app.add_option("--random-seed", p->random_seed, "Random seed")
         ->capture_default_str();
-    app.add_option("--density", p->syncmer.density, "Density of selected k-mers")
+    app.add_option("--density", p->syncmer.param.density, "Density of selected k-mers")
         ->capture_default_str();
     auto bfg =
         app.add_option_group("bloomfilter", "Parameters to setup bloom filter");
