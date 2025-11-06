@@ -26,7 +26,9 @@ int asm_program(CLI::App &parent) {
     app.add_option("output", p->output, "Output gfa file")->required();
     app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
         ->required();
-    app.add_option("-t,--threads", p->threads, "Number of threads")
+    app.add_option("-t,--threads", p->threads.work, "Number of worker threads")
+        ->capture_default_str();
+    app.add_option("-@,--io-threads", p->threads.io, "Number of IO threads")
         ->capture_default_str();
     app.add_option("--random-seed", p->random_seed, "Random seed")
         ->capture_default_str();

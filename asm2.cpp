@@ -373,7 +373,11 @@ struct dbg_index {
 struct assembler {
     string input;
     string output;
-    int threads;
+    struct {
+        int io;
+        int work;
+    } threads;
+
     int lcp_level;
     double density;
     uint64_t projected_count;
@@ -384,7 +388,7 @@ struct assembler {
     assembler(const asm_config &cfg)
         : input{cfg.input},
           output{cfg.output},
-          threads{cfg.threads},
+          threads{cfg.threads.io, cfg.threads.work},
           lcp_level{cfg.lcp_level},
           density{cfg.syncmer.param.density},
           projected_count{cfg.bloom.projected_count},
@@ -603,19 +607,18 @@ struct assembler {
         // }
     }
     auto construct_dbg() {
-        dqt data_queue{static_cast<size_t>(threads) * 1024, 1, 1};
-        dqt recycle_queue{static_cast<size_t>(threads) * 1024, 1, 1};
+        dqt data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
+        dqt recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
         std::atomic<bool> done{false};
 
         dbg_index dbgi{false_positive_rate, projected_count, random_seed};
 
         gtl::vector<std::thread> workers;
-        auto [data_thread_count, worker_thread_count] =
-            get_thread_dist(threads);
-        gtl::vector<int> valid_read_counts(worker_thread_count, 0);
-        gtl::vector<int> all_read_counts(worker_thread_count, 0);
 
-        for (int tid = 1; tid <= worker_thread_count; ++tid) {
+        gtl::vector<int> valid_read_counts(threads.work, 0);
+        gtl::vector<int> all_read_counts(threads.work, 0);
+
+        for (int tid = 1; tid <= threads.work; ++tid) {
             workers.emplace_back(process_data, tid, lcp_level,
                                  std::ref(data_queue), std::ref(recycle_queue),
                                  std::ref(dbgi), std::ref(done),
@@ -625,7 +628,7 @@ struct assembler {
         }
 
         generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
-                      data_thread_count);
+            threads.io);
 
         done.store(true);
         for (auto &worker : workers) {
@@ -644,17 +647,15 @@ struct assembler {
     }
 
     auto convert2basespace(dbg_index &dbgi) -> int {
-        dqt data_queue{static_cast<size_t>(threads) * 1024, 1, 1};
-        dqt recycle_queue{static_cast<size_t>(threads) * 1024, 1, 1};
+        dqt data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
+        dqt recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
         std::atomic<bool> done{false};
 
         gtl::vector<std::thread> workers;
-        auto [data_thread_count, worker_thread_count] =
-            get_thread_dist(threads);
-        gtl::vector<int> valid_read_counts(worker_thread_count, 0);
-        gtl::vector<int> all_read_counts(worker_thread_count, 0);
+        gtl::vector<int> valid_read_counts(threads.work, 0);
+        gtl::vector<int> all_read_counts(threads.work, 0);
 
-        for (int tid = 1; tid <= worker_thread_count; ++tid) {
+        for (int tid = 1; tid <= threads.work; ++tid) {
             workers.emplace_back(
                 process_data, tid, lcp_level, std::ref(data_queue),
                 std::ref(recycle_queue), std::ref(dbgi), std::ref(done),
@@ -663,7 +664,7 @@ struct assembler {
                 std::cref(syncmer_functor));
         }
         generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
-                      data_thread_count);
+            threads.io);
 
         done.store(true);
         for (auto &worker : workers) {

@@ -1,7 +1,6 @@
 #ifndef NIBBLE2BASE_HPP
 #define NIBBLE2BASE_HPP
 // #include <sys/_types/_u_char.h>
-#include "htslib/hts_log.h"
 typedef unsigned int u_int;
 typedef unsigned char u_char;
 typedef unsigned short u_short;

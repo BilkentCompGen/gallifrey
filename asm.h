@@ -10,7 +10,10 @@ struct asm_config {
     std::string input;
     std::string output;
     int lcp_level = 3;
-    int threads = 8;
+    struct {
+        int io   = 4;
+        int work = 8;
+    } threads;
     size_t random_seed = 1453;
     struct {
         int k;
