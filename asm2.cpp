@@ -687,9 +687,9 @@ input_type identify_input(const std::string &input) {
     std::string_view sv(input);
     if (sv.ends_with(".bam")) {
         return input_type::BAM;
-    } else if (sv.ends_with(".sam")){
+    } else if (sv.ends_with(".sam")) {
         return input_type::SAM;
-    }else if (sv.ends_with(".fastq") || sv.ends_with(".fq") ||
+    } else if (sv.ends_with(".fastq") || sv.ends_with(".fq") ||
                sv.ends_with(".fasta") || sv.ends_with(".fa") ||
                sv.ends_with(".fna")) {
         return input_type::FASTX;
