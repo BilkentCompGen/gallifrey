@@ -5,6 +5,7 @@
 #include <htslib/hts.h>
 #include <htslib/sam.h>
 #include <htslib/thread_pool.h>
+#include <inttypes.h>
 #include <stdio.h>
 
 #include <chrono>
@@ -229,7 +230,7 @@ struct dbg_index {
                         max_edge_len =
                             std::max(max_edge_len, prev_it->second.seq.size());
                     }
-                    // Remove every tipe if non_terminating_exists
+                    // Remove every tip if non_terminating_exists
 
                     if (non_terminating_exists) {
                         for (auto &prev_id : current->second.prev) {
@@ -258,6 +259,9 @@ struct dbg_index {
                     } else if (max_edge_len - min_edge_len > max_tip_length) {
                         for (auto &prev_id : current->second.prev) {
                             auto prev_it = dbg.find(prev_id);
+                            if (prev_it == dbg.end()){
+                                continue;
+                            }
                             if (prev_it->second.prev.size() == 0 &&
                                 prev_it->second.fec == 1 &&
                                 prev_it->second.seq.size() <
@@ -703,13 +707,14 @@ input_type identify_input(const std::string &input) {
 
 void print_raw_dbg(FILE *out, const dbg_index &dbgi) {
     for (const auto &[lval, edges] : dbgi.dbg) {
-        fprintf(out, "S\tC%" PRIu64 "\t%s\tLN:i:%d\tRC:i:%d",
-                lval, "*", 100, edges.cc);
+        fprintf(out, "S\tC%" PRIu64 "\t%s\tLN:i:%d\tRC:i:%d", lval, "*", 100,
+                edges.cc);
     }
 
     for (const auto &[lval, edges] : dbgi.dbg) {
         for (const auto &p : edges.prev) {
-            fprintf(out, "L\tC%" PRIu64 "\t+\tC%" PRIu64 "\t+\t%dM\n", p, lval, 1);
+            fprintf(out, "L\tC%" PRIu64 "\t+\tC%" PRIu64 "\t+\t%dM\n", p, lval,
+                    1);
         }
     }
 }
@@ -723,8 +728,8 @@ void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
 
         //        __builtin_debugtrap();
         if (edges.seq.size() == 0) {
-            fprintf(out, "S\tC%" PRIu64 "\t%s\tLN:i:%d\tRC:i:%lu\n", lval, "", 0,
-                    edges.cc + edges.prev.size());
+            fprintf(out, "S\tC%" PRIu64 "\t%s\tLN:i:%d\tRC:i:%lu\n", lval, "",
+                    0, edges.cc + edges.prev.size());
         } else {
             //            int i = onehotto2bitDNA2(s, buffer);
             fprintf(out, "S\tC%" PRIu64 "\t", lval);
@@ -744,7 +749,8 @@ void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
 
         for (uint64_t nl : edges.prev) {
             if (dbgi.dbg.contains(nl))
-                fprintf(out, "L\tC%" PRIu64 "\t+\tC%" PRIu64 "\t+\t%dM\n", nl, lval, 0);
+                fprintf(out, "L\tC%" PRIu64 "\t+\tC%" PRIu64 "\t+\t%dM\n", nl,
+                        lval, 0);
         }
     }
 }
@@ -768,11 +774,13 @@ void print_dbg_dot(const dbg_index &dbgi, int i) {
         fprintf(dot_file, "\t\t</table>\n");
         fprintf(dot_file, "\t>];\n");
         for (auto &node : dbgi.dbg) {
-            fprintf(dot_file, "\t%" PRIu64 " [label=\"%" PRIu64 "->%u,%zu,%zu\"];\n",
+            fprintf(dot_file,
+                    "\t%" PRIu64 " [label=\"%" PRIu64 "->%u,%zu,%zu\"];\n",
                     node.first, node.first, node.second.fec,
                     node.second.prev.size(), node.second.seq.size());
             for (auto &prev : node.second.prev) {
-                fprintf(dot_file, "\t%" PRIu64 " -> %" PRIu64 ";\n", prev, node.first);
+                fprintf(dot_file, "\t%" PRIu64 " -> %" PRIu64 ";\n", prev,
+                        node.first);
             }
         }
         fprintf(dot_file, "}\n");
