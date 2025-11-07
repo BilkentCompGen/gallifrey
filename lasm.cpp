@@ -7,8 +7,11 @@
 #include "asm.h"
 #include "bamdoctor.h"
 #include "ext/lcptools/lcptools_ho.h"
+
+#ifdef BUILD_HISTOGRAM_UTILS
 #include "stats.h"
 #include "sthist.h"
+#endif
 
 using std::string;
 
@@ -32,7 +35,8 @@ int asm_program(CLI::App &parent) {
         ->capture_default_str();
     app.add_option("--random-seed", p->random_seed, "Random seed")
         ->capture_default_str();
-    app.add_option("--density", p->syncmer.param.density, "Density of selected k-mers")
+    app.add_option("--density", p->syncmer.param.density,
+                   "Density of selected k-mers")
         ->capture_default_str();
     auto bfg =
         app.add_option_group("bloomfilter", "Parameters to setup bloom filter");
@@ -45,14 +49,19 @@ int asm_program(CLI::App &parent) {
     auto gcg = app.add_option_group("graphcleaning",
                                     "Parameters to setup graph cleaning");
     gcg->add_option("--iterations", p->graph_cleaning.iterations,
-                    "Number of iterations")
+                    "Number of iterations of graph cleaning")
         ->capture_default_str();
     gcg->add_option("--max-tip-length", p->graph_cleaning.max_tip_length,
                     "Maximum tip length to cut in terms of cores")
         ->capture_default_str();
+    gcg->add_option("--min-bubble-depth-difference-ratio",
+                    p->graph_cleaning.min_bubble_depth_difference_percentage,
+                    "Minimum bubble length to pop in terms of cores")
+        ->capture_default_str();
     gcg->add_option("--min-bubble-length-difference",
                     p->graph_cleaning.min_bubble_length_difference,
-                    "Maximum bubble length to pop in terms of cores")
+                    "Minimum difference between the two ends of the bubbles to "
+                    "pop. if depth(P1) * arg > depth(P2) then pop();")
         ->capture_default_str();
     app.callback([=]() {
         int ret = run_assembly(*p);
@@ -62,6 +71,7 @@ int asm_program(CLI::App &parent) {
     return 0;
 }
 
+#ifdef BUILD_HISTOGRAM_UTILS
 void stats_program(CLI::App &parent) {
     auto *app_ = parent.add_subcommand("bam-stats", "Print stats on input bam");
     auto &app = *app_;
@@ -86,6 +96,29 @@ void stats_program(CLI::App &parent) {
         return ret;
     });
 }
+
+void stdin_hist_prog(CLI::App &parent) {
+    auto *app_ = parent.add_subcommand("mephisto",
+                                       "Testing HTSLib Multi File movements");
+    auto &app = *app_;
+    struct parameters {
+        int dims;
+        int freq;
+    };
+    // Allocate parameters as heap and set default values
+    parameters *params = new parameters{1, 10};
+    app.add_option("--dims", params->dims, "screen dimensions")
+        ->capture_default_str();
+    app.add_option("--freq", params->freq, "Frequency of histogram updates")
+        ->capture_default_str();
+
+    app.callback([=]() {
+        int ret = run_hist_on_stdin(params->dims, params->freq);
+        delete params;
+        return ret;
+    });
+}
+#endif
 
 int sam_read_testing(CLI::App &parent) {
     struct parameters {
@@ -129,29 +162,6 @@ int sam_read_testing(CLI::App &parent) {
     });
     return 0;
 }
-
-void stdin_hist_prog(CLI::App &parent) {
-    auto *app_ = parent.add_subcommand("mephisto",
-                                       "Testing HTSLib Multi File movements");
-    auto &app = *app_;
-    struct parameters {
-        int dims;
-        int freq;
-    };
-    // Allocate parameters as heap and set default values
-    parameters *params = new parameters{1, 10};
-    app.add_option("--dims", params->dims, "screen dimensions")
-        ->capture_default_str();
-    app.add_option("--freq", params->freq, "Frequency of histogram updates")
-        ->capture_default_str();
-
-    app.callback([=]() {
-        int ret = run_hist_on_stdin(params->dims, params->freq);
-        delete params;
-        return ret;
-    });
-}
-
 #define DOCTEST_CONFIG_IMPLEMENT
 #include "doctest.h"
 
@@ -186,8 +196,10 @@ int main(int argc, char **argv) {
     app.require_subcommand(1);
     // app.set_help_all_flag("--help-all", "Expand all help");
     asm_program(app);
+#ifdef BUILD_HISTOGRAM_UTILS
     stats_program(app);
     stdin_hist_prog(app);
+#endif
     sam_read_testing(app);
     CLI11_PARSE(app, argc, argv);
     return 0;

@@ -5,7 +5,8 @@
 #include <htslib/hts.h>
 #include <htslib/sam.h>
 #include <htslib/thread_pool.h>
-
+#include <inttypes.h>
+#include <stdio.h>
 
 #include <chrono>
 #include <cstdint>
@@ -17,8 +18,6 @@
 #include <iostream>
 #include <mutex>
 #include <string>
-#include <inttypes.h>
-#include <stdio.h>
 
 #include "asm.h"
 #include "bgzf.h"
@@ -166,6 +165,7 @@ struct dbg_index {
             for (auto &dn : lci) {
                 auto current = dbg.find(dn.second.id);
                 if (current == dbg.end()) {
+                    dn.second.pos = -1;
                     continue;
                 }
                 // Simple paths
@@ -207,6 +207,7 @@ struct dbg_index {
             for (auto &dn : lci) {
                 auto current = dbg.find(dn.second.id);
                 if (current == dbg.end()) {
+                    dn.second.pos = -1;
                     continue;
                 }
                 // We have non-zero forward edges, and more than one prev
@@ -259,7 +260,7 @@ struct dbg_index {
                     } else if (max_edge_len - min_edge_len > max_tip_length) {
                         for (auto &prev_id : current->second.prev) {
                             auto prev_it = dbg.find(prev_id);
-                            if (prev_it == dbg.end()){
+                            if (prev_it == dbg.end()) {
                                 continue;
                             }
                             if (prev_it->second.prev.size() == 0 &&
@@ -284,6 +285,7 @@ struct dbg_index {
             for (auto &dn : lci) {
                 auto current = dbg.find(dn.second.id);
                 if (current == dbg.end()) {
+                    dn.second.pos = -1;
                     continue;
                 }
 
@@ -628,7 +630,7 @@ struct assembler {
         }
 
         generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
-            threads.io);
+                      threads.io);
 
         done.store(true);
         for (auto &worker : workers) {
@@ -664,7 +666,7 @@ struct assembler {
                 std::cref(syncmer_functor));
         }
         generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
-            threads.io);
+                      threads.io);
 
         done.store(true);
         for (auto &worker : workers) {
@@ -771,14 +773,15 @@ void print_dbg_dot(const dbg_index &dbgi, int i) {
                 "\t\t\t<tr><td bgcolor=\"lightgrey\">Node ID</td><td "
                 "bgcolor=\"lightgrey\">Forward</td><td "
                 "bgcolor=\"lightgrey\">Prev</td><td "
-                "bgcolor=\"lightgrey\">Merged count</td></tr>\n");
+                "bgcolor=\"lightgrey\">Merged count</td><td "
+                "bgcolor=\"lightgrey\">Core Count </td></tr>\n");
         fprintf(dot_file, "\t\t</table>\n");
         fprintf(dot_file, "\t>];\n");
         for (auto &node : dbgi.dbg) {
             fprintf(dot_file,
-                    "\t%" PRIu64 " [label=\"%" PRIu64 "->%u,%zu,%zu\"];\n",
+                    "\t%" PRIu64 " [label=\"%" PRIu64 "->%u,%zu,%zu,%d\"];\n",
                     node.first, node.first, node.second.fec,
-                    node.second.prev.size(), node.second.seq.size());
+                    node.second.prev.size(), node.second.seq.size(), node.second.cc);
             for (auto &prev : node.second.prev) {
                 fprintf(dot_file, "\t%" PRIu64 " -> %" PRIu64 ";\n", prev,
                         node.first);
@@ -798,13 +801,14 @@ int run_assembly(const asm_config &cfg) {
         fprintf(stderr, "Unknown input type %s\n", cfg.input.c_str());
         return -1;
     }
+
     assembler as(cfg);
     auto dbg = as.construct_dbg();
-
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG construction done.");
-    dbg.count_forward_edges();
 
+    dbg.count_forward_edges();
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Count forward edges done.");
+
     as.convert2basespace(dbg);
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Converting to basespace done.");
 
@@ -812,6 +816,7 @@ int run_assembly(const asm_config &cfg) {
                        cfg.graph_cleaning.max_tip_length,
                        cfg.graph_cleaning.min_bubble_length_difference);
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Simplify graph done.");
+
     FILE *out = fopen(cfg.output.c_str(), "w");
     print_dbg_seqs(out, dbg);
     // print_raw_dbg(out, dbg);
@@ -886,10 +891,12 @@ TEST_CASE("Graph simplification simple") {
     //     // print_raw_dbg(dot_file, dbgi);
     //     fprintf(dot_file, "digraph G {\n");
     //     for (auto &node : dbgi.dbg) {
-    //         fprintf(dot_file, "\t%" PRIu64 " [label=\"%" PRIu64 "\"];\n", node.first,
+    //         fprintf(dot_file, "\t%" PRIu64 " [label=\"%" PRIu64 "\"];\n",
+    //         node.first,
     //                 node.first);
     //         for (auto &prev : node.second.prev) {
-    //             fprintf(dot_file, "\t%" PRIu64 " -> %" PRIu64 ";\n", prev, node.first);
+    //             fprintf(dot_file, "\t%" PRIu64 " -> %" PRIu64 ";\n", prev,
+    //             node.first);
     //         }
     //     }
     //     fprintf(dot_file, "}\n");
@@ -1020,28 +1027,34 @@ TEST_CASE("Graph simplification Tips (Outgoing)") {
 TEST_CASE("Graph simplification Tips (Incoming)") {
     dbg_index dbgi{0.95, 10, 0};
     gtl::vector<u32> mock_cores;
+    lcmer<LCMER_L> l;
+    gtl::vector<u64> ll;
+
+    u64 idx = 0;
     int MOCK_CORE_COUNT = 30;
     for (int i = 0; i < MOCK_CORE_COUNT; i++) {
         mock_cores.push_back(MurmurHash3_32(&i, sizeof(int), 156));
     }
-    lcmer<LCMER_L> l(mock_cores.begin());
-    u64 idx = 0;
+    for (int DEPTH = 0; DEPTH < 10; ++DEPTH) {
+        l = lcmer<LCMER_L>(mock_cores.begin());
 
-    gtl::vector<u64> ll(1, 0);
-    ll.reserve(MOCK_CORE_COUNT - LCMER_L + 3);
-    ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-    for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
-        uint32_t in_core = mock_cores[i];
-        l.update_lcmer(in_core);
+        ll.push_back(0);
+
+        ll.reserve(MOCK_CORE_COUNT - LCMER_L + 3);
         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+        for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
+            uint32_t in_core = mock_cores[i];
+            l.update_lcmer(in_core);
+            ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
+        }
+        ll.push_back(0);
+        for (size_t i = 1; i <= ll.size() - 1; i++) {
+            assembler::insert_lcmer_helper(ll, i, dbgi);
+        }
+
+        ll.clear();
     }
     ll.push_back(0);
-    for (size_t i = 1; i <= ll.size() - 1; i++) {
-        assembler::insert_lcmer_helper(ll, i, dbgi);
-    }
-
-    ll.clear();
-
     mock_cores[8] = 123123123;
     l = lcmer<LCMER_L>(mock_cores.begin() + 7);
 

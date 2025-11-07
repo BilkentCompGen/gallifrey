@@ -99,7 +99,7 @@ class TerminalCell : public Cell {
                 ++i;
                 if(i >= height){ break;}
             }
-            ++idx;   
+            ++idx;
         }
     }
 };
@@ -169,7 +169,7 @@ class Screen {
     bool running = true;
     Screen(int r, int c) : gridR(r), gridC(c) {
         if (tb_init()) throw;
-        
+
         tb_clear();
         std::signal(SIGINT, [](int) {
             tb_shutdown();
@@ -215,7 +215,7 @@ class Screen {
         if (!h) throw;
         h->print(fmt,args...);
     }
-    
+
 
     void update() {
         compute();
