@@ -2,17 +2,27 @@
 #define _SYNCMER_H_
 
 #include <concepts>
+#include <cstdint>
 #include <limits>
-
+#define KOMIHASH_NS_CUSTOM komihash
+#include <komihash.h>
 namespace syncmer {
 template <class Rule>
 concept SyncmerRule = requires(Rule k) {
     { k(unsigned{}) } -> std::same_as<bool>;
 };
-template <class HF>
+template <class HF, class INT_TYPE>
 concept HashFunction = requires(HF h) {
-    { HF{unsigned{}} } -> std::same_as<HF>;
-    { h(unsigned{}) } -> std::same_as<unsigned>;
+    { HF{INT_TYPE{}} } -> std::same_as<HF>;
+    { h(INT_TYPE{}) } -> std::same_as<INT_TYPE>;
+};
+
+struct Komi{
+    uint64_t seed;
+    Komi(uint64_t seed) : seed {seed} {}
+    uint64_t operator () (uint64_t val) const {
+        return komihash::komihash(&val, sizeof(uint64_t), seed);
+    }
 };
 // uint32_t MurmurHash3_32(const void *key, int len, uint32_t seed);
 struct MurMur {
@@ -85,7 +95,7 @@ struct Identity{
         return value;
     }
 };
-template <class INT_TYPE, HashFunction HASH_FUNCTION>
+template <class INT_TYPE, HashFunction<INT_TYPE> HASH_FUNCTION>
 struct DensitySyncmerRule {
     double density;
     double threshold;

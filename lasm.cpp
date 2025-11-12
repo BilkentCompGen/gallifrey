@@ -33,7 +33,7 @@ int asm_program(CLI::App &parent) {
         ->capture_default_str();
     app.add_option("-@,--io-threads", p->threads.io, "Number of IO threads")
         ->capture_default_str();
-    app.add_option("--random-seed", p->random_seed, "Random seed")
+    app.add_option("--random-seed", p->seed, "Random seed")
         ->capture_default_str();
     app.add_option("--density", p->syncmer.param.density,
                    "Density of selected k-mers")
@@ -167,11 +167,8 @@ int sam_read_testing(CLI::App &parent) {
 
 int tests(int argc, char **argv) {
     doctest::Context context;
-
-    context.addFilter("test-case-exclude", "*math*");
     context.setOption("abort-after", 5);
     context.setOption("order-by", "name");
-
     context.applyCommandLine(argc, argv);
 
     // overrides
@@ -180,12 +177,7 @@ int tests(int argc, char **argv) {
     int res = context.run();
 
     if (context.shouldExit()) return res;
-
-    int client_stuff_return_code = 0;
-    // your program - if the testing framework is integrated in your production
-    // code
-
-    return res + client_stuff_return_code;
+    return res;
 }
 
 int main(int argc, char **argv) {

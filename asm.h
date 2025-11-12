@@ -14,7 +14,7 @@ struct asm_config {
         int io = 4;
         int work = 8;
     } threads;
-    size_t random_seed = 1453;
+    size_t seed = 1453;
     struct {
         int k;
         union param {
@@ -33,7 +33,7 @@ struct asm_config {
         int iterations = 2;
         int max_tip_length = LCMER_L * 2;
         int min_bubble_length_difference = 2;
-        double min_bubble_depth_difference_percentage = 0.6;
+        double min_bubble_depth_difference_percentage = 2;
     } graph_cleaning;
 };
 

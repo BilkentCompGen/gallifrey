@@ -230,7 +230,7 @@ TEST_CASE("K-mer view on Crumbs") {
     gtl::vector<uint8_t> bytes{{0, 1, 2, 3, 0, 1, 2, 3}};
     SUBCASE("K==4") {
         static constexpr int K = 4;
-        KmerViewOnCrumbs<K, uint32_t, 2> kview;
+        KmerViewOnCrumbs<K, uint64_t, 2> kview;
         size_t i = kview.fill(bytes.data());
         uint32_t expected =
             bytes[0] << 6 | bytes[1] << 4 | bytes[2] << 2 | bytes[3];
@@ -244,7 +244,7 @@ TEST_CASE("K-mer view on Crumbs") {
     }
     SUBCASE("K==5") {
         static constexpr int K = 5;
-        KmerViewOnCrumbs<K, uint32_t, 2> kview;
+        KmerViewOnCrumbs<K, uint64_t, 2> kview;
         size_t i = kview.fill(bytes.data());
         uint32_t expected = bytes[0] << 8 | bytes[1] << 6 | bytes[2] << 4 |
                             bytes[3] << 2 | bytes[4];

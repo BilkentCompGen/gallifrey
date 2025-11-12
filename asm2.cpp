@@ -1,5 +1,6 @@
 
 #include <concurrentqueue.h>
+#include <fcntl.h>
 #include <htslib/bgzf.h>
 #include <htslib/hfile.h>
 #include <htslib/hts.h>
@@ -16,6 +17,7 @@
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <string>
 
@@ -27,6 +29,7 @@
 #include "lcmer.h"
 #include "lcptools/lcptools_ho.h"
 #include "nibble2base.hpp"
+#include "savebuffer_bh.h"
 #include "syncmer.h"
 
 using u64 = uint64_t;
@@ -58,6 +61,9 @@ struct dbg_index {
         }
 #endif
 #endif
+        constexpr double avg_core_count() const {
+            return (double)cc / seq.size();
+        }
     };
     using dbg_map_t = gtl::parallel_flat_hash_map<
         u64, bidbg_val, std::hash<u64>, gtl::priv::hash_default_eq<u64>,
@@ -116,7 +122,8 @@ struct dbg_index {
         }
     }
     void simplify_graph(int max_iterations = 1, size_t max_tip_length = 5,
-                        size_t bubble_diff_eps = 2) {
+                        size_t bubble_diff_eps = 2, size_t min_core_depth = 3,
+                        double bubble_depth_epsilon = 2) {
         gtl::flat_hash_map<u64, u64> redirect_deleted;
         auto try_simplify_simple_path = [&](u64 id, auto current) -> bool {
             // Find a node we cannot simplify
@@ -130,6 +137,7 @@ struct dbg_index {
             bool simplified = false;
             auto prev_it = dbg.find(current->second.prev[0]);
             gtl::vector<bam_nibble_data> merged;
+            unsigned cc_sum = 0;
             while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
                    prev_it->second.fec == 1) {
                 if (prev_it != dbg.end()) {
@@ -137,6 +145,7 @@ struct dbg_index {
                          it != current->second.seq.end(); ++it) {
                         merged.emplace_back(std::move(*it));
                     }
+                    cc_sum += current->second.cc;
                     dbg.erase(current->first);
                     simplified = true;
                 } else {  // Prev is erased
@@ -153,6 +162,7 @@ struct dbg_index {
             }
 
             current->second.fec = first_fec;
+            current->second.cc += cc_sum;
             for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
                 current->second.seq.emplace_back(std::move(*it));
             }
@@ -194,91 +204,166 @@ struct dbg_index {
                 // merge_map.emplace(dn.second, node.prev[0], prev_node)
             }
             for (auto &node : dbg) {
+                size_t idx = 0;
+                int self_idx = -1;
                 for (auto &p : node.second.prev) {
                     auto it = redirect_deleted.find(p);
                     if (it != redirect_deleted.end()) {
                         p = it->second;
+                    } else if (p == node.first) {  // Self edge
+                        node.second.fec--;
+                        self_idx = idx;
                     }
+                    ++idx;
+                }
+                if (self_idx != -1) {
+                    node.second.prev.erase(node.second.prev.begin() + self_idx);
                 }
             }
 
             // Tips
-
             for (auto &dn : lci) {
                 auto current = dbg.find(dn.second.id);
                 if (current == dbg.end()) {
                     dn.second.pos = -1;
                     continue;
                 }
+                if (current->second.avg_core_count() < min_core_depth) {
+                    // Forlorn
+                    if (current->second.fec == 0 &&
+                        current->second.prev.size() == 0) {
+                        dbg.erase(current);
+                    } else if (current->second.fec == 0 &&
+                               current->second.prev.size() == 1) {
+                        auto prev_it = dbg.find(current->second.prev[0]);
+                        if (prev_it != dbg.end()) {
+                            prev_it->second.fec--;
+                        }
+                        dbg.erase(current);
+                    }
+                    // else if (current->second.fec == 1 &&
+                    //            current->second.prev.size() == 0) {
+                    //     dbg.erase(current);
+                    // }
+                } else {
+                    for (u64 &pid : current->second.prev) {
+                        auto prev_it = dbg.find(pid);
+                        if (prev_it != dbg.end()) {
+                            if (prev_it->second.avg_core_count() <
+                                    min_core_depth &&
+                                prev_it->second.prev.size() == 0 &&
+                                prev_it->second.fec == 1) {
+                                dbg.erase(prev_it);
+                                pid = std::numeric_limits<u64>::max();
+                            }
+                        }
+                    }
+                    auto &pvec = current->second.prev;
+                    pvec.erase(std::remove_if(
+                                   pvec.begin(), pvec.end(),
+                                   [](u64 val) {
+                                       return val ==
+                                              std::numeric_limits<u64>::max();
+                                   }),
+                               pvec.end());
+                    for (u64 &pid : current->second.prev) {
+                        auto prev_it = dbg.find(pid);
+                        if (prev_it != dbg.end()) {
+                            if (prev_it->second.avg_core_count() <
+                                    current->second.avg_core_count() &&
+                                prev_it->second.seq.size() < max_tip_length &&
+                                current->second.seq.size() >
+                                    2 * max_tip_length &&
+                                prev_it->second.prev.size() == 0 &&
+                                prev_it->second.fec == 1) {
+                                dbg.erase(prev_it);
+                                pid = std::numeric_limits<u64>::max();
+                            }
+                        }
+                    }
+                    pvec.erase(std::remove_if(
+                                   pvec.begin(), pvec.end(),
+                                   [](u64 val) {
+                                       return val ==
+                                              std::numeric_limits<u64>::max();
+                                   }),
+                               pvec.end());
+                }
                 // We have non-zero forward edges, and more than one prev
                 // edges
-                if (current->second.fec > 0 &&
-                    current->second.prev.size() > 0) {
-                    // Check if one of the prev edges is not terminating
-                    bool non_terminating_exists = false;
-                    size_t min_edge_len = INT_MAX;
-                    size_t max_edge_len = INT_MIN;
-                    for (auto &prev_id : current->second.prev) {
-                        auto prev_it = dbg.find(prev_id);
-                        if (prev_it == dbg.end()) {
-                            continue;
-                        }
-                        if (prev_it->second.prev.size() > 0) {
-                            non_terminating_exists = true;
-                        }
-                        min_edge_len =
-                            std::min(min_edge_len, prev_it->second.seq.size());
-                        max_edge_len =
-                            std::max(max_edge_len, prev_it->second.seq.size());
-                    }
-                    // Remove every tip if non_terminating_exists
+                // if (current->second.fec > 0 &&
+                //     current->second.prev.size() > 0) {
+                //     // Check if one of the prev edges is not terminating
+                //     bool non_terminating_exists = false;
+                //     size_t min_edge_len = INT_MAX;
+                //     size_t max_edge_len = INT_MIN;
+                //     for (auto &prev_id : current->second.prev) {
+                //         auto prev_it = dbg.find(prev_id);
+                //         if (prev_it == dbg.end()) {
+                //             continue;
+                //         }
+                //         if (prev_it->second.prev.size() > 0) {
+                //             non_terminating_exists = true;
+                //         }
+                //         min_edge_len =
+                //             std::min(min_edge_len,
+                //             prev_it->second.seq.size());
+                //         max_edge_len =
+                //             std::max(max_edge_len,
+                //             prev_it->second.seq.size());
+                //     }
+                //     // Remove every tip if non_terminating_exists
 
-                    if (non_terminating_exists) {
-                        for (auto &prev_id : current->second.prev) {
-                            auto prev_it = dbg.find(prev_id);
-                            if (prev_it == dbg.end()) {
-                                // delete from prev
-                                current->second.prev.erase(
-                                    std::remove(current->second.prev.begin(),
-                                                current->second.prev.end(),
-                                                prev_id),
-                                    current->second.prev.end());
-                                continue;
-                            }
-                            if (prev_it->second.prev.size() == 0 &&
-                                prev_it->second.fec == 1 &&
-                                prev_it->second.seq.size() < max_tip_length) {
-                                // Erase the node from the current->second.prev
-                                current->second.prev.erase(
-                                    std::remove(current->second.prev.begin(),
-                                                current->second.prev.end(),
-                                                prev_id),
-                                    current->second.prev.end());
-                                dbg.erase(prev_it);
-                            }
-                        }
-                    } else if (max_edge_len - min_edge_len > max_tip_length) {
-                        for (auto &prev_id : current->second.prev) {
-                            auto prev_it = dbg.find(prev_id);
-                            if (prev_it == dbg.end()) {
-                                continue;
-                            }
-                            if (prev_it->second.prev.size() == 0 &&
-                                prev_it->second.fec == 1 &&
-                                prev_it->second.seq.size() <
-                                    max_tip_length - max_tip_length) {
-                                // Erase the node from the current->second.prev
+                //     if (non_terminating_exists) {
+                //         for (auto &prev_id : current->second.prev) {
+                //             auto prev_it = dbg.find(prev_id);
+                //             if (prev_it == dbg.end()) {
+                //                 // delete from prev
+                //                 current->second.prev.erase(
+                //                     std::remove(current->second.prev.begin(),
+                //                                 current->second.prev.end(),
+                //                                 prev_id),
+                //                     current->second.prev.end());
+                //                 continue;
+                //             }
+                //             if (prev_it->second.prev.size() == 0 &&
+                //                 prev_it->second.fec == 1 &&
+                //                 prev_it->second.seq.size() < max_tip_length)
+                //                 {
+                //                 // Erase the node from the
+                //                 current->second.prev
+                //                 current->second.prev.erase(
+                //                     std::remove(current->second.prev.begin(),
+                //                                 current->second.prev.end(),
+                //                                 prev_id),
+                //                     current->second.prev.end());
+                //                 dbg.erase(prev_it);
+                //             }
+                //         }
+                //     } else if (max_edge_len - min_edge_len > max_tip_length)
+                //     {
+                //         for (auto &prev_id : current->second.prev) {
+                //             auto prev_it = dbg.find(prev_id);
+                //             if (prev_it == dbg.end()) {
+                //                 continue;
+                //             }
+                //             if (prev_it->second.prev.size() == 0 &&
+                //                 prev_it->second.fec == 1 &&
+                //                 prev_it->second.seq.size() <
+                //                     max_tip_length - max_tip_length) {
+                //                 // Erase the node from the
+                //                 current->second.prev
 
-                                current->second.prev.erase(
-                                    std::remove(current->second.prev.begin(),
-                                                current->second.prev.end(),
-                                                prev_id),
-                                    current->second.prev.end());
-                                dbg.erase(prev_it);
-                            }
-                        }
-                    }
-                }
+                //                 current->second.prev.erase(
+                //                     std::remove(current->second.prev.begin(),
+                //                                 current->second.prev.end(),
+                //                                 prev_id),
+                //                     current->second.prev.end());
+                //                 dbg.erase(prev_it);
+                //             }
+                //         }
+                //     }
+                // }
             }
 
             // Buubles
@@ -298,8 +383,9 @@ struct dbg_index {
                             p2->second.prev.size() == 1) {
                             if (p1->second.prev[0] == p2->second.prev[0]) {
                                 // BUBBLE FOUND
-                                if (p1->second.cc - p2->second.cc >
-                                    bubble_diff_eps) {
+                                if (p2->second.avg_core_count() /
+                                        p1->second.avg_core_count() <
+                                    bubble_depth_epsilon) {
                                     // Remove p2
                                     dbg.erase(p2);
                                     current->second.prev.pop_back();
@@ -307,9 +393,9 @@ struct dbg_index {
                                     if (nn != dbg.end()) {
                                         nn->second.fec--;
                                     }
-
-                                } else if (-p1->second.cc + p2->second.cc <
-                                           bubble_diff_eps) {
+                                } else if (p1->second.avg_core_count() /
+                                               p2->second.avg_core_count() <
+                                           bubble_depth_epsilon) {
                                     // Remove p1
                                     dbg.erase(p1);
                                     current->second.prev[0] =
@@ -325,10 +411,41 @@ struct dbg_index {
                     }
                 }
             }
-
+            // Death by thousand cuts
+            for (auto &dn : lci) {
+                auto current = dbg.find(dn.second.id);
+                if (current == dbg.end()) {
+                    continue;
+                }
+                if (current->second.avg_core_count() < 2 &&
+                    current->second.prev.size() == 1 &&
+                    current->second.fec == 1) {
+                    auto prev_it = dbg.find(current->second.prev[0]);
+                    if (prev_it != dbg.end()) prev_it->second.fec--;
+                    dbg.erase(current);
+                }
+            }
+            for (auto &node : dbg) {
+                auto &pvec = node.second.prev;
+                for (auto it = pvec.begin(); it != pvec.end(); ++it) {
+                    if (dbg.find(*it) == dbg.end()) {
+                        *it = std::numeric_limits<u64>::max();
+                    }
+                }
+                pvec.erase(
+                    std::remove_if(pvec.begin(), pvec.end(),
+                                   [](u64 val) {
+                                       return val ==
+                                              std::numeric_limits<u64>::max();
+                                   }),
+                    pvec.end());
+            }
             redirect_deleted.clear();
         }
 
+        erase_if(lci, [](const auto &node) {
+            return node.second.pos == std::numeric_limits<u64>::max();
+        });
         // // Remove bubbles and tips
         // for (auto &node : dbg) {
         //     if (node.second.prev.size() == 2) {  // can be simplified.
@@ -375,38 +492,34 @@ struct dbg_index {
 struct assembler {
     string input;
     string output;
-    struct {
-        int io;
-        int work;
-    } threads;
-
+    decltype(asm_config::threads) threads;
     int lcp_level;
     double density;
-    uint64_t projected_count;
-    double false_positive_rate;
-    uint64_t random_seed;
+    decltype(asm_config::bloom) bloom;
+    uint64_t seed;
     using SYNCMER_HASHER = syncmer::MurMur;
     syncmer::DensitySyncmerRule<uint32_t, SYNCMER_HASHER> syncmer_functor;
     assembler(const asm_config &cfg)
         : input{cfg.input},
           output{cfg.output},
-          threads{cfg.threads.io, cfg.threads.work},
+          threads{cfg.threads},
           lcp_level{cfg.lcp_level},
           density{cfg.syncmer.param.density},
-          projected_count{cfg.bloom.projected_count},
-          false_positive_rate{cfg.bloom.false_positive_rate},
-          random_seed{cfg.random_seed},
-          syncmer_functor{density, static_cast<unsigned int>(random_seed)} {}
-    static inline void insert_lcmer_helper(const gtl::vector<uint64_t> &ll,
-                                           const uint32_t &i, dbg_index &dbgi) {
+          bloom{cfg.bloom},
+          seed{cfg.seed},
+          syncmer_functor{density, static_cast<unsigned int>(seed)} {}
+
+    static inline auto insert_lcmer_helper(const gtl::vector<uint64_t> &ll,
+                                           const uint32_t &i, dbg_index &dbgi)
+        -> bool {
         if (ll[i] == 0) {
-            return;
+            return false;
         }
         if (ll[i - 1] == 0) {
             if (ll[i + 1] == 0) {
-                return;
+                return false;
             } else {
-                dbgi.dbg.lazy_emplace_l(
+                return dbgi.dbg.lazy_emplace_l(
                     ll[i],
                     [&](dbg_index::dbg_map_t::value_type &val) {
                         val.second.cc++;
@@ -417,7 +530,7 @@ struct assembler {
             }
         } else {
             if (ll[i + 1] == 0) {
-                dbgi.dbg.lazy_emplace_l(
+                return dbgi.dbg.lazy_emplace_l(
                     ll[i],
                     [&](dbg_index::dbg_map_t::value_type &val) {
                         val.second.emplace_prev(ll[i - 1]);
@@ -427,7 +540,7 @@ struct assembler {
                         ctr(ll[i], dbg_index::bidbg_val{0, 0, {}, {ll[i - 1]}});
                     });
             } else {
-                dbgi.dbg.lazy_emplace_l(
+                return dbgi.dbg.lazy_emplace_l(
                     ll[i],
                     [&](dbg_index::dbg_map_t::value_type &val) {
                         val.second.emplace_prev(ll[i - 1]);
@@ -454,7 +567,11 @@ struct assembler {
         ll.push_back(0);
 
         for (size_t i = 1; i < ll.size() - 1; ++i) {
-            insert_lcmer_helper(ll, i, dbgi);
+            if (insert_lcmer_helper(ll, i, dbgi)) {
+                dbgi.dbg[ll[i]].seq.emplace_back(lr.data,
+                                                 lr.pos[i + LCMER_L - 1].second,
+                                                 lr.pos[i + LCMER_L].second);
+            }
         }
     }
     static void process_cores_for_basespace(
@@ -568,6 +685,7 @@ struct assembler {
     auto generate_data(const std::string &input, dqt &data_queue,
                        dqt &recycle_queue, int threads) {
         samFile *fp = sam_open(input.c_str(), "r");
+
         if (!fp) {
             std::cerr << "Error: Could not open " << input << std::endl;
             return;
@@ -613,7 +731,7 @@ struct assembler {
         dqt recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
         std::atomic<bool> done{false};
 
-        dbg_index dbgi{false_positive_rate, projected_count, random_seed};
+        dbg_index dbgi{bloom.false_positive_rate, bloom.projected_count, seed};
 
         gtl::vector<std::thread> workers;
 
@@ -731,8 +849,10 @@ void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
 
         //        __builtin_debugtrap();
         if (edges.seq.size() == 0) {
-            fprintf(out, "S\tC%" PRIu64 "\t%s\tLN:i:%d\tRC:i:%lu\n", lval, "",
-                    0, edges.cc + edges.prev.size());
+            fprintf(out,
+                    "S\tC%" PRIu64
+                    "\t%s\tLN:i:%d\tRC:i:%u\tBE:i:%zu\tFE:i:%u\\n",
+                    lval, "", 0, edges.cc, edges.prev.size(), edges.fec);
         } else {
             //            int i = onehotto2bitDNA2(s, buffer);
             fprintf(out, "S\tC%" PRIu64 "\t", lval);
@@ -746,8 +866,9 @@ void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
                 fprintf(out, "%s", buf.data + (buf.data[0] == 'N' ? 1 : 0));
                 sofar += s.len;
             }
-            fprintf(out, "\tLN:i:%zu\tRC:i:%lu\n", sofar,
-                    edges.cc + edges.prev.size());
+            fprintf(out, "\tLN:i:%zu\tRC:i:%d\tCC:i:%u\tBE:i:%zu\tFE:i:%u\n",
+                    sofar, (int)(edges.avg_core_count() * sofar), edges.cc,
+                    edges.prev.size(), edges.fec);
         }
 
         for (uint64_t nl : edges.prev) {
@@ -781,7 +902,8 @@ void print_dbg_dot(const dbg_index &dbgi, int i) {
             fprintf(dot_file,
                     "\t%" PRIu64 " [label=\"%" PRIu64 "->%u,%zu,%zu,%d\"];\n",
                     node.first, node.first, node.second.fec,
-                    node.second.prev.size(), node.second.seq.size(), node.second.cc);
+                    node.second.prev.size(), node.second.seq.size(),
+                    node.second.cc);
             for (auto &prev : node.second.prev) {
                 fprintf(dot_file, "\t%" PRIu64 " -> %" PRIu64 ";\n", prev,
                         node.first);
@@ -809,12 +931,13 @@ int run_assembly(const asm_config &cfg) {
     dbg.count_forward_edges();
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Count forward edges done.");
 
-    as.convert2basespace(dbg);
-    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Converting to basespace done.");
+    // as.convert2basespace(dbg);
+    // TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Converting to basespace done.");
 
-    dbg.simplify_graph(cfg.graph_cleaning.iterations,
-                       cfg.graph_cleaning.max_tip_length,
-                       cfg.graph_cleaning.min_bubble_length_difference);
+    dbg.simplify_graph(
+        cfg.graph_cleaning.iterations, cfg.graph_cleaning.max_tip_length,
+        cfg.graph_cleaning.min_bubble_length_difference, 3,
+        cfg.graph_cleaning.min_bubble_depth_difference_percentage);
     TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Simplify graph done.");
 
     FILE *out = fopen(cfg.output.c_str(), "w");
@@ -872,7 +995,9 @@ TEST_CASE("Graph simplification simple") {
     }
 
     tests_mock_fill_seq(dbgi);
-
+    for (auto &n : dbgi.dbg) {  // Main Path has 10X depth
+        n.second.cc *= 10;
+    }
     dbgi.count_forward_edges();
     dbgi.simplify_graph(1);
     SUBCASE("Post simplify dbg") {
@@ -943,7 +1068,9 @@ TEST_CASE("Graph simplification Bubble") {
     }
 
     dbgi.count_forward_edges();
-
+    for (auto &n : dbgi.dbg) {  // Main Path has 10X depth
+        n.second.cc *= 10;
+    }
     tests_mock_fill_seq(dbgi);
     print_dbg_dot(dbgi, 0);
 
@@ -992,7 +1119,9 @@ TEST_CASE("Graph simplification Tips (Outgoing)") {
     for (size_t i = 1; i <= ll.size() - 1; i++) {
         assembler::insert_lcmer_helper(ll, i, dbgi);
     }
-
+    for (auto &n : dbgi.dbg) {  // Main Path has 10X depth
+        n.second.cc *= 10;
+    }
     ll.clear();
     mock_cores[12] = 123123123;
     l = lcmer<LCMER_L>(mock_cores.begin());
@@ -1013,16 +1142,25 @@ TEST_CASE("Graph simplification Tips (Outgoing)") {
     tests_mock_fill_seq(dbgi);
     print_dbg_dot(dbgi, 3);
 
+    dbgi.simplify_graph(1);
     SUBCASE("Post simplify dbg") {
-        dbgi.simplify_graph(1);
         for (auto &node : dbgi.dbg) {
             INFO(node.first, "\t.\t.\t", node.second.seq.size());
         }
         CAPTURE(dbgi.dbg.size());
         CHECK(dbgi.dbg.size() == 2);
     }
-
     print_dbg_dot(dbgi, 4);
+
+    dbgi.simplify_graph(1);
+    SUBCASE("Post simplify dbg") {
+        for (auto &node : dbgi.dbg) {
+            INFO(node.first, "\t.\t.\t", node.second.seq.size());
+        }
+        CAPTURE(dbgi.dbg.size());
+        CHECK(dbgi.dbg.size() == 1);
+    }
+    print_dbg_dot(dbgi, 5);
 }
 TEST_CASE("Graph simplification Tips (Incoming)") {
     dbg_index dbgi{0.95, 10, 0};
@@ -1072,7 +1210,7 @@ TEST_CASE("Graph simplification Tips (Incoming)") {
     dbgi.count_forward_edges();
 
     tests_mock_fill_seq(dbgi);
-    print_dbg_dot(dbgi, 5);
+    print_dbg_dot(dbgi, 6);
 
     SUBCASE("Post simplify dbg") {
         dbgi.simplify_graph(2);
@@ -1083,5 +1221,5 @@ TEST_CASE("Graph simplification Tips (Incoming)") {
         CHECK(dbgi.dbg.size() == 2);
     }
 
-    print_dbg_dot(dbgi, 6);
+    print_dbg_dot(dbgi, 7);
 }

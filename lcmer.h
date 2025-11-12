@@ -321,7 +321,7 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
                                     struct lps *str,
                                     const auto &syncmer_functor) {
     int core_index = 0;
-    KmerViewOnCrumbs<SYNCMER_K, uint32_t, 2> kmer_view;
+    KmerViewOnCrumbs<SYNCMER_K, uint64_t, 2> kmer_view;
     int64_t it1 = kmer_view.fill(data);
     // find lcp cores
     // if(str->capacity < )

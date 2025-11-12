@@ -108,6 +108,12 @@ struct BlockedBloomFilter
         return static_cast<int>(-std::log2(epsilon) + 0.5);
     }
 
+    const uint8_t *GetBlock(uint32_t h1, uint32_t ) const
+    {
+        uint32_t block_idx = h1 % num_blocks;
+        uint32_t byte_idx = block_idx * CACHE_LINE_BYTES;
+        return bv.data() + byte_idx;
+    }
     uint8_t *GetBlock(uint32_t h1, uint32_t )
     {
         uint32_t block_idx = h1 % num_blocks;
@@ -127,10 +133,10 @@ struct BlockedBloomFilter
         }
     }
 
-    bool Query(uint32_t h1, uint32_t h2)
+    bool Query(uint32_t h1, uint32_t h2) const
     {
         bool result = true;
-        uint8_t *block = GetBlock(h1, h2);
+        const uint8_t *block = GetBlock(h1, h2);
         for(int i = 1; i < k; i++)
         {
             uint32_t bit_pos = (h1 + i * h2) % CACHE_LINE_BITS;
