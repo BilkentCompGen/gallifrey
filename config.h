@@ -29,6 +29,14 @@
 #define BAMREAD_CHUNK_SIZE 256ULL
 #endif
 
+#ifndef WAIT_QUEUE_TIMEOUT_MS
+#define WAIT_QUEUE_TIMEOUT_MS 2
+#endif
+
+#ifndef WAIT_QUEUE_TIMEOUT
+#define WAIT_QUEUE_TIMEOUT std::chrono::milliseconds(WAIT_QUEUE_TIMEOUT_MS)
+#endif
+
 #define INIT_TIMERS(name) \
     std::chrono::high_resolution_clock::time_point name##_chrono_start = std::chrono::high_resolution_clock::now(); \
     std::chrono::high_resolution_clock::time_point name##_last_checkpoint = name##_chrono_start; \

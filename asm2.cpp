@@ -1,5 +1,6 @@
 
-#include <concurrentqueue.h>
+// #include <concurrentqueue.h>
+#include <blockingconcurrentqueue.h>
 #include <fcntl.h>
 #include <htslib/bgzf.h>
 #include <htslib/hfile.h>
@@ -617,7 +618,7 @@ struct assembler {
         return {8, threads - 8};
     }
     using cqt = moodycamel::ConcurrentQueue<Chunk>;
-    using dqt = moodycamel::ConcurrentQueue<bam1_t *>;
+    using dqt = moodycamel::BlockingConcurrentQueue<bam1_t *>;
 
     // static auto process_data_from_chunks(int thread_id, int lcp_level,
     //                                      string filename, cqt &chunk_queue,
@@ -637,7 +638,9 @@ struct assembler {
         lps str = {0, 0, 0, 0};
         charsi chs;
         while (true) {
-            if (!data_queue.try_dequeue(data_p)) {
+
+            if (!data_queue.wait_dequeue_timed(data_p, WAIT_QUEUE_TIMEOUT)) {
+            //if (!data_queue.try_dequeue(data_p)) {
                 if (done.load()) {
                     break;
                 }
