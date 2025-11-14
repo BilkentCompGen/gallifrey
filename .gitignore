@@ -14,5 +14,5 @@ target_cxxabi.h.gch
 target_compile_features.cmake
 *.bam
 *.json
-build/*
+build*/*
 *.idx
