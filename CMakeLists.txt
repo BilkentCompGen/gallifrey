@@ -12,7 +12,7 @@ endif()
 enable_testing()
 # Compiler flags
 # Debug flags
-set(CMAKE_CXX_FLAGS_DEBUG "-g -pg -O0 -DDEBUG -Wall -Wextra -Wpedantic")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -pg -O0 -DDEBUG -Wall -Wextra -Wpedantic -fsanitize=undefined,null,bounds -fsanitize-trap=all")
 # Release flags
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -pg -march=native -ftree-vectorize -DNDEBUG -Wall -Wextra -Wpedantic")
 # RelWithDebInfo flags
@@ -20,6 +20,15 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG -Wall -Wextra")
 # MinSizeRel flags
 set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG")
 
+if(PGO_GENERATE)
+    message(STATUS "Building with PGO instrumentation")
+    add_compile_options(-fprofile-generate)
+    add_link_options(-fprofile-generate)
+endif()
+if(PGO_USE)
+    add_compile_options(-fprofile-use=${PROFILE_DATA_FILE} -fprofile-correction)
+    add_link_options(-fprofile-use=${PROFILE_DATA_FILE})
+endif()
 # Set linker flags for release builds
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -no-pie")
