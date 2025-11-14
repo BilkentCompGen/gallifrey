@@ -9,20 +9,8 @@
 #define SYNCMER_K 8
 #endif
 
-#ifndef SYNCMER_S
-#define SYNCMER_S 1
-#endif
-
-#ifndef SYNCMER_T
-#define SYNCMER_T 20
-#endif
-
 #ifndef SYNCMER_RULE
 #define SYNCMER_RULE DensitySyncmerRule
-#endif
-
-#ifndef KMER_SPACE_MASK
-#define KMER_SPACE_MASK 0xFFFFFFFFFFFFFFFF
 #endif
 
 #ifndef BAMREAD_CHUNK_SIZE

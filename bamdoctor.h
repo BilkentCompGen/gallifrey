@@ -20,7 +20,7 @@ enum class SamReadTestingMode {
     POOL,
 };
 
-inline int run_sam_read_testing(const std::string &input, int threads, int lcp_level, SamReadTestingMode mode, const std::string &job_type){
+inline int run_sam_read_testing(const std::string &input, int threads, int lcp_level, SamReadTestingMode mode, const std::string &job_type, double density){
     INIT_TIMERS(BAM_READING);
     //Explain the program nicely formatted brief
     printf("Input: %s\n", input.c_str());
@@ -67,7 +67,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     gtl::vector<std::thread> workers;
     std::atomic<bool> done{false};
     int counts[1024] = {0};
-    syncmer::DensitySyncmerRule<uint32_t, syncmer::MurMur> sr{double{SYNCMER_S}/SYNCMER_T, 423};
+    syncmer::DensitySyncmerRule<uint32_t, syncmer::MurMur> sr{density, 423, static_cast<unsigned int>(-1)};
     charsi chs;
     auto job = [&]() -> std::function<int(bam1_t *, lps *)> {
         if (job_type == "read_count"){

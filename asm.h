@@ -24,6 +24,7 @@ struct asm_config {
                 int t;
             } mincode;
         } param;
+        std::string spaced_seed_mask = "11111111111111111111111111111111";
     } syncmer;
     struct {
         uint64_t projected_count = 100'000'000;

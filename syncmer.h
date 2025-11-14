@@ -101,13 +101,14 @@ struct DensitySyncmerRule {
     double threshold;
     INT_TYPE seed;
     HASH_FUNCTION hf;
-    DensitySyncmerRule(double density, INT_TYPE seed)
+    INT_TYPE mask;
+    DensitySyncmerRule(double density, INT_TYPE seed, INT_TYPE mask)
         : density{density},
           threshold{std::numeric_limits<INT_TYPE>::max() * density},
           seed{seed},
-          hf{seed} {}
+          hf{seed}, mask{mask} {}
     constexpr bool operator()(INT_TYPE val) const {
-        return hf(val) < threshold;
+        return hf(val & mask) < threshold;
     }
 };
 }  // namespace syncmer

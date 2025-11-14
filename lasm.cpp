@@ -35,6 +35,9 @@ int asm_program(CLI::App &parent) {
         ->capture_default_str();
     app.add_option("--random-seed", p->seed, "Random seed")
         ->capture_default_str();
+    app.add_option("--spaced-seed-mask", p->syncmer.spaced_seed_mask,
+                   "Mask for spaced seeding. (0->skip, 1->keep, 2->mask left bit, 3->mask right bit.")
+        ->capture_default_str();
     app.add_option("--density", p->syncmer.param.density,
                    "Density of selected k-mers")
         ->capture_default_str();
@@ -79,8 +82,9 @@ void stats_program(CLI::App &parent) {
         string input_file;
         int update_frequency;
         int lcmer_level;
+        double density;
     };
-    parameters *params = new parameters{"", 100, 5};
+    parameters *params = new parameters{"", 100, 5, 0.01};
     app.add_option("input", params->input_file, "Input bam file")->required();
     app.add_option("--update-frequency", params->update_frequency,
                    "Update frequency")
@@ -88,10 +92,12 @@ void stats_program(CLI::App &parent) {
     app.add_option("-l,--level", params->lcmer_level,
                    "Depth of lcmers to be computed")
         ->capture_default_str();
+    app.add_option("--density", params->density,
+                   "Density of selected k-mers")->required();
 
     app.callback([=]() {
         int ret = run_stats(params->input_file, params->update_frequency,
-                            params->lcmer_level);
+                            params->lcmer_level, params->density);
         delete params;
         return ret;
     });
@@ -127,16 +133,19 @@ int sam_read_testing(CLI::App &parent) {
         int threads;
         SamReadTestingMode mode;
         string job;
+        double density;
     };
     auto *app_ = parent.add_subcommand("bamdoctor", "read bam file fast");
     auto &app = *app_;
     parameters *p =
-        new parameters{"", 5, 8, SamReadTestingMode::BASIC, "read_count"};
+        new parameters{"", 5, 8, SamReadTestingMode::BASIC, "read_count", 0.01};
     app.add_option("input", p->input, "Input bam file")->required();
     app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
-        ->capture_default_str();
+        ->required();
     app.add_option("-t,--threads", p->threads, "Number of threads")
         ->capture_default_str();
+    app.add_option("--density", p->density,
+                   "Density of selected k-mers")->required();
 
     std::map<std::string, SamReadTestingMode> SamReadTestingMode_map = {
         {"basic", SamReadTestingMode::BASIC},
@@ -156,7 +165,7 @@ int sam_read_testing(CLI::App &parent) {
             CLI::CheckedTransformer(SamReadTestingMode_map, CLI::ignore_case));
     app.callback([=]() {
         int ret = run_sam_read_testing(p->input, p->threads, p->lcp_level,
-                                       p->mode, p->job);
+                                       p->mode, p->job, p->density);
         delete p;
         return ret;
     });

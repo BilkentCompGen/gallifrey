@@ -209,7 +209,7 @@ struct KmerViewOnCrumbs {
         value |= data_address[index];
 
         // value = value & KMER_SPACE_MASK;
-        return value;
+        return value ;
     }
 
     constexpr int_type get() const noexcept { return value; }
@@ -241,11 +241,10 @@ struct KmerViewOnNibbles {
         } else {
             value |= bam_seqi(data_address, index);
         }
-        value = value & KMER_SPACE_MASK;
         return value;
     }
 
-    constexpr int_type get() const noexcept { return value & KMER_SPACE_MASK; }
+    constexpr int_type get() const noexcept { return value; }
 };
 
 template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
@@ -262,6 +261,7 @@ struct KmerViewOnBytes {
         4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
         4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
         4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4};
+
     using int_type = INT_TYPE;
     static constexpr int k = _K;
     int_type value;
@@ -283,11 +283,10 @@ struct KmerViewOnBytes {
         } else {
             value |= data[index];
         }
-        value = value & KMER_SPACE_MASK;
-        return value;
+        return value ;
     }
 
-    constexpr int_type get() const noexcept { return value & KMER_SPACE_MASK; }
+    constexpr int_type get() const noexcept { return value ; }
 };
 
 void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,

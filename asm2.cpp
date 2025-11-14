@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <gtl/phmap.hpp>
@@ -508,8 +509,35 @@ struct assembler {
           density{cfg.syncmer.param.density},
           bloom{cfg.bloom},
           seed{cfg.seed},
-          syncmer_functor{density, static_cast<unsigned int>(seed)} {}
+          syncmer_functor{density, static_cast<unsigned int>(seed), static_cast<unsigned int>(compute_spaced_mask(cfg.syncmer.spaced_seed_mask))} {}
 
+    static  u64 compute_spaced_mask(const std::string &mask_str){
+        if(mask_str.size() > 32){
+            fprintf(stderr, "Error: mask string is too long %zu > 32\n", mask_str.size());
+            exit(EXIT_FAILURE);
+        }
+        u64 acc = -1;
+        for(char c : mask_str){
+            acc <<=2;
+            switch(c){
+                case '0':
+                    break;
+                case '1':
+                    acc |= 3;
+                    break;
+                case '2':
+                    acc |= 2;
+                    break;
+                case '3':
+                    acc |= 1;
+                    break;
+            }
+        }
+        if ((int64_t)acc != -1){
+            fprintf(stderr, "Using spaced seeds with mask %s built into 0x%" PRIX64 "!\n", mask_str.c_str(), acc );
+        }
+        return acc;
+    }
     static inline auto insert_lcmer_helper(const gtl::vector<uint64_t> &ll,
                                            const uint32_t &i, dbg_index &dbgi)
         -> bool {
@@ -638,9 +666,8 @@ struct assembler {
         lps str = {0, 0, 0, 0};
         charsi chs;
         while (true) {
-
             if (!data_queue.wait_dequeue_timed(data_p, WAIT_QUEUE_TIMEOUT)) {
-            //if (!data_queue.try_dequeue(data_p)) {
+                // if (!data_queue.try_dequeue(data_p)) {
                 if (done.load()) {
                     break;
                 }
