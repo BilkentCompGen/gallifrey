@@ -38,9 +38,17 @@ int asm_program(CLI::App &parent) {
     app.add_option("--spaced-seed-mask", p->syncmer.spaced_seed_mask,
                    "Mask for spaced seeding. (0->skip, 1->keep, 2->mask left bit, 3->mask right bit.")
         ->capture_default_str();
-    app.add_option("--density", p->syncmer.param.density,
-                   "Density of selected k-mers")
+    app.add_option("--syncmer-k", p->syncmer.k,
+                   "K-mer length")
         ->capture_default_str();
+    app.add_option("--density", p->syncmer.density,
+                   "Density of selected k-mers")->expected(0.0F,1.0F);
+    app.add_option("--submer-s", p->syncmer.mincode.s,
+                   "Size of submers for mincode syncmers")
+        ->excludes("--density");
+    app.add_option("--submer-t", p->syncmer.mincode.t,
+                   "Position of submers for mincode syncmers (Closed syncmer if omitted)")
+        ->excludes("--density")->needs("--submer-s");
     auto bfg =
         app.add_option_group("bloomfilter", "Parameters to setup bloom filter");
     bfg->add_option("--projected-element-count", p->bloom.projected_count,

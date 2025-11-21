@@ -4,6 +4,9 @@
 #include <concepts>
 #include <cstdint>
 #include <limits>
+
+#include "asm.h"
+#include "gtl/vector.hpp"
 #define KOMIHASH_NS_CUSTOM komihash
 #include <komihash.h>
 namespace syncmer {
@@ -17,10 +20,10 @@ concept HashFunction = requires(HF h) {
     { h(INT_TYPE{}) } -> std::same_as<INT_TYPE>;
 };
 
-struct Komi{
+struct Komi {
     uint64_t seed;
-    Komi(uint64_t seed) : seed {seed} {}
-    uint64_t operator () (uint64_t val) const {
+    Komi(uint64_t seed) : seed{seed} {}
+    uint64_t operator()(uint64_t val) const {
         return komihash::komihash(&val, sizeof(uint64_t), seed);
     }
 };
@@ -88,29 +91,102 @@ struct MurMur {
         return MurmurHash3_32((const char *)&value, sizeof(value), seed);
     }
 };
-struct Identity{
+struct Identity {
     unsigned seed;
     Identity(unsigned seed) : seed{seed} {}
-    unsigned operator()(unsigned value) const {
-        return value;
-    }
+    unsigned operator()(unsigned value) const { return value; }
 };
 template <class INT_TYPE, HashFunction<INT_TYPE> HASH_FUNCTION>
 struct DensitySyncmerRule {
-    double density;
-    double threshold;
-    INT_TYPE seed;
+    using int_type = INT_TYPE;
+    syncmer_params cfg;
+    int_type seed;
     HASH_FUNCTION hf;
-    INT_TYPE mask;
-    DensitySyncmerRule(double density, INT_TYPE seed, INT_TYPE mask)
-        : density{density},
-          threshold{std::numeric_limits<INT_TYPE>::max() * density},
+    int_type mask;
+    constexpr int_type k() const { return cfg.k; }
+    constexpr double density() const { return cfg.density; }
+    constexpr int_type threshold () const { return density() * std::numeric_limits<int_type>::max(); }
+    DensitySyncmerRule(const syncmer_params &cfg, int_type seed)
+        : cfg{cfg},
           seed{seed},
-          hf{seed}, mask{mask} {}
-    constexpr bool operator()(INT_TYPE val) const {
-        return hf(val & mask) < threshold;
+          hf{seed},
+          mask{(int_type)cfg.compute_spaced_mask()} {}
+    DensitySyncmerRule(int_type k, double density, INT_TYPE seed, INT_TYPE mask)
+        : cfg{.k = k, .density=density},
+          seed{seed},
+          hf{seed},
+          mask{mask} {}
+    constexpr bool operator()(int_type val) const {
+        return hf(val & mask) < threshold();
     }
 };
+
+// Builds a LuT for the given syncmer rule should work fine for K <= 11, 12
+template <class INT_TYPE, HashFunction<INT_TYPE> HASH_FUNCTION>
+struct GenericSyncmerRule {
+    using int_type = INT_TYPE;
+    syncmer_params cfg;
+    int_type seed;
+    HASH_FUNCTION hf;
+    int_type s_mask;
+    int_type k_mask;
+    int64_t table_size;
+    gtl::vector<bool> table;
+
+    constexpr int_type k() const { return cfg.k; }
+    constexpr int_type s() const { return cfg.mincode.s; }
+    constexpr int_type t() const { return cfg.mincode.t; }
+    constexpr double density() const { return cfg.density; }
+    constexpr int_type threshold () const { return density() * std::numeric_limits<int_type>::max(); }
+    constexpr auto type() const -> syncmer_params::typeenum {
+        return cfg.type();
+    }
+    GenericSyncmerRule(const syncmer_params &cfg, int_type seed)
+        : cfg{cfg},
+          seed{seed},
+          hf{seed},
+          s_mask{(1U << s()) - 1U},
+          k_mask{(INT_TYPE)cfg.compute_spaced_mask()},
+          table_size{2 << (2 * k() - 1)},
+          table(table_size, 0) {
+        size_t tc = 0;
+        for (int i = 0; i < table_size; ++i) {
+            table[i] = is_syncmer(i & k_mask);
+            tc += table[i];
+        }
+        fprintf(stderr, "K-mer density: %lf\n", (double)tc / table_size);
+    }
+    constexpr bool operator()(int_type val) const { return table[val]; }
+    constexpr bool is_syncmer(int_type val) const {
+        switch (type()) {
+            case syncmer_params::typeenum::MinCodeClosed: // Intentional fallthrough
+            case syncmer_params::typeenum::MinCodeOpen: {
+                int_type min_index = -1;
+                int_type min_val = std::numeric_limits<int_type>::max();
+                for (int_type i = 0; i < k() - s(); ++i) {
+                    int_type masked_s = (val >> i) & s_mask;
+                    int_type hashed_s = hf(masked_s);
+                    if (hashed_s < min_val) {
+                        min_index = i;
+                        min_val = hashed_s;
+                    }
+                }
+                if (type() == syncmer_params::typeenum::MinCodeClosed) {
+                    return min_index == 0 || min_index == k() - s() - 1;
+                } else {
+                    return t() == min_index;
+                }
+            }
+            case syncmer_params::typeenum::Density: {
+                return hf(val & k_mask) < threshold();
+            }
+            case syncmer_params::typeenum::Invalid:
+                fprintf(stderr, "Invalid syncmer type\n");
+                exit(EXIT_FAILURE);
+        }
+    }
+};
+
 }  // namespace syncmer
 
 #endif

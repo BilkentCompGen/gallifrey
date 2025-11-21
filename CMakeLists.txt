@@ -16,7 +16,7 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g -pg -O0 -DDEBUG -Wall -Wextra -Wpedantic -fsanitiz
 # Release flags
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -pg -march=native -ftree-vectorize -DNDEBUG -Wall -Wextra -Wpedantic")
 # RelWithDebInfo flags
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG -Wall -Wextra")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG -Wall -Wextra -mtune=native -ftree-vectorize -march=native")
 # MinSizeRel flags
 set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG")
 

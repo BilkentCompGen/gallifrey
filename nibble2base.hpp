@@ -226,6 +226,9 @@ static __attribute__((constructor)) CPUType nibble2base_resolve(void) {
 }
 
 #endif
+#endif  // BUILDING_SIMD_NIBBLE2BASE
+
+
 
 struct bam_nibble_data {
     size_t len : 63;
@@ -265,5 +268,4 @@ struct bam_nibble_data {
         return buffer + len + (skip_first ? 1 : 0);
     }
 };
-#endif  // BUILDING_SIMD_NIBBLE2BASE
 #endif

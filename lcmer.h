@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <thread>
 #ifndef LCMER_H
 #define LCMER_H
@@ -94,6 +95,42 @@ struct lcp_read {
 
 template <int N>
 struct lcmer {
+    // static uint32_t MaskedMurmur3(const std::array<uint32_t, N> &key,
+    //                               uint32_t seed) {
+    //     //        const uint8_t *data = (const uint8_t *)key;
+
+    //     uint32_t h1 = seed;
+
+    //     const uint32_t c1 = 0xcc9e2d51;
+    //     const uint32_t c2 = 0x1b873593;
+
+    //     // Body: Process blocks of 4 bytes at a time
+    //     const uint32_t *blocks = key.data() + N;
+
+    //     for (int i = -N; i; i++) {
+    //         uint32_t k1 = lcmer<N>::mask[i + N] ? blocks[i] : 0;
+
+    //         k1 *= c1;
+    //         k1 = (k1 << 15) | (k1 >> (32 - 15));
+    //         k1 *= c2;
+
+    //         h1 ^= k1;
+    //         h1 = (h1 << 15) | (h1 >> (32 - 15));
+    //         h1 = h1 * 5 + 0xe6546b64;
+    //     }
+    //     // Finalization: Mix the hash to ensure the last few bits are fully
+    //     // mixed
+    //     // h1 ^= (N*4);
+
+    //     /* fmix32 */
+    //     h1 ^= h1 >> 16;
+    //     h1 *= 0x85ebca6b;
+    //     h1 ^= h1 >> 13;
+    //     h1 *= 0xc2b2ae35;
+    //     h1 ^= h1 >> 16;
+    //     return h1;
+    // }
+
     std::array<uint32_t, N> data;
 
     lcmer() {}
@@ -188,28 +225,28 @@ T reverse_complement_kmer(T kmer, int K) {
     return kmer;
 }
 
-template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
+template <typename INT_TYPE = uint32_t, INT_TYPE BIT_WIDTH = 2>
 struct KmerViewOnCrumbs {
     using int_type = INT_TYPE;
-    static constexpr int k = _K;
+    int_type k;
+    int_type KMASK;
     int_type value;
-    static constexpr int_type KMASK = ((int_type)1 << (BIT_WIDTH * k)) - 1;
-    KmerViewOnCrumbs() : value{0} {}
+    KmerViewOnCrumbs(int_type k) : k{k}, KMASK{((int_type)1 << (BIT_WIDTH * k)) - 1}, value{0} {}
 
     int fill(const uint8_t *data_address) {
-        int i;
+        int_type i;
         for (i = 0; i < k; i++) {
             move_get(data_address, i);
         }
         return i;
     }
-    int_type move_get(const uint8_t *data_address, int index) {
+    int_type move_get(const uint8_t *data_address, int_type index) {
         value <<= BIT_WIDTH;
-        if constexpr (KMASK != -1) value &= KMASK;
+        value &= KMASK;
         value |= data_address[index];
 
         // value = value & KMER_SPACE_MASK;
-        return value ;
+        return value;
     }
 
     constexpr int_type get() const noexcept { return value; }
@@ -283,10 +320,10 @@ struct KmerViewOnBytes {
         } else {
             value |= data[index];
         }
-        return value ;
+        return value;
     }
 
-    constexpr int_type get() const noexcept { return value ; }
+    constexpr int_type get() const noexcept { return value; }
 };
 
 void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
@@ -320,7 +357,7 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
                                     struct lps *str,
                                     const auto &syncmer_functor) {
     int core_index = 0;
-    KmerViewOnCrumbs<SYNCMER_K, uint64_t, 2> kmer_view;
+    KmerViewOnCrumbs<uint64_t, 2> kmer_view{syncmer_functor.k()};
     int64_t it1 = kmer_view.fill(data);
     // find lcp cores
     // if(str->capacity < )
@@ -337,8 +374,8 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
             //     (str->capacity * 2 + 1) * sizeof(struct core)); str->capacity
             //     = str->capacity * 2 + 1;
             // }
-            init_core_kmer<uint32_t, 2>(&(str->cores[core_index]),
-                                        kmer_view.get(), it1, it1 + SYNCMER_K);
+            init_core_kmer_xor<uint32_t>(&(str->cores[core_index]),
+                                         kmer_view.get(), it1, it1 + SYNCMER_K);
             core_index++;
         }
         kmer_view.move_get(data, it1);

@@ -25,6 +25,10 @@
 #define WAIT_QUEUE_TIMEOUT std::chrono::milliseconds(WAIT_QUEUE_TIMEOUT_MS)
 #endif
 
+#ifndef MAXIMUM_WORK_THREADS
+#define MAXIMUM_WORK_THREADS 127
+#endif
+
 #define INIT_TIMERS(name) \
     std::chrono::high_resolution_clock::time_point name##_chrono_start = std::chrono::high_resolution_clock::now(); \
     std::chrono::high_resolution_clock::time_point name##_last_checkpoint = name##_chrono_start; \

@@ -40,9 +40,21 @@ using u32 = uint32_t;
 using std::string;
 enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 
+template <std::integral int_type>
+consteval int_type nextpowerof2(int_type v) {
+    v--;
+    for (size_t i = 1; i < sizeof(int_type) * 8; i <<= 1) {
+        v |= v >> i;
+    }
+    v++;
+    return v;
+}
+
 #define PREV_WITH_VEC
 #define HT_SHARD_BC 8
 struct dbg_index {
+    static constexpr u64 lcindex_increment =
+        nextpowerof2((u64)MAXIMUM_WORK_THREADS);
     using mutex_type = std::mutex;
     struct bidbg_val {
         unsigned cc;
@@ -74,24 +86,15 @@ struct dbg_index {
 
     struct lci_type {
         u64 id;
-        u64 pos;
-        lci_type() : id(0), pos(-1) {}
-        lci_type(u64 _id, u64 _pos) : id(_id), pos(_pos) {}
-        lci_type(u64 _id) : id(_id), pos(-1) {}
+        //    u64 pos; // TODO remove this
+        // lci_type() : id(0), pos(-1) {}
+        // lci_type(u64 _id, u64 _pos) : id(_id), pos(_pos) {}
+        // lci_type(u64 _id) : id(_id), pos(-1) {}
     };
     using lcmer_index_t = gtl::parallel_flat_hash_map<
         lcmer<LCMER_L>, lci_type, std::hash<lcmer<LCMER_L>>,
         gtl::priv::hash_default_eq<lcmer<LCMER_L>>,
         std::allocator<std::pair<const lcmer<LCMER_L>, lci_type>>, HT_SHARD_BC,
-        mutex_type>;
-
-    struct merge_info_t {
-        u64 id;
-        u64 pos;
-    };
-    using merge_info_map_t = gtl::parallel_flat_hash_map<
-        u64, merge_info_t, std::hash<u64>, gtl::priv::hash_default_eq<u64>,
-        std::allocator<std::pair<const u64, merge_info_t>>, HT_SHARD_BC,
         mutex_type>;
 
     dbg_map_t dbg;
@@ -177,7 +180,7 @@ struct dbg_index {
             for (auto &dn : lci) {
                 auto current = dbg.find(dn.second.id);
                 if (current == dbg.end()) {
-                    dn.second.pos = -1;
+                    dn.second.id = -1;
                     continue;
                 }
                 // Simple paths
@@ -227,7 +230,7 @@ struct dbg_index {
             for (auto &dn : lci) {
                 auto current = dbg.find(dn.second.id);
                 if (current == dbg.end()) {
-                    dn.second.pos = -1;
+                    dn.second.id = -1;
                     continue;
                 }
                 if (current->second.avg_core_count() < min_core_depth) {
@@ -372,7 +375,7 @@ struct dbg_index {
             for (auto &dn : lci) {
                 auto current = dbg.find(dn.second.id);
                 if (current == dbg.end()) {
-                    dn.second.pos = -1;
+                    dn.second.id = -1;
                     continue;
                 }
 
@@ -446,7 +449,7 @@ struct dbg_index {
         }
 
         erase_if(lci, [](const auto &node) {
-            return node.second.pos == std::numeric_limits<u64>::max();
+            return node.second.id == std::numeric_limits<u64>::max();
         });
         // // Remove bubbles and tips
         // for (auto &node : dbg) {
@@ -471,8 +474,8 @@ struct dbg_index {
     u64 emplace_nobloomfilter(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
         auto vv = lci.try_emplace(l, idx | tid);
         if (vv.second) {  // Means new item on the table
-            idx += 128;   // TODO: change this to next power of two from the
-                          // threadcount.
+            idx += lcindex_increment;
+            // threadcount.
         }
         return vv.first->second.id;
     }
@@ -484,8 +487,8 @@ struct dbg_index {
         }
         auto vv = lci.try_emplace_with_hash(new_hash, l, idx | tid);
         if (vv.second) {  // Means new item on the table
-            idx += 128;   // TODO: change this to next power of two from the
-                          // threadcount.
+            idx += lcindex_increment;
+            // threadcount.
         }
         return vv.first->second.id;
     }
@@ -500,44 +503,20 @@ struct assembler {
     decltype(asm_config::bloom) bloom;
     uint64_t seed;
     using SYNCMER_HASHER = syncmer::MurMur;
-    syncmer::DensitySyncmerRule<uint32_t, SYNCMER_HASHER> syncmer_functor;
+    using SyncmerType =  syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
+    decltype(asm_config::syncmer) syncmer_params;
+    SyncmerType syncmer_functor;
     assembler(const asm_config &cfg)
         : input{cfg.input},
           output{cfg.output},
           threads{cfg.threads},
           lcp_level{cfg.lcp_level},
-          density{cfg.syncmer.param.density},
           bloom{cfg.bloom},
           seed{cfg.seed},
-          syncmer_functor{density, static_cast<unsigned int>(seed), static_cast<unsigned int>(compute_spaced_mask(cfg.syncmer.spaced_seed_mask))} {}
+          syncmer_params{cfg.syncmer},
+          syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)} {}
 
-    static  u64 compute_spaced_mask(const std::string &mask_str){
-        if(mask_str.size() > 32){
-            fprintf(stderr, "Error: mask string is too long %zu > 32\n", mask_str.size());
-            exit(EXIT_FAILURE);
-        }
-        u64 acc = -1;
-        for(char c : mask_str){
-            acc <<=2;
-            switch(c){
-                case '0':
-                    break;
-                case '1':
-                    acc |= 3;
-                    break;
-                case '2':
-                    acc |= 2;
-                    break;
-                case '3':
-                    acc |= 1;
-                    break;
-            }
-        }
-        if ((int64_t)acc != -1){
-            fprintf(stderr, "Using spaced seeds with mask %s built into 0x%" PRIX64 "!\n", mask_str.c_str(), acc );
-        }
-        return acc;
-    }
+
     static inline auto insert_lcmer_helper(const gtl::vector<uint64_t> &ll,
                                            const uint32_t &i, dbg_index &dbgi)
         -> bool {
@@ -660,7 +639,7 @@ struct assembler {
         int thread_id, int lcp_level, dqt &data_queue, dqt &recycle_queue,
         dbg_index &dbgi, std::atomic<bool> &done, int &processed_read_count,
         int &all_reads, decltype(assembler::process_cores) Process_Func,
-        syncmer::DensitySyncmerRule<uint32_t, SYNCMER_HASHER> syncmer_functor) {
+        SyncmerType syncmer_functor) {
         uint64_t lcmer_index = 0;
         bam1_t *data_p = NULL;
         lps str = {0, 0, 0, 0};

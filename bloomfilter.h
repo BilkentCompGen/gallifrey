@@ -102,6 +102,14 @@ struct bloom_interface<BF, mutex> {
         uint64_t h = komihash::komihash(&element, sizeof(element), random_seed);
         implementation.Insert(h >> 32, h & 0xFFFFFFFF);
     }
+    bool contains(const uint64_t &h) const {
+        // std::lock_guard<mutex> lock{m};
+        return implementation.Query(h >> 32, h & 0xFFFFFFFF);
+    }
+    void insert(const uint64_t &h) {
+        std::lock_guard<mutex> lock{m};
+        implementation.Insert(h >> 32, h & 0xFFFFFFFF);
+    }
 };
 
 #endif
