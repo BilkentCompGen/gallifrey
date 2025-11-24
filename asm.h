@@ -122,7 +122,7 @@ struct asm_config {
         fprintf(f,
                 "Graph Cleaning Parameters: \n\tIterations: %d\n\tMax Tip "
                 "Length: %d\n\tMin Bubble Length Difference: %d\n\tMin Bubble "
-                "Depth Difference Percentage: %.2f\n",
+                "Depth Difference Rate: %.2f\n",
                 graph_cleaning.iterations, graph_cleaning.max_tip_length,
                 graph_cleaning.min_bubble_length_difference,
                 graph_cleaning.min_bubble_depth_difference_percentage);

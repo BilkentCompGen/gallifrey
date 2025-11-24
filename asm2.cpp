@@ -379,7 +379,7 @@ struct dbg_index {
                     continue;
                 }
 
-                if (current->second.prev.size() ==
+                if (current->second.prev.size() >=
                     2) {  // Simple case with 2 should expand later to many case
                     auto p1 = dbg.find(current->second.prev[0]);
                     auto p2 = dbg.find(current->second.prev[1]);
@@ -393,7 +393,7 @@ struct dbg_index {
                                     bubble_depth_epsilon) {
                                     // Remove p2
                                     dbg.erase(p2);
-                                    current->second.prev.pop_back();
+                                    current->second.prev.erase(std::next(current->second.prev.begin()));
                                     auto nn = dbg.find(p1->second.prev[0]);
                                     if (nn != dbg.end()) {
                                         nn->second.fec--;
@@ -405,7 +405,8 @@ struct dbg_index {
                                     dbg.erase(p1);
                                     current->second.prev[0] =
                                         current->second.prev[1];
-                                    current->second.prev.pop_back();
+                                    current->second.prev.erase(std::next(current->second.prev.begin()));
+
                                     auto nn = dbg.find(p2->second.prev[0]);
                                     if (nn != dbg.end()) {
                                         nn->second.fec--;
@@ -430,6 +431,36 @@ struct dbg_index {
                     dbg.erase(current);
                 }
             }
+            // Simple Loops
+
+            for (auto &dn : lci) {
+                auto current = dbg.find(dn.second.id);
+                if (current == dbg.end()) {
+                    continue;
+                }
+                if(current->second.fec == 1 && current->second.prev.size() == 1){
+                    auto prev_it = dbg.find(current->second.prev[0]);
+                    if (prev_it != dbg.end()) {
+                        auto &prepre=prev_it->second.prev;
+                        for(auto pp = prepre.begin(); pp != prepre.end(); ++pp){
+                            if(*pp == dn.second.id){ // Loop here
+                                *pp = std::numeric_limits<u64>::max();
+                                if(current->second.cc >= 2*prev_it->second.cc){ // TODO: this is not right. Need to duplicate the sequence
+                                    auto &tomerge = current->second.seq;
+                                    for (auto it = tomerge.begin(); it != tomerge.end(); ++it) {
+                                        prev_it->second.seq.emplace_back(std::move(*it));
+                                    }
+                                }
+
+                                prev_it->second.fec--;
+                                dbg.erase(current);
+                            }
+                        }
+                    }
+
+                }
+            }
+            //Fix edges
             for (auto &node : dbg) {
                 auto &pvec = node.second.prev;
                 for (auto it = pvec.begin(); it != pvec.end(); ++it) {
