@@ -1254,8 +1254,8 @@ TEST_CASE("Graph simplification Tips (Incoming)") {
     tests_mock_fill_seq(dbgi);
     print_dbg_dot(dbgi, 6);
 
+    dbgi.simplify_graph(1);
     SUBCASE("Post simplify dbg") {
-        dbgi.simplify_graph(2);
         for (auto &node : dbgi.dbg) {
             INFO(node.first, "\t.\t.\t", node.second.seq.size());
         }
@@ -1263,5 +1263,14 @@ TEST_CASE("Graph simplification Tips (Incoming)") {
         CHECK(dbgi.dbg.size() == 2);
     }
 
+
+    dbgi.simplify_graph(1);
+    SUBCASE("Post simplify dbg 2") {
+        for (auto &node : dbgi.dbg) {
+            INFO(node.first, "\t.\t.\t", node.second.seq.size());
+        }
+        CAPTURE(dbgi.dbg.size());
+        CHECK(dbgi.dbg.size() == 1);
+    }
     print_dbg_dot(dbgi, 7);
 }
