@@ -7,7 +7,6 @@
 #include "asm.h"
 #include "bamdoctor.h"
 #include "ext/lcptools/lcptools_ho.h"
-
 #ifdef BUILD_HISTOGRAM_UTILS
 #include "stats.h"
 #include "sthist.h"

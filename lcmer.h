@@ -1,7 +1,4 @@
 #pragma once
-
-#include <limits>
-#include <thread>
 #ifndef LCMER_H
 #define LCMER_H
 #include <htslib/sam.h>
@@ -11,9 +8,7 @@
 #include <gtl/vector.hpp>
 #include <iterator>
 
-#include "config.h"
 #include "ext/lcptools/lcptools_ho.h"
-#include "nibble2base.hpp"
 
 // Makes sure we have enough scratch space
 template <class T, double GF = 2>
@@ -91,7 +86,7 @@ struct lcp_read {
         cores.reserve(size);
         pos.reserve(size);
     }
-    void clear(){
+    void clear() {
         cores.clear();
         pos.clear();
         data = NULL;
@@ -237,10 +232,11 @@ struct KmerViewOnCrumbs {
     int_type KMASK;
     int_type value;
 
-    static constexpr INT_TYPE BIT_MASK = - 1;
-    //static constexpr INT_TYPE BIT_MASK = ((INT_TYPE)1 << BIT_WIDTH) - 1;
+    static constexpr INT_TYPE BIT_MASK = -1;
+    // static constexpr INT_TYPE BIT_MASK = ((INT_TYPE)1 << BIT_WIDTH) - 1;
 
-    KmerViewOnCrumbs(int_type k) : k{k}, KMASK{((int_type)1 << (BIT_WIDTH * k)) - 1}, value{0} {}
+    KmerViewOnCrumbs(int_type k)
+        : k{k}, KMASK{((int_type)1 << (BIT_WIDTH * k)) - 1}, value{0} {}
 
     int fill(const uint8_t *data_address) {
         int_type i;
@@ -249,12 +245,31 @@ struct KmerViewOnCrumbs {
         }
         return i;
     }
+
+    int fill_rle(const uint8_t *data_address, int_type cap) {
+        int_type i;
+        int_type it = move_get_rle(-1, data_address, 0, cap);
+        for (i = 0; i < k && it < cap; i++) {
+            it = move_get_rle(data_address[it - 1], data_address, it, cap);
+        }
+        return it;
+    }
+
     int_type move_get(const uint8_t *data_address, int_type index) {
         value <<= BIT_WIDTH;
         value &= KMASK;
         value |= (data_address[index] & BIT_MASK);
-        // value = value & KMER_SPACE_MASK;
-        return value;
+        return index+1;
+    }
+    int_type move_get_rle(uint8_t prev, const uint8_t *data_address,
+                          int_type index, int_type cap) {
+        while (prev == data_address[index] && index < cap) {
+            index++;
+        }
+        value <<= BIT_WIDTH;
+        value &= KMASK;
+        value |= (data_address[index] & BIT_MASK);
+        return index+1;
     }
     constexpr int_type get() const noexcept { return value; }
 };
@@ -365,7 +380,7 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
                                     const auto &syncmer_functor) {
     int core_index = 0;
     KmerViewOnCrumbs<uint64_t, 2> kmer_view{syncmer_functor.k()};
-    int64_t it1 = kmer_view.fill(data);
+    int64_t it1 = kmer_view.fill_rle(data, len);
     // find lcp cores
     // if(str->capacity < )
     if (str->capacity < len * CONSTANT_FACTOR) {
@@ -373,7 +388,7 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
         str->cores = (struct core *)realloc(
             str->cores, (str->capacity) * sizeof(struct core));
     }
-    for (; it1 + SYNCMER_K < len; it1++) {
+    for (; it1 + SYNCMER_K < len;) {
         // printf("%d\t%d\n", kmer_view.get(), table[kmer_view.get()]);
         if (syncmer_functor(kmer_view.get())) {
             // if (core_index >= str->capacity){
@@ -385,7 +400,7 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
                                          kmer_view.get(), it1, it1 + SYNCMER_K);
             core_index++;
         }
-        kmer_view.move_get(data, it1);
+        it1 = kmer_view.move_get_rle(data[it1 - 1], data, it1, len);
         // cout << "None\n";
     }
     // cout << "CORESSS" << it1 << "\t" << it2 << "\n";
@@ -418,9 +433,9 @@ inline void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len,
 }
 
 inline void parse_cores_from_bam_record(const uint8_t *data, size_t len,
-                                            int lcp_level, lps *str,
-                                            const auto &syncmer_functor,
-                                            charsi &chs, lcp_read &lr) {
+                                        int lcp_level, lps *str,
+                                        const auto &syncmer_functor,
+                                        charsi &chs, lcp_read &lr) {
     // uint64_t estimated_core_size = (int)(len / std::pow(1.5, lcp_level));
 
     // onehotto2bitDNA_bivec_chs(data, len, chs);  // TODO Make this not

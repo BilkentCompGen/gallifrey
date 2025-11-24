@@ -2,14 +2,12 @@
 
 #include <cstdint>
 
-#include "CLI/CLI.hpp"
 #include "ext/doctest.h"
 #include "ext/lcptools/lcptools_ho.h"
 #include "gtl/phmap.hpp"
 #include "htslib/hts.h"
 #include "htslib/sam.h"
 #include "nibble2base.hpp"
-#include "syncmer.h"
 
 void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
                    uint64_t si, uint64_t ei) {
