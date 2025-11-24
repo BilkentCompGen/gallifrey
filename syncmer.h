@@ -152,6 +152,9 @@ struct GenericSyncmerRule {
         if (s() != cfg.invalid_param_value) {
             s_mask = (1U << s()) - 1U;
         }
+        else{
+            s_mask = -1;
+        }
         size_t tc = 0;
         for (int i = 0; i < table_size; ++i) {
             table[i] = is_syncmer(i & k_mask);

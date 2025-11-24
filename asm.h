@@ -69,16 +69,17 @@ struct syncmer_params {
         return acc;
     }
     void print_cfg(FILE *f) const {
-        fprintf(f, "Spaced Seed Mask: %s\n", spaced_seed_mask.c_str());
-        if(invalid_density != invalid_param_value){
+        fprintf(f, "spaced-seed-mask: \"%s\"\n", spaced_seed_mask.c_str());
+        if (invalid_density != invalid_param_value) {
+            fprintf(f, "kmer-selection: \"density\"\n");
             fprintf(f, "Density: %f\n", density);
-        }
-        else{
-            if(mincode.t != invalid_param_value){
-                fprintf(f, "Open-Syncmers s=%lu t=%lu\n", mincode.s, mincode.t);
-            }
-            else{
-                fprintf(f, "Closed-Syncmers s=%lu\n", mincode.s);
+        } else {
+            if (mincode.t != invalid_param_value) {
+                fprintf(f, "kmer-selection: \"open-syncmers\"\n");
+                fprintf(f, "syncmer-s:%lu\nsyncmer-t:%lu\n", mincode.s, mincode.t);
+            } else {
+                fprintf(f, "kmer-selection: \"closed-syncmers\"\n");
+                fprintf(f, "syncmer-s: %lu\n", mincode.s);
             }
         }
     }
@@ -92,7 +93,7 @@ struct asm_config {
         int work = 8;
     } threads;
     size_t seed = 1453;
-    bool rle = false;
+    bool rle = true;
     syncmer_params syncmer;
     struct {
         uint64_t projected_count = 100'000'000;
@@ -109,19 +110,19 @@ struct asm_config {
         fprintf(f, "Input: %s\n", input.c_str());
         fprintf(f, "Output: %s\n", output.c_str());
         fprintf(f, "LCP Level: %d\n", lcp_level);
-        fprintf(f, "Threads: IO=%d, Work=%d\n", threads.io, threads.work);
+        fprintf(f, "Threads:\n\tIO: %d\n\tWork: %d\n", threads.io, threads.work);
         fprintf(f, "Seed: %zu\n", seed);
         fprintf(f, "RLE: %s\n", rle ? "true" : "false");
         syncmer.print_cfg(f);
         fprintf(f,
-                "Bloom Filter Parameters: Projected Count=%" PRIu64
-                ", False Positive "
-                "Rate=%.3f\n",
+                "Bloom Filter Parameters:\n\tProjected Count: %" PRIu64
+                "\n\tFalse Positive "
+                "Rate: %.3f\n",
                 bloom.projected_count, bloom.false_positive_rate);
         fprintf(f,
-                "Graph Cleaning Parameters: Iterations=%d, Max Tip Length=%d, "
-                "Min Bubble Length Difference=%d, Min Bubble Depth Difference "
-                "Percentage=%.2f%%\n",
+                "Graph Cleaning Parameters: \n\tIterations: %d\n\tMax Tip "
+                "Length: %d\n\tMin Bubble Length Difference: %d\n\tMin Bubble "
+                "Depth Difference Percentage: %.2f\n",
                 graph_cleaning.iterations, graph_cleaning.max_tip_length,
                 graph_cleaning.min_bubble_length_difference,
                 graph_cleaning.min_bubble_depth_difference_percentage);
