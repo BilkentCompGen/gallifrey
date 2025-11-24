@@ -644,6 +644,7 @@ struct assembler {
         bam1_t *data_p = NULL;
         lps str = {0, 0, 0, 0};
         charsi chs;
+        lcp_read lr;
         while (true) {
             if (!data_queue.wait_dequeue_timed(data_p, WAIT_QUEUE_TIMEOUT)) {
                 // if (!data_queue.try_dequeue(data_p)) {
@@ -654,9 +655,10 @@ struct assembler {
                 continue;
             }
             all_reads++;
-            lcp_read lr = parse_cores_from_bam_record(
+            lr.clear();
+            parse_cores_from_bam_record(
                 bam_get_seq(data_p), data_p->core.l_qseq, lcp_level, &str,
-                syncmer_functor, chs);
+                syncmer_functor, chs, lr);
             if (lr.cores.size() < LCMER_L + 2) {
                 // printf("Skipping read %lld, cores.size()=%zu\n", here,
                 // lr.cores.size());
@@ -924,8 +926,8 @@ void print_dbg_dot(const dbg_index &dbgi, int i) {
 }
 
 int run_assembly(const asm_config &cfg) {
+    cfg.print_cfg(stderr );
     INIT_TIMERS(HIFI_ASSEMBLY);
-
     auto inty = identify_input(cfg.input);
 
     if (inty == input_type::UNKNOWN) {

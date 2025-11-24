@@ -91,6 +91,11 @@ struct lcp_read {
         cores.reserve(size);
         pos.reserve(size);
     }
+    void clear(){
+        cores.clear();
+        pos.clear();
+        data = NULL;
+    }
 };
 
 template <int N>
@@ -231,6 +236,10 @@ struct KmerViewOnCrumbs {
     int_type k;
     int_type KMASK;
     int_type value;
+
+    static constexpr INT_TYPE BIT_MASK = - 1;
+    //static constexpr INT_TYPE BIT_MASK = ((INT_TYPE)1 << BIT_WIDTH) - 1;
+
     KmerViewOnCrumbs(int_type k) : k{k}, KMASK{((int_type)1 << (BIT_WIDTH * k)) - 1}, value{0} {}
 
     int fill(const uint8_t *data_address) {
@@ -243,12 +252,10 @@ struct KmerViewOnCrumbs {
     int_type move_get(const uint8_t *data_address, int_type index) {
         value <<= BIT_WIDTH;
         value &= KMASK;
-        value |= data_address[index];
-
+        value |= (data_address[index] & BIT_MASK);
         // value = value & KMER_SPACE_MASK;
         return value;
     }
-
     constexpr int_type get() const noexcept { return value; }
 };
 
@@ -410,10 +417,10 @@ inline void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len,
     lps_ptr->size = parse1_bam_syncmers(data, len, lps_ptr, syncmer_functor);
 }
 
-inline lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
+inline void parse_cores_from_bam_record(const uint8_t *data, size_t len,
                                             int lcp_level, lps *str,
                                             const auto &syncmer_functor,
-                                            charsi &chs) {
+                                            charsi &chs, lcp_read &lr) {
     // uint64_t estimated_core_size = (int)(len / std::pow(1.5, lcp_level));
 
     // onehotto2bitDNA_bivec_chs(data, len, chs);  // TODO Make this not
@@ -427,14 +434,12 @@ inline lcp_read parse_cores_from_bam_record(const uint8_t *data, size_t len,
                               chs);  // TODO Make this not allocate work
     init_lps_bam(str, chs.data, len, syncmer_functor);
     lps_deepen(str, lcp_level);
-    lcp_read lr;
-    lr.reserve(str->size);
+
     for (int i = 0; i < str->size; ++i) {
         lr.cores.emplace_back(str->cores[i].label);
         lr.pos.emplace_back(str->cores[i].start, str->cores[i].end);
     }
     lr.data = data;
-    return lr;
 }
 
 lcp_read parse_cores_from_kseq(const char *data, size_t len, int lcp_level);
