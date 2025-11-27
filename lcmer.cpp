@@ -158,6 +158,18 @@ void onehotto2bitDNA_bivec_chs(const uint8_t *data, size_t len, charsi &chs) {
         chs.data[len - 1] = 27 - __builtin_clz(data[len / 2]);
     }
 }
+void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len, charsi &chs) {
+    chs.require(len);
+    size_t mid = len/2-1;
+    for (size_t i = 0; i < len / 2; ++i) {
+        chs.data[2 * (mid-i)] = __builtin_clz(data[i]) - 24;
+        chs.data[2 * (mid-i) + 1] = 3 - __builtin_ctz(data[i]);
+    }
+    if (len % 2 == 1) {
+        chs.data[0] =  __builtin_clz(data[len / 2]) - 24;
+    }
+
+}
 uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len) {
     uint8_t *ret = (uint8_t *)malloc(len);
 #pragma clang loop vectorize(enable) interleave(enable)
@@ -210,6 +222,16 @@ TEST_CASE("Nibbles to Crumbs") {
             CHECK(expected[bytes[i]].second == conversion[2 * i + 1]);
         }
         free(conversion);
+    }
+    SUBCASE("Even reverse") {
+        charsi c;
+        c.require(2 * bytes.size());
+            onehotto2bitDNA_bivec_chs_reverse(bytes.data(), 2 * bytes.size(), c);
+        size_t bs = bytes.size() - 1;
+        for (unsigned i = 0; i < bytes.size(); ++i) {
+            CHECK(3-expected[bytes[bs-i]].first == c.data[2 * i]);
+            CHECK(3-expected[bytes[bs-i]].second == c.data[2 * i + 1]);
+        }
     }
     bytes.push_back((1 << 4));
     expected[bytes.back()] = {tab[1], 0};

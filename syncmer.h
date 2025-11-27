@@ -160,7 +160,7 @@ struct GenericSyncmerRule {
             table[i] = is_syncmer(i & k_mask);
             tc += table[i];
         }
-        fprintf(stderr, "K-mer density: %lf\n", (double)tc / table_size);
+        fprintf(stderr, "Real K-mer density: %lf\n", (double)tc / table_size);
     }
     constexpr bool operator()(int_type val) const { return table[val]; }
     constexpr bool is_syncmer(int_type val) const {
@@ -188,6 +188,7 @@ struct GenericSyncmerRule {
                 return hf(val & k_mask) < threshold();
             }
             case syncmer_params::typeenum::Invalid:
+            default:
                 fprintf(stderr, "Invalid syncmer type\n");
                 exit(EXIT_FAILURE);
         }

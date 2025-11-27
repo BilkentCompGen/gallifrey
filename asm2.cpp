@@ -50,6 +50,51 @@ consteval int_type nextpowerof2(int_type v) {
     return v;
 }
 
+template<class T>
+struct mptr{
+    static constexpr size_t vmask = 3;
+    static constexpr size_t pmask = ~vmask;
+    T *ptr;
+    ~mptr(){
+        delete unwrap();
+        ptr = 0;
+    }
+    mptr(T val) : ptr{new T{val}} {}
+    mptr(T val, int message) : ptr{new T{val}} {
+        write_message(message);
+    }
+    mptr(T *ptr) : ptr{ptr}{}
+    mptr(T *ptr, int message) : ptr{ptr}{
+        write_message(message);
+    }
+    mptr(mptr &&other) {
+        ptr = other.ptr;
+        other.ptr = 0;
+    }
+    mptr(const mptr &other) = delete;
+    mptr &operator =(const mptr &other) = delete;
+    mptr &&operator =(mptr &&other){
+        this->ptr = other.ptr;
+        other.ptr = 0;
+    }
+    constexpr const T *unwrap() const{
+        return (T*)((size_t)(ptr) & pmask);
+    }
+    constexpr T *unwrap(){
+        return (T*)((size_t)(ptr) & pmask);
+    }
+    constexpr T operator *() const{
+        if (ptr)
+            return *unwrap();
+        throw 42;
+    }
+    constexpr int get_message() const {
+        return (size_t)(ptr) & vmask;
+    }
+    void write_message(int message){
+        ptr = (T*)((size_t)(ptr) | (message & vmask));
+    }
+};
 #define PREV_WITH_VEC
 #define HT_SHARD_BC 8
 struct dbg_index {
@@ -526,6 +571,8 @@ struct dbg_index {
 };
 
 struct assembler {
+    using SYNCMER_HASHER = syncmer::MurMur;
+    using SyncmerType =  syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
     string input;
     string output;
     decltype(asm_config::threads) threads;
@@ -533,8 +580,6 @@ struct assembler {
     double density;
     decltype(asm_config::bloom) bloom;
     uint64_t seed;
-    using SYNCMER_HASHER = syncmer::MurMur;
-    using SyncmerType =  syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
     decltype(asm_config::syncmer) syncmer_params;
     SyncmerType syncmer_functor;
     assembler(const asm_config &cfg)
@@ -803,7 +848,6 @@ struct assembler {
             valid_sum += valid_read_counts[i];
             all_sum += all_read_counts[i];
         }
-
         fprintf(stderr, "%d processed\n%d total reads\n", valid_sum, all_sum);
         return dbgi;
     }

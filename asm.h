@@ -129,5 +129,7 @@ struct asm_config {
     }
 };
 
+
 int run_assembly(const asm_config &param);
+int run_mapping(const asm_config &param);
 #endif

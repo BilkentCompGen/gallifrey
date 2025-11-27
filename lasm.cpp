@@ -1,6 +1,7 @@
 #include <CLI/CLI.hpp>
 #include <string>
 
+#include "CLI/CLI.hpp"
 #include "nibble2base.hpp"
 
 #define LCPTOOLS_IMPL
@@ -16,7 +17,7 @@ using std::string;
 
 auto lam = []() -> int {
     CPUType type = nibble2base_resolve();
-    std::cout << "CPU Type: " << (int)type << std::endl;
+    std::cerr << "CPU Type: " << (int)type << std::endl;
     return 0;
 }();
 struct bloom_parameters;
@@ -82,7 +83,43 @@ int asm_program(CLI::App &parent) {
     });
     return 0;
 }
-
+int map_prog(CLI::App &parent) {
+    auto *app_ = parent.add_subcommand("map", "run hifi assembly");
+    auto &app = *app_;
+    asm_config *p = new asm_config;
+    app.add_option("input", p->input, "Input bam file")->required();
+    app.add_option("reference", p->output, "Input bam file")->required();
+    app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
+        ->required();
+    app.add_option("-t,--threads", p->threads.work, "Number of worker threads")
+        ->capture_default_str();
+    app.add_option("-@,--io-threads", p->threads.io, "Number of IO threads")
+        ->capture_default_str();
+    app.add_option("--random-seed", p->seed, "Random seed")
+        ->capture_default_str();
+    app.add_flag("--rle", p->rle, "Enable Run Length Encoding")
+        ->capture_default_str();
+    app.add_option("--spaced-seed-mask", p->syncmer.spaced_seed_mask,
+                   "Mask for spaced seeding. (0->skip, 1->keep, 2->mask left bit, 3->mask right bit.")
+        ->capture_default_str();
+    app.add_option("--syncmer-k", p->syncmer.k,
+                   "K-mer length")
+        ->capture_default_str();
+    app.add_option("--density", p->syncmer.density,
+                   "Density of selected k-mers")->expected(0.0F,1.0F);
+    app.add_option("--submer-s", p->syncmer.mincode.s,
+                   "Size of submers for mincode syncmers")
+        ->excludes("--density");
+    app.add_option("--submer-t", p->syncmer.mincode.t,
+                   "Position of submers for mincode syncmers (Closed syncmer if omitted)")
+        ->excludes("--density")->needs("--submer-s");
+    app.callback([=]() {
+        int ret = run_mapping(*p);
+        delete p;
+        return ret;
+    });
+    return 0;
+}
 #ifdef BUILD_HISTOGRAM_UTILS
 void stats_program(CLI::App &parent) {
     auto *app_ = parent.add_subcommand("bam-stats", "Print stats on input bam");
@@ -180,6 +217,9 @@ int sam_read_testing(CLI::App &parent) {
     });
     return 0;
 }
+
+
+
 #define DOCTEST_CONFIG_IMPLEMENT
 #include "doctest.h"
 
@@ -205,7 +245,9 @@ int main(int argc, char **argv) {
     CLI::App app("lasm");
     app.require_subcommand(1);
     // app.set_help_all_flag("--help-all", "Expand all help");
+
     asm_program(app);
+    map_prog(app);
 #ifdef BUILD_HISTOGRAM_UTILS
     stats_program(app);
     stdin_hist_prog(app);

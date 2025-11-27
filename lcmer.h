@@ -259,17 +259,30 @@ struct KmerViewOnCrumbs {
         value <<= BIT_WIDTH;
         value &= KMASK;
         value |= (data_address[index] & BIT_MASK);
-        return index+1;
+        return index + 1;
     }
-    int_type move_get_rle(uint8_t prev, const uint8_t *data_address,
-                          int_type index, int_type cap) {
-        while (prev == data_address[index] && index < cap) {
+
+    int_type move_get_rle2(uint8_t prev, const uint8_t *data_address,
+                           int_type index, int_type cap) {
+        while (index < cap && prev == data_address[index]) {
             index++;
         }
         value <<= BIT_WIDTH;
         value &= KMASK;
         value |= (data_address[index] & BIT_MASK);
-        return index+1;
+        return index + 1;
+    }
+    int_type move_get_rle(uint8_t prev, const uint8_t *data_address,
+                          int_type index, int_type cap) {
+        const uint8_t *p = data_address + index;
+        const uint8_t *end = data_address + cap;
+
+        while (p < end && *p == prev) {
+            ++p;
+        }
+        if(p==end) { return cap;}
+        value = ((value << BIT_WIDTH) & KMASK) | (*p & BIT_MASK);
+        return static_cast<int_type>((p - data_address) + 1);
     }
     constexpr int_type get() const noexcept { return value; }
 };
@@ -373,7 +386,10 @@ void init_core_kmer_xor(struct core *cr, _T Kval, uint64_t si, uint64_t ei) {
 
 uint8_t *onehotto2bitDNA(const uint8_t *data, size_t len);
 uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len);
+
 void onehotto2bitDNA_bivec_chs(const uint8_t *data, size_t len, charsi &c);
+void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len,
+                                       charsi &c);
 
 inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
                                     struct lps *str,
@@ -384,7 +400,7 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
     // find lcp cores
     // if(str->capacity < )
     if (str->capacity < len * CONSTANT_FACTOR) {
-        str->capacity = 1.5 * len * CONSTANT_FACTOR;
+        str->capacity = 2 * len * CONSTANT_FACTOR;
         str->cores = (struct core *)realloc(
             str->cores, (str->capacity) * sizeof(struct core));
     }
@@ -396,8 +412,8 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
             //     (str->capacity * 2 + 1) * sizeof(struct core)); str->capacity
             //     = str->capacity * 2 + 1;
             // }
-            init_core_kmer_xor<uint32_t>(&(str->cores[core_index]),
-                                         kmer_view.get(), it1, it1 + SYNCMER_K);
+            init_core_kmer<uint32_t>(&(str->cores[core_index]), kmer_view.get(),
+                                     it1, it1 + SYNCMER_K);
             core_index++;
         }
         it1 = kmer_view.move_get_rle(data[it1 - 1], data, it1, len);
@@ -435,7 +451,8 @@ inline void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len,
 inline void parse_cores_from_bam_record(const uint8_t *data, size_t len,
                                         int lcp_level, lps *str,
                                         const auto &syncmer_functor,
-                                        charsi &chs, lcp_read &lr) {
+                                        charsi &chs, lcp_read &lr,
+                                        bool reversed = false) {
     // uint64_t estimated_core_size = (int)(len / std::pow(1.5, lcp_level));
 
     // onehotto2bitDNA_bivec_chs(data, len, chs);  // TODO Make this not
@@ -444,9 +461,12 @@ inline void parse_cores_from_bam_record(const uint8_t *data, size_t len,
     //
     chs.require(len);
     //    nibble2base((uint8_t *)data, (char *)chs.data, (int)len);
+    if (reversed) {
+        onehotto2bitDNA_bivec_chs_reverse(data, len, chs);
+    } else {
+        onehotto2bitDNA_bivec_chs(data, len, chs);
+    }
 
-    onehotto2bitDNA_bivec_chs(data, len,
-                              chs);  // TODO Make this not allocate work
     init_lps_bam(str, chs.data, len, syncmer_functor);
     lps_deepen(str, lcp_level);
 
