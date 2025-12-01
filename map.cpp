@@ -25,7 +25,7 @@ struct SWResult {
     gtl::vector<uint32_t> alignedB;
 };
 
-static inline int sw_match(uint32_t a, uint32_t b) { return (a == b ? 2 : 0); }
+static inline int sw_match(uint32_t a, uint32_t b) { return (a == b ? 2 : -1); }
 
 //
 // Forward SW DP, returns max score and coordinates (end of local alignment)
@@ -270,6 +270,8 @@ struct mapper {
     using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
     const asm_config cfg;
     SyncmerType syncmer_functor;
+
+
     mapper(const asm_config& cfg)
         : cfg{cfg}, syncmer_functor(cfg.syncmer, cfg.seed) {}
     auto read_hts(const std::string& path, bool reversed)
@@ -280,7 +282,6 @@ struct mapper {
             std::lock_guard<std::mutex> lock(gm);
             return vec.emplace_back(element);
         };
-
         moodycamel::BlockingConcurrentQueue<bam1_t*> queue{1024, 1, 1};
         std::atomic<bool> done(false);
         auto work = [&queue, &done, &seqs, this, reversed, atomic_emplace]() {
