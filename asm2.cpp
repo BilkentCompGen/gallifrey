@@ -7,7 +7,6 @@
 #include <htslib/hts.h>
 #include <htslib/sam.h>
 #include <htslib/thread_pool.h>
-#include <inttypes.h>
 #include <stdio.h>
 
 #include <chrono>
@@ -27,7 +26,6 @@
 #include "ext/doctest.h"
 #include "lcmer.h"
 #include "lcptools/lcptools_ho.h"
-#include "nibble2base.hpp"
 #include "syncmer.h"
 #include "graph.h"
 
@@ -425,93 +423,7 @@ input_type identify_input(const std::string &input) {
     return input_type::UNKNOWN;
 }
 
-void print_raw_dbg(FILE *out, const dbg_index &dbgi) {
-    for (const auto &[lval, edges] : dbgi.dbg) {
-        fprintf(out, "S\tC%" PRIu64 "\t%s\tLN:i:%d\tRC:i:%d", lval, "*", 100,
-                edges.cc);
-    }
 
-    for (const auto &[lval, edges] : dbgi.dbg) {
-        for (const auto &p : edges.prev) {
-            fprintf(out, "L\tC%" PRIu64 "\t+\tC%" PRIu64 "\t+\t%dM\n", p, lval,
-                    1);
-        }
-    }
-}
-
-void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
-    charsi buf;
-    for (const auto &[lval, edges] : dbgi.dbg) {
-        if (edges.cc == 0 && edges.prev.size() == 0) {
-            continue;
-        }
-
-        //        __builtin_debugtrap();
-        if (edges.seq.size() == 0) {
-            fprintf(out,
-                    "S\tC%" PRIu64
-                    "\t%s\tLN:i:%d\tRC:i:%u\tBE:i:%zu\tFE:i:%u\\n",
-                    lval, "", 0, edges.cc, edges.prev.size(), edges.fec);
-        } else {
-            //            int i = onehotto2bitDNA2(s, buffer);
-            fprintf(out, "S\tC%" PRIu64 "\t", lval);
-            size_t sofar = 0;
-            //            for (const bam_nibble_data &s : edges.seq) {
-            // reversed
-            for (auto it = edges.seq.begin(); it != edges.seq.end(); ++it) {
-                const bam_nibble_data &s = *it;
-                buf.require(s.len + 1);
-                s.convert_to_ascii((char *)buf.data);
-                fprintf(out, "%s", buf.data + (buf.data[0] == 'N' ? 1 : 0));
-                sofar += s.len;
-            }
-            fprintf(out, "\tLN:i:%zu\tRC:i:%d\tCC:i:%u\tBE:i:%zu\tFE:i:%u\n",
-                    sofar, (int)(edges.avg_core_count() * sofar), edges.cc,
-                    edges.prev.size(), edges.fec);
-        }
-
-        for (uint64_t nl : edges.prev) {
-            if (dbgi.dbg.contains(nl))
-                fprintf(out, "L\tC%" PRIu64 "\t+\tC%" PRIu64 "\t+\t%dM\n", nl,
-                        lval, 0);
-        }
-    }
-}
-
-void print_dbg_dot(const dbg_index &dbgi, int i) {
-    string filename = string{"graph"} + std::to_string(i) + ".dot";
-    FILE *dot_file = fopen(filename.c_str(), "w");
-    if (dot_file) {
-        // print_raw_dbg(dot_file, dbgi);
-        fprintf(dot_file, "digraph G {\n");
-        // Legend
-        fprintf(dot_file, "\tlegend [shape=none, label=<\n");
-        fprintf(
-            dot_file,
-            "\t\t<table border=\"0\" cellborder=\"1\" cellspacing=\"0\">\n");
-        fprintf(dot_file,
-                "\t\t\t<tr><td bgcolor=\"lightgrey\">Node ID</td><td "
-                "bgcolor=\"lightgrey\">Forward</td><td "
-                "bgcolor=\"lightgrey\">Prev</td><td "
-                "bgcolor=\"lightgrey\">Merged count</td><td "
-                "bgcolor=\"lightgrey\">Core Count </td></tr>\n");
-        fprintf(dot_file, "\t\t</table>\n");
-        fprintf(dot_file, "\t>];\n");
-        for (auto &node : dbgi.dbg) {
-            fprintf(dot_file,
-                    "\t%" PRIu64 " [label=\"%" PRIu64 "->%u,%zu,%zu,%d\"];\n",
-                    node.first, node.first, node.second.fec,
-                    node.second.prev.size(), node.second.seq.size(),
-                    node.second.cc);
-            for (auto &prev : node.second.prev) {
-                fprintf(dot_file, "\t%" PRIu64 " -> %" PRIu64 ";\n", prev,
-                        node.first);
-            }
-        }
-        fprintf(dot_file, "}\n");
-        fclose(dot_file);
-    }
-}
 
 int run_assembly(const asm_config &cfg) {
     cfg.print_cfg(stderr );
