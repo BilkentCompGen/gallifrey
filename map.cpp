@@ -10,6 +10,7 @@
 #include "asm.h"
 #include "blockingconcurrentqueue.h"
 #include "config.h"
+#include "graph.h"
 #include "gtl/phmap.hpp"
 #include "gtl/vector.hpp"
 #include "htslib/sam.h"
@@ -218,19 +219,20 @@ using MinimizerIndex = gtl::parallel_flat_hash_map<
     std::allocator<std::pair<const uint64_t, gtl::vector<SeedLoc>>>, 8,
     std::mutex>;
 
-MinimizerIndex build_minimizer_index(const gtl::vector<lcp_read>& lcp_ctgs,
-                                     int K, int W, int tcount) {
+MinimizerIndex build_minimizer_index(
+    const gtl::vector<std::pair<std::string, lcp_read>>& lcp_ctgs, int K, int W,
+    int tcount) {
     MinimizerIndex index;
 
     // Pre-allocate based on heuristic:
     // assume about (#bases / W) minimizers total
     size_t total_bases = 0;
-    for (const auto& c : lcp_ctgs) total_bases += c.cores.size();
+    for (const auto& c : lcp_ctgs) total_bases += c.second.cores.size();
     index.reserve(total_bases / W + 16);
 
     auto work = [tcount, &lcp_ctgs, &index, K, W](int tid) {
         for (uint32_t cid = tid; cid < lcp_ctgs.size(); cid += tcount) {
-            const auto& ref = lcp_ctgs[cid].cores;
+            const auto& ref = lcp_ctgs[cid].second.cores;
 
             gtl::vector<Minimizer> mins = compute_minimizers(ref, K, W);
 
@@ -271,16 +273,16 @@ struct mapper {
     const asm_config cfg;
     SyncmerType syncmer_functor;
 
-
     mapper(const asm_config& cfg)
         : cfg{cfg}, syncmer_functor(cfg.syncmer, cfg.seed) {}
-    auto read_hts(const std::string& path, bool reversed)
-        -> gtl::vector<lcp_read> {
+    auto read_hts(const std::string& path, bool reversed) {
         std::mutex gm;
-        gtl::vector<lcp_read> seqs;
-        auto atomic_emplace = [&](auto& vec, lcp_read&& element) {
+        gtl::vector<std::pair<std::string, lcp_read>> seqs;
+
+        auto atomic_emplace = [&](auto& vec, const std::string& name,
+                                  lcp_read&& element) {
             std::lock_guard<std::mutex> lock(gm);
-            return vec.emplace_back(element);
+            return vec.emplace_back(name, element);
         };
         moodycamel::BlockingConcurrentQueue<bam1_t*> queue{1024, 1, 1};
         std::atomic<bool> done(false);
@@ -296,7 +298,7 @@ struct mapper {
                     parse_cores_from_bam_record(
                         bam_get_seq(rec), rec->core.l_qseq, cfg.lcp_level, &str,
                         syncmer_functor, chs, read, reversed);
-                    atomic_emplace(seqs, std::move(read));
+                    atomic_emplace(seqs, bam_get_qname(rec), std::move(read));
                     bam_destroy1(rec);
                     lps_clear(&str);
                     rec = NULL;
@@ -358,50 +360,100 @@ gtl::vector<SeedHit> find_query_seeds(const gtl::vector<uint32_t>& query,
                                       int W) {
     gtl::vector<SeedHit> hits;
 
-    // 1. Extract query minimizers
     gtl::vector<Minimizer> qmins = compute_minimizers(query, K, W);
 
     // Reserve approx (#minimizers * average bucket size)
     hits.reserve(qmins.size() * 2);
 
-    // 2. For each query minimizer, look up matches
     for (const auto& qm : qmins) {
         auto it = index.find(qm.hash);
         if (it == index.end()) continue;  // no match
-
         const gtl::vector<SeedLoc>& bucket = it->second;
-
-        // Avoid reallocation
-        hits.reserve(hits.size() + bucket.size());
-
-        // 3. Emit all hits
         for (const SeedLoc& loc : bucket) {
-            hits.push_back({
-                qm.pos,      // query minimizer start
-                loc.contig,  // contig ID
-                loc.pos      // reference minimizer start
-            });
+            hits.push_back({qm.pos, loc.contig, loc.pos});
         }
     }
 
     return hits;
 }
+
+struct Chain {
+    gtl::vector<int> indices;  // seed indices in original hits vector
+    int score;
+};
+
+// Input: hits for one contig (unsorted)
+// Output: multiple best chains
+
+struct Interval {
+    u32 ctg;
+    u32 s;
+    u32 e;
+};
+struct Segment {
+    Interval qry;
+    Interval ref;
+    int elements;
+};
+gtl::vector<Segment> chain_multiple(u32 me, gtl::vector<SeedHit>& hits,
+                                    int MAX_DIAG_DELTA = 1000,
+                                    float SECONDARY_CUTOFF = 0.6f,
+                                    int MIN_CHAIN_SCORE = 3) {
+    // Simplify hit streaks
+    gtl::vector<Segment> segments;
+    if (hits.empty()) {
+        return {};
+    }
+    if (hits.size() == 1) {
+        return {{{me, hits[0].qpos, hits[0].qpos}},
+                {{hits[0].contig, hits[0].rpos, hits[0].rpos}, {1}}};
+    }
+
+    std::sort(hits.begin(), hits.end(), [](const SeedHit& a, const SeedHit& b) {
+        if (a.contig != b.contig) return a.contig < b.contig;
+        if (a.qpos != b.qpos) return a.qpos < b.qpos;
+        return a.rpos < b.rpos;
+    });
+    auto left = hits.begin();
+    auto it = std::next(left);
+
+    while (it != hits.end() && std::next(it) != hits.end()) {
+        if (it->contig == left->contig) {
+            ++it;
+        } else {
+            segments.emplace_back(Interval{me, left->qpos, it->qpos},
+                                  Interval{left->contig, left->rpos, it->rpos},
+                                  (int)(it - left));
+            ++it;
+            left = it;
+            ++it;
+        }
+    }
+    if (left + 1 != it)
+        segments.emplace_back(Interval{me, left->qpos, it->qpos},
+                              Interval{left->contig, left->rpos, it->rpos},
+                              (int)(it - left));
+
+    return segments;
+}
+
 int run_mapping(const asm_config& param) {
     INIT_TIMERS(Mapping)
     mapper map(param);
 
     auto ref = map.read_hts(param.input, false);
     auto qry = map.read_hts(param.output, false);
-    TIME_CHECKPOINT(Mapping, stderr, "Read input files %s and %s", param.input.c_str(), param.output.c_str());
+    TIME_CHECKPOINT(Mapping, stderr, "Read input files %s and %s",
+                    param.input.c_str(), param.output.c_str());
     // auto ref = map.read_hts(
     //     param.output);  // I am reusing output here for passing str, I dont
     //     want
     //                     // to rewiret or modify the asm_confgi
 
-    int K = 4;
-    int W = 3;
-    gtl::vector<gtl::flat_hash_set<uint32_t>> rs;
-    gtl::vector<gtl::flat_hash_set<uint32_t>> qs;
+    int K = 3;
+    int W = 2;
+    // gtl::vector<gtl::flat_hash_set<uint32_t>> rs;
+    // gtl::vector<gtl::flat_hash_set<uint32_t>> qs;
 
     auto mindex = build_minimizer_index(ref, K, W, param.threads.work);
     TIME_CHECKPOINT(Mapping, stderr, "Built index");
@@ -409,21 +461,28 @@ int run_mapping(const asm_config& param) {
     std::atomic<bool> done{false};
 
     moodycamel::BlockingConcurrentQueue<size_t> jobqueue{qry.size() * 2};
-    moodycamel::BlockingConcurrentQueue<std::pair<size_t, gtl::vector<SeedHit>>>
+    moodycamel::BlockingConcurrentQueue<
+        std::tuple<size_t, gtl::vector<SeedHit>, gtl::vector<Segment>>>
         resultqueue{qry.size() * 2};
 
     auto worker_fnc = [&done, &jobqueue, &qry, &mindex, K, W, &resultqueue]() {
         size_t job = 0;
-        while (!done.load() && jobqueue.size_approx() > 0) {
+        while (true) {
             if (jobqueue.wait_dequeue_timed(job,
                                             std::chrono::milliseconds(1))) {
-                auto result = find_query_seeds(qry.at(job).cores, mindex, K, W);
+                auto hits =
+                    find_query_seeds(qry.at(job).second.cores, mindex, K, W);
+                auto chains = chain_multiple(job, hits);
                 while (!resultqueue.try_enqueue(
-                    std::make_pair(job, std::move(result)))) {
+                    std::make_tuple(job, std::move(hits), std::move(chains)))) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
+            } else {
+                if (done.load() && jobqueue.size_approx() == 0) {
+                    break;
+                }
             }
-        };
+        }
     };
     gtl::vector<std::thread> threads;
     for (size_t i = 0; i < qry.size(); ++i) {
@@ -434,13 +493,26 @@ int run_mapping(const asm_config& param) {
     }
 
     size_t pcount = 0;
-    std::pair<size_t, gtl::vector<SeedHit>> hits;
+    std::tuple<size_t, gtl::vector<SeedHit>, gtl::vector<Segment>> qitem;
     while (pcount < qry.size()) {
-        if (resultqueue.wait_dequeue_timed(hits,
+        if (resultqueue.wait_dequeue_timed(qitem,
                                            std::chrono::milliseconds(1))) {
-            printf("%zu: [", hits.first);
-            for (const auto& hit : hits.second) {
-                printf("(%d, %d, %d) ", hit.contig, hit.qpos, hit.rpos);
+            printf("Chains: %zu[\n", std::get<2>(qitem).size());
+
+            int i = 0;
+            for (const auto& chain : std::get<2>(qitem)) {
+                printf("Chain %d:(%s:%d-%d) (%s:%d-%d) #%d\n", i,
+                       qry[chain.qry.ctg].first.c_str(), chain.qry.s,
+                       chain.qry.e, ref[chain.ref.ctg].first.c_str(),
+                       chain.ref.s, chain.ref.e, chain.elements);
+                ++i;
+            }
+
+            printf("]\nHits: %zu\n", std::get<1>(qitem).size());
+            printf("%zu: [", std::get<0>(qitem));
+            for (const auto& hit : std::get<1>(qitem)) {
+                printf("(%s, %d, %d) ", ref[hit.contig].first.c_str(), hit.qpos,
+                       hit.rpos);
             }
             printf("]\n");
             ++pcount;

@@ -24,66 +24,53 @@
 #include "bgzf.h"
 #include "config.h"
 #include "ext/doctest.h"
+#include "graph.h"
 #include "lcmer.h"
 #include "lcptools/lcptools_ho.h"
+#include "nibble2base.hpp"
 #include "syncmer.h"
-#include "graph.h"
-
 
 using std::string;
 enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 
-
-template<class T>
-struct mptr{
+template <class T>
+struct mptr {
     static constexpr size_t vmask = 3;
     static constexpr size_t pmask = ~vmask;
     T *ptr;
-    ~mptr(){
+    ~mptr() {
         delete unwrap();
         ptr = 0;
     }
     mptr(T val) : ptr{new T{val}} {}
-    mptr(T val, int message) : ptr{new T{val}} {
-        write_message(message);
-    }
-    mptr(T *ptr) : ptr{ptr}{}
-    mptr(T *ptr, int message) : ptr{ptr}{
-        write_message(message);
-    }
+    mptr(T val, int message) : ptr{new T{val}} { write_message(message); }
+    mptr(T *ptr) : ptr{ptr} {}
+    mptr(T *ptr, int message) : ptr{ptr} { write_message(message); }
     mptr(mptr &&other) {
         ptr = other.ptr;
         other.ptr = 0;
     }
     mptr(const mptr &other) = delete;
-    mptr &operator =(const mptr &other) = delete;
-    mptr &&operator =(mptr &&other){
+    mptr &operator=(const mptr &other) = delete;
+    mptr &&operator=(mptr &&other) {
         this->ptr = other.ptr;
         other.ptr = 0;
     }
-    constexpr const T *unwrap() const{
-        return (T*)((size_t)(ptr) & pmask);
-    }
-    constexpr T *unwrap(){
-        return (T*)((size_t)(ptr) & pmask);
-    }
-    constexpr T operator *() const{
-        if (ptr)
-            return *unwrap();
+    constexpr const T *unwrap() const { return (T *)((size_t)(ptr)&pmask); }
+    constexpr T *unwrap() { return (T *)((size_t)(ptr)&pmask); }
+    constexpr T operator*() const {
+        if (ptr) return *unwrap();
         throw 42;
     }
-    constexpr int get_message() const {
-        return (size_t)(ptr) & vmask;
-    }
-    void write_message(int message){
-        ptr = (T*)((size_t)(ptr) | (message & vmask));
+    constexpr int get_message() const { return (size_t)(ptr)&vmask; }
+    void write_message(int message) {
+        ptr = (T *)((size_t)(ptr) | (message & vmask));
     }
 };
 
-
 struct assembler {
     using SYNCMER_HASHER = syncmer::MurMur;
-    using SyncmerType =  syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
+    using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
     string input;
     string output;
     decltype(asm_config::threads) threads;
@@ -102,7 +89,6 @@ struct assembler {
           seed{cfg.seed},
           syncmer_params{cfg.syncmer},
           syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)} {}
-
 
     static inline auto insert_lcmer_helper(const gtl::vector<uint64_t> &ll,
                                            const uint32_t &i, dbg_index &dbgi)
@@ -163,9 +149,15 @@ struct assembler {
 
         for (size_t i = 1; i < ll.size() - 1; ++i) {
             if (insert_lcmer_helper(ll, i, dbgi)) {
-                dbgi.dbg[ll[i]].seq.emplace_back(lr.data,
-                                                 lr.pos[i + LCMER_L - 1].second,
-                                                 lr.pos[i + LCMER_L].second);
+                // Lets try atomic
+                dbgi.dbg.modify_if(ll[i], [&lr,i](dbg_index::dbg_map_t::value_type &val) {
+                    val.second.seq.emplace_back(lr.data,
+                                         lr.pos[i + LCMER_L - 1].second,
+                                         lr.pos[i + LCMER_L].second);
+                });
+                // dbgi.dbg[ll[i]].seq.emplace_back(lr.data,
+                //                                  lr.pos[i + LCMER_L - 1].second,
+                //                                  lr.pos[i + LCMER_L].second);
             }
         }
     }
@@ -192,6 +184,7 @@ struct assembler {
                 if (val.second.seq.size() == 0) {
                     if (to - from > 0) {
                         val.second.seq.emplace_back(lr.data, from, to);
+                        assert((to & 3) + 4 < lr.data_length);
                     }
                 }
             });
@@ -222,11 +215,12 @@ struct assembler {
     //                                      int &all_reads) {
     //     uint64_t lcmer_index = 0;
     // }
-    static auto process_data(
-        int thread_id, int lcp_level, dqt &data_queue, dqt &recycle_queue,
-        dbg_index &dbgi, std::atomic<bool> &done, int &processed_read_count,
-        int &all_reads, decltype(assembler::process_cores) Process_Func,
-        SyncmerType syncmer_functor) {
+    static auto process_data(int thread_id, int lcp_level, dqt &data_queue,
+                             dqt &recycle_queue, dbg_index &dbgi,
+                             std::atomic<bool> &done, int &processed_read_count,
+                             int &all_reads,
+                             decltype(assembler::process_cores) Process_Func,
+                             SyncmerType syncmer_functor) {
         uint64_t lcmer_index = 0;
         bam1_t *data_p = NULL;
         lps str = {0, 0, 0, 0};
@@ -243,9 +237,9 @@ struct assembler {
             }
             all_reads++;
             lr.clear();
-            parse_cores_from_bam_record(
-                bam_get_seq(data_p), data_p->core.l_qseq, lcp_level, &str,
-                syncmer_functor, chs, lr);
+            parse_cores_from_bam_record(bam_get_seq(data_p),
+                                        data_p->core.l_qseq, lcp_level, &str,
+                                        syncmer_functor, chs, lr);
             if (lr.cores.size() < LCMER_L + 2) {
                 // printf("Skipping read %lld, cores.size()=%zu\n", here,
                 // lr.cores.size());
@@ -423,10 +417,10 @@ input_type identify_input(const std::string &input) {
     return input_type::UNKNOWN;
 }
 
-
-
+size_t bam_nib_byte_counter;
 int run_assembly(const asm_config &cfg) {
-    cfg.print_cfg(stderr );
+    bam_nib_byte_counter = 0;
+    cfg.print_cfg(stderr);
     INIT_TIMERS(HIFI_ASSEMBLY);
     auto inty = identify_input(cfg.input);
 
@@ -445,6 +439,15 @@ int run_assembly(const asm_config &cfg) {
     // as.convert2basespace(dbg);
     // TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "Converting to basespace done.");
 
+    if (cfg.print_precleanup_graph) {
+        FILE *out = fopen((cfg.output + ".raw").c_str(), "w");
+        print_dbg_seqs(out, dbg);
+        TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr,
+                        "DBG printing done. Used %zu bytes in nibbles",
+                        bam_nib_byte_counter);
+        fclose(out);
+    }
+
     dbg.simplify_graph(
         cfg.graph_cleaning.iterations, cfg.graph_cleaning.max_tip_length,
         cfg.graph_cleaning.min_bubble_length_difference, 3,
@@ -454,7 +457,9 @@ int run_assembly(const asm_config &cfg) {
     FILE *out = fopen(cfg.output.c_str(), "w");
     print_dbg_seqs(out, dbg);
     // print_raw_dbg(out, dbg);
-    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr, "DBG printing done.");
+    TIME_CHECKPOINT(HIFI_ASSEMBLY, stderr,
+                    "DBG printing done. Used %zu bytes in nibbles",
+                    bam_nib_byte_counter);
     fclose(out);
 
     return 0;
@@ -731,7 +736,6 @@ TEST_CASE("Graph simplification Tips (Incoming)") {
         CAPTURE(dbgi.dbg.size());
         CHECK(dbgi.dbg.size() == 2);
     }
-
 
     dbgi.simplify_graph(1);
     SUBCASE("Post simplify dbg 2") {

@@ -158,17 +158,17 @@ void onehotto2bitDNA_bivec_chs(const uint8_t *data, size_t len, charsi &chs) {
         chs.data[len - 1] = 27 - __builtin_clz(data[len / 2]);
     }
 }
-void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len, charsi &chs) {
+void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len,
+                                       charsi &chs) {
     chs.require(len);
-    size_t mid = len/2-1;
+    size_t mid = len / 2 - 1;
     for (size_t i = 0; i < len / 2; ++i) {
-        chs.data[2 * (mid-i)] = __builtin_clz(data[i]) - 24;
-        chs.data[2 * (mid-i) + 1] = 3 - __builtin_ctz(data[i]);
+        chs.data[2 * (mid - i)] = __builtin_clz(data[i]) - 24;
+        chs.data[2 * (mid - i) + 1] = 3 - __builtin_ctz(data[i]);
     }
     if (len % 2 == 1) {
-        chs.data[0] =  __builtin_clz(data[len / 2]) - 24;
+        chs.data[0] = __builtin_clz(data[len / 2]) - 24;
     }
-
 }
 uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len) {
     uint8_t *ret = (uint8_t *)malloc(len);
@@ -226,11 +226,11 @@ TEST_CASE("Nibbles to Crumbs") {
     SUBCASE("Even reverse") {
         charsi c;
         c.require(2 * bytes.size());
-            onehotto2bitDNA_bivec_chs_reverse(bytes.data(), 2 * bytes.size(), c);
+        onehotto2bitDNA_bivec_chs_reverse(bytes.data(), 2 * bytes.size(), c);
         size_t bs = bytes.size() - 1;
         for (unsigned i = 0; i < bytes.size(); ++i) {
-            CHECK(3-expected[bytes[bs-i]].first == c.data[2 * i]);
-            CHECK(3-expected[bytes[bs-i]].second == c.data[2 * i + 1]);
+            CHECK(3 - expected[bytes[bs - i]].first == c.data[2 * i]);
+            CHECK(3 - expected[bytes[bs - i]].second == c.data[2 * i + 1]);
         }
     }
     bytes.push_back((1 << 4));
@@ -393,10 +393,10 @@ TEST_CASE("BAM Read Parsing") {
         int seqlen = strlen(seq_gt);
         srand(time(NULL));
         int N_RANDOM_CASES = 50;
-        std::vector<bam_nibble_data> copied;
+        gtl::vector<bam_nibble_data> copied;
 
-        std::vector<size_t> froms;
-        std::vector<size_t> tos;
+        gtl::vector<size_t> froms;
+        gtl::vector<size_t> tos;
         for (int casei = 0; casei < N_RANDOM_CASES; ++casei) {
             int to = rand() % (seqlen - 100) + 100;
             int from = rand() % (to - 100);
@@ -413,6 +413,62 @@ TEST_CASE("BAM Read Parsing") {
             INFO("from: ", from, " to: ", to, "seq.len: ", seq.len);
             CHECK_EQ(std::string{seq_gt}.substr(from, to - from),
                      std::string{buffer}.substr(seq.skip_first ? 1 : 0));
+        }
+    }
+    bam_hdr_destroy(hdr);
+    sam_close(fp);
+    free(seq_gt);
+}
+
+TEST_CASE("BAM Read Parsing With Crumbs") {
+    std::string input = "../tests/test_single.bam";
+    samFile *fp = sam_open(input.c_str(), "r");
+    if (fp == NULL) {
+        FAIL("Failed to open BAM file:", input);
+    }
+
+    bam_hdr_t *hdr = sam_hdr_read(fp);
+    bam1_t *rec = bam_init1();
+    if (sam_read1(fp, hdr, rec) <= 0) {
+        FAIL("Failed to read BAM record");
+    }
+
+    char *seq_gt = (char *)malloc(rec->core.l_qseq + 1);
+    for (int i = 0; i < rec->core.l_qseq; ++i) {
+        seq_gt[i] = seq_nt16_str[bam_seqi(bam_get_seq(rec), i)];
+    }
+    seq_gt[rec->core.l_qseq] = '\0';
+    SUBCASE(
+        "Converting Nibble-encoded data to crumbs and decoding it to bases") {
+        int seqlen = strlen(seq_gt);
+        srand(time(NULL));
+        int N_RANDOM_CASES = 50;
+
+        gtl::vector<CrumbledSubSeq> copied;
+
+        gtl::vector<size_t> froms;
+        gtl::vector<size_t> tos;
+        for (int casei = 0; casei < N_RANDOM_CASES; ++casei) {
+            int to = rand() % (seqlen - 100) + 100;
+            int from = to - 100 - (rand() % 12);
+            copied.emplace_back(bam_get_seq(rec), from, to, CrumbledSubSeq::from_nibbles{});
+            froms.push_back(from);
+            tos.push_back(to);
+        }
+        char buffer[1024 * 1024];
+        for (int casei = 0; casei < N_RANDOM_CASES; ++casei) {
+            auto &seq = copied[casei];
+            size_t from = froms[casei];
+            size_t to = tos[casei];
+            seq.convert_to_ascii(buffer);
+            INFO("from: ", from, " to: ", to, "seq.len: ", seq.len);
+            CHECK_EQ(std::string{seq_gt}.substr(from, to - from),
+                     std::string{buffer});
+            CrumbledSubSeq fr_chr_cr{seq_gt, from, to,
+                                     CrumbledSubSeq::from_ascii{}};
+            fr_chr_cr.convert_to_ascii(buffer);
+            CHECK_EQ(std::string{seq_gt}.substr(from, to - from),
+                     std::string{buffer});
         }
     }
     bam_hdr_destroy(hdr);

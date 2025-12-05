@@ -95,6 +95,7 @@ struct asm_config {
     size_t seed = 1453;
     bool rle = true;
     syncmer_params syncmer;
+    bool print_precleanup_graph = false;
     struct {
         uint64_t projected_count = 100'000'000;
         double false_positive_rate = 0.001;

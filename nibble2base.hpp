@@ -1,6 +1,7 @@
 #ifndef NIBBLE2BASE_HPP
 #define NIBBLE2BASE_HPP
 // #include <sys/_types/_u_char.h>
+#include "htslib/hts.h"
 typedef unsigned int u_int;
 typedef unsigned char u_char;
 typedef unsigned short u_short;
@@ -240,6 +241,7 @@ struct bam_nibble_data {
           skip_first(from % 2 == 1),
           data(new uint8_t[len / 2 + 1]) {  //(skip_first?1:0)]) {
         memcpy(data, nibbles + (from / 2), (len / 2) + 1);
+
     }
     bam_nibble_data() : len(0), skip_first(false), data(nullptr) {}
     bam_nibble_data(bam_nibble_data &&other)
@@ -266,6 +268,116 @@ struct bam_nibble_data {
         }
         buffer[len + (skip_first ? 1 : 0)] = 0;
         return buffer + len + (skip_first ? 1 : 0);
+    }
+};
+
+// Uses naive conversions for now can be optimized later if necessary
+struct CrumbledSubSeq {
+    size_t len : 62;
+    uint8_t skip_first_n : 2;
+    uint8_t *data;
+    struct from_ascii {};
+    struct from_nibbles {};
+    uint8_t *nibble2crumb(uint8_t *dest, const uint8_t *src, size_t from,
+                          size_t to) {
+        size_t _from = from & (~3);
+        size_t _to = to & (~3);
+        if (_to != to) {
+            _to += 4;
+        }
+        for (size_t i = _from; i < _to; i += 4) {
+            size_t write_idx = (i - _from) / 4;
+            dest[write_idx] = seq_nt16_int[bam_seqi(src, i)] |
+                              seq_nt16_int[bam_seqi(src, i + 1)] << 2 |
+                              seq_nt16_int[bam_seqi(src, i + 2)] << 4 |
+                              seq_nt16_int[bam_seqi(src, i + 3)] << 6;
+            // dest[write_idx] = 0xff;
+        }
+        skip_first_n = from - _from;
+
+        return dest;
+    }
+    uint8_t *chars2crumb(uint8_t *dest, const char *src, size_t from,
+                         size_t to) {
+        for (size_t i = from; i < to; i++) {
+            size_t write_index = (i-from) / 4;
+            size_t write_crumb = (i-from) % 4;
+            if (write_crumb == 0) {
+                dest[write_index] = 0;
+            }
+            switch (src[i]) {
+                case 'a':
+                case 'A':
+                    break;
+                case 'c':
+                case 'C':
+                    dest[write_index] |= 1 << (2 * write_crumb);
+                    break;
+                case 'g':
+                case 'G':
+                    dest[write_index] |= 2 << (2 * write_crumb);
+                    break;
+                case 'U':
+                case 'u':
+                case 'T':
+                case 't':
+                    dest[write_index] |= 3 << (2 * write_crumb);
+                    break;
+                default:
+                    break;
+            }
+        }
+        return dest;
+    }
+    char *crumb2base(char *dest, const uint8_t *src, size_t len) const {
+        static constexpr const char *lut = "ACGT";
+        for (size_t i = skip_first_n; i < len + skip_first_n; ++i) {
+            dest[i - skip_first_n] = lut[(src[i / 4] >> (2 * (i % 4))) & 3];
+        }
+        return dest;
+    }
+    CrumbledSubSeq(const char *nibbles, size_t from, size_t to, from_ascii)
+        : len((to - from)),
+          skip_first_n(0),
+          data(new uint8_t[len / 4 + 4]) {  //(skip_first?1:0)]) {
+        chars2crumb(data, nibbles, from, to);
+
+    }
+    CrumbledSubSeq(const uint8_t *nibbles, size_t from, size_t to, from_nibbles) noexcept
+        : len((to - from)),
+          skip_first_n(from & 3),
+          data(new uint8_t[len / 4 + 4]) {  //(skip_first?1:0)]) {
+        nibble2crumb(data, nibbles, from, to);
+    }
+    CrumbledSubSeq(const uint8_t *nibbles, size_t from, size_t to) noexcept
+        : len((to - from)),
+          skip_first_n(from & 3),
+          data(new uint8_t[len / 4 + 4]) {  //(skip_first?1:0)]) {
+        nibble2crumb(data, nibbles, from, to);
+
+    }
+    CrumbledSubSeq() noexcept : len(0), skip_first_n(0), data(nullptr) {}
+    CrumbledSubSeq(CrumbledSubSeq &&other) noexcept
+        : len(other.len), skip_first_n(other.skip_first_n), data(other.data) {
+        other.data = nullptr;
+    }
+    CrumbledSubSeq(const CrumbledSubSeq &other) = delete;
+    CrumbledSubSeq &operator=(const CrumbledSubSeq &other) = delete;
+    ~CrumbledSubSeq() { delete[] data; }
+    CrumbledSubSeq &operator=(CrumbledSubSeq &&other) noexcept {
+        if (this != &other) {
+            delete[] data;
+            data = other.data;
+            skip_first_n = other.skip_first_n;
+            len = other.len;
+            other.data = nullptr;
+        }
+        return *this;
+    }
+    char *convert_to_ascii(char *buffer) const {
+        crumb2base(buffer, data, len);
+        buffer[len] = '\0';
+        return buffer;
     }
 };
 #endif

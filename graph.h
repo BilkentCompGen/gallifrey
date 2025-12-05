@@ -26,6 +26,9 @@ consteval int_type nextpowerof2(int_type v) {
 using u64 = uint64_t;
 using u32 = uint32_t;
 
+// using SequenceContainerType = bam_nibble_data;
+using SequenceContainerType = CrumbledSubSeq;
+
 struct dbg_index {
     static constexpr u64 lcindex_increment =
         nextpowerof2((u64)MAXIMUM_WORK_THREADS);
@@ -33,7 +36,7 @@ struct dbg_index {
     struct bidbg_val {
         unsigned cc;
         unsigned fec;
-        gtl::vector<bam_nibble_data> seq;
+        gtl::vector<SequenceContainerType> seq;
 #ifdef PREV_WITH_SET
         gtl::flat_hash_set<u64> prev;
         void emplace_prev(u64 val) { prev.emplace(val); }
@@ -115,7 +118,7 @@ struct dbg_index {
             unsigned first_fec = current->second.fec;
             bool simplified = false;
             auto prev_it = dbg.find(current->second.prev[0]);
-            gtl::vector<bam_nibble_data> merged;
+            gtl::vector<SequenceContainerType> merged;
             unsigned cc_sum = 0;
             while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
                    prev_it->second.fec == 1) {
@@ -533,18 +536,19 @@ inline void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
         if (edges.seq.size() == 0) {
             fprintf(out,
                     "S\tC%" PRIu64
-                    "\t%s\tLN:i:%d\tRC:i:%u\tBE:i:%zu\tFE:i:%u\\n",
+                    "\t%s\tLN:i:%d\tRC:i:%u\tBE:i:%zu\tFE:i:%u\n",
                     lval, "", 0, edges.cc, edges.prev.size(), edges.fec);
         } else {
             //            int i = onehotto2bitDNA2(s, buffer);
             fprintf(out, "S\tC%" PRIu64 "\t", lval);
             size_t sofar = 0;
-            //            for (const bam_nibble_data &s : edges.seq) {
+            //            for (const SequenceContainerType &s : edges.seq) {
             // reversed
             for (auto it = edges.seq.begin(); it != edges.seq.end(); ++it) {
-                const bam_nibble_data &s = *it;
+                const SequenceContainerType &s = *it;
                 buf.require(s.len + 1);
                 s.convert_to_ascii((char *)buf.data);
+
                 fprintf(out, "%s", buf.data + (buf.data[0] == 'N' ? 1 : 0));
                 sofar += s.len;
             }
