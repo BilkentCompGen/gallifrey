@@ -38,7 +38,10 @@ int asm_program(CLI::App &parent) {
 
     app.add_flag("--rle", p->rle, "Enable Run Length Encoding")
         ->capture_default_str();
+
     app.add_flag("--print-raw-dbg", p->print_precleanup_graph, "Print DBG before cleanup (with .raw suffix)")
+        ->capture_default_str();
+    app.add_flag("--silent", p->silent, "Do not print progress to stderr")
         ->capture_default_str();
     app.add_option("--spaced-seed-mask", p->syncmer.spaced_seed_mask,
                    "Mask for spaced seeding. (0->skip, 1->keep, 2->mask left bit, 3->mask right bit.")

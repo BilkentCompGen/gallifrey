@@ -278,6 +278,9 @@ struct CrumbledSubSeq {
     uint8_t *data;
     struct from_ascii {};
     struct from_nibbles {};
+    static constexpr size_t storage_size(size_t bases) noexcept {
+        return bases / 4 + 4;
+    }
     uint8_t *nibble2crumb(uint8_t *dest, const uint8_t *src, size_t from,
                           size_t to) {
         size_t _from = from & (~3);
@@ -356,7 +359,11 @@ struct CrumbledSubSeq {
         nibble2crumb(data, nibbles, from, to);
 
     }
-    CrumbledSubSeq() noexcept : len(0), skip_first_n(0), data(nullptr) {}
+    CrumbledSubSeq(size_t length, uint8_t skip) noexcept
+        : len(length),
+          skip_first_n(skip),
+          data(new uint8_t[storage_size(length)]()) {}
+    CrumbledSubSeq() noexcept : CrumbledSubSeq(0, 0) {}
     CrumbledSubSeq(CrumbledSubSeq &&other) noexcept
         : len(other.len), skip_first_n(other.skip_first_n), data(other.data) {
         other.data = nullptr;
@@ -378,6 +385,20 @@ struct CrumbledSubSeq {
         crumb2base(buffer, data, len);
         buffer[len] = '\0';
         return buffer;
+    }
+    [[nodiscard]] CrumbledSubSeq reverse_complement() const {
+        CrumbledSubSeq rc{len, 0};
+        for (size_t i = 0; i < len; ++i) {
+            const size_t src_pos = len - 1 - i + skip_first_n;
+            const size_t src_byte = src_pos / 4;
+            const size_t src_shift = (src_pos % 4) * 2;
+            const uint8_t code = (data[src_byte] >> src_shift) & 0x3;
+            const uint8_t complement = static_cast<uint8_t>(code ^ 0x3);
+            const size_t dst_byte = i / 4;
+            const size_t dst_shift = (i % 4) * 2;
+            rc.data[dst_byte] |= static_cast<uint8_t>(complement << dst_shift);
+        }
+        return rc;
     }
 };
 #endif

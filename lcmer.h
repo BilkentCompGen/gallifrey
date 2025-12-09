@@ -1,4 +1,7 @@
 #pragma once
+#include <cstdint>
+
+#include "nibble2base.hpp"
 #ifndef LCMER_H
 #define LCMER_H
 #include <htslib/sam.h>
@@ -226,7 +229,7 @@ T reverse_complement_kmer(T kmer, int K) {
 }
 
 template <typename INT_TYPE = uint32_t, INT_TYPE BIT_WIDTH = 2>
-struct KmerViewOnCrumbs {
+struct KmerViewOnInts {
     using int_type = INT_TYPE;
     int_type k;
     int_type KMASK;
@@ -235,7 +238,7 @@ struct KmerViewOnCrumbs {
     static constexpr INT_TYPE BIT_MASK = -1;
     // static constexpr INT_TYPE BIT_MASK = ((INT_TYPE)1 << BIT_WIDTH) - 1;
 
-    KmerViewOnCrumbs(int_type k)
+    KmerViewOnInts(int_type k)
         : k{k}, KMASK{((int_type)1 << (BIT_WIDTH * k)) - 1}, value{0} {}
 
     int fill(const uint8_t *data_address) {
@@ -280,9 +283,52 @@ struct KmerViewOnCrumbs {
         while (p < end && *p == prev) {
             ++p;
         }
-        if(p==end) { return cap;}
+        if (p == end) {
+            return cap;
+        }
         value = ((value << BIT_WIDTH) & KMASK) | (*p & BIT_MASK);
         return static_cast<int_type>((p - data_address) + 1);
+    }
+    constexpr int_type get() const noexcept { return value; }
+};
+
+template <class INT_TYPE = uint32_t>
+struct KmerViewOnCrumbs {
+    using int_type = INT_TYPE;
+    int_type k;
+    int_type kmask;
+    int_type value;
+    uint8_t prev;
+    static constexpr uint8_t mask = 3U;
+    KmerViewOnCrumbs(int_type k)
+        : k{k}, kmask{((int_type)1 << (2 * k)) - 1}, value{0}, prev{255} {}
+
+    int fill_rle(const uint8_t *data_address, int_type cap) {
+        int_type i;
+        int_type it = move_get_rle( data_address, 0, cap);
+        for (i = 0; i < k && it < cap; i++) {
+            it = move_get_rle( data_address, it, cap);
+        }
+        return it;
+    }
+
+    int_type move_get_rle(const uint8_t *data_address, int_type index,
+                          int_type cap) {
+        size_t byte_idx = index / 4;
+        size_t crum_idx = index % 4;
+        uint8_t at = (data_address[byte_idx] >> (crum_idx * 2) ) & mask;
+        while (index < cap && at == prev) {
+            ++index;
+            byte_idx = index / 4;
+            crum_idx = index % 4;
+            at = (data_address[byte_idx] >> (crum_idx * 2) ) & mask;
+        }
+        if (index == cap) {
+            return index;
+        }
+        value = ((value << 2) & kmask) | at;
+        prev = at;
+        return index + 1;
     }
     constexpr int_type get() const noexcept { return value; }
 };
@@ -395,31 +441,49 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
                                     struct lps *str,
                                     const auto &syncmer_functor) {
     int core_index = 0;
-    KmerViewOnCrumbs<uint64_t, 2> kmer_view{syncmer_functor.k()};
+    KmerViewOnInts<uint64_t, 2> kmer_view{syncmer_functor.k()};
     int64_t it1 = kmer_view.fill_rle(data, len);
-    // find lcp cores
-    // if(str->capacity < )
     if (str->capacity < len * CONSTANT_FACTOR) {
         str->capacity = 2 * len * CONSTANT_FACTOR;
         str->cores = (struct core *)realloc(
             str->cores, (str->capacity) * sizeof(struct core));
     }
     for (; it1 + SYNCMER_K < len;) {
-        // printf("%d\t%d\n", kmer_view.get(), table[kmer_view.get()]);
         if (syncmer_functor(kmer_view.get())) {
-            // if (core_index >= str->capacity){
-            //     str->cores = (struct core *)realloc(str->cores,
-            //     (str->capacity * 2 + 1) * sizeof(struct core)); str->capacity
-            //     = str->capacity * 2 + 1;
-            // }
             init_core_kmer<uint32_t>(&(str->cores[core_index]), kmer_view.get(),
                                      it1, it1 + SYNCMER_K);
             core_index++;
         }
         it1 = kmer_view.move_get_rle(data[it1 - 1], data, it1, len);
-        // cout << "None\n";
     }
-    // cout << "CORESSS" << it1 << "\t" << it2 << "\n";
+    return core_index;
+}
+inline uint64_t parse1_CrumbledSubSeqs_syncmers(const gtl::vector<CrumbledSubSeq> &sseqs,
+                                       struct lps *str,
+                                       const auto &syncmer_functor) {
+    int core_index = 0;
+    if (sseqs.empty()) {
+        fprintf(stderr, "Error: Empty sequence list\n");
+        return core_index;
+    }
+    KmerViewOnCrumbs<uint64_t> kmer_view{syncmer_functor.k()};
+    size_t it1 = kmer_view.fill_rle(sseqs[0].data + sseqs[0].skip_first_n, sseqs[0].len);
+    it1 += sseqs[0].skip_first_n;
+    size_t l_so_far = 0;
+    for (size_t i = 0; i < sseqs.size(); ++i) {
+        for (; it1 < sseqs[i].len;) {
+            if (syncmer_functor(kmer_view.get())) {
+                init_core_kmer<uint32_t>(&(str->cores[core_index]),
+                                         kmer_view.get(), l_so_far + it1 - sseqs[i].skip_first_n, l_so_far + it1 + SYNCMER_K - sseqs[i].skip_first_n);
+                core_index++;
+            }
+            it1 = kmer_view.move_get_rle(sseqs[i].data, it1, sseqs[i].len);
+        }
+        if (sseqs.size() > i + 1) {
+            it1 = sseqs[i + 1].skip_first_n;
+        }
+        l_so_far += sseqs[i].len;
+    }
     return core_index;
 }
 
@@ -448,19 +512,36 @@ inline void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len,
     lps_ptr->size = parse1_bam_syncmers(data, len, lps_ptr, syncmer_functor);
 }
 
+inline void init_lps_crumbled(lps *lps_ptr, gtl::vector<CrumbledSubSeq> &sseqs,
+                              const auto &syncmer_functor) {
+    size_t len = 0;
+    lps_ptr->level = 1;
+    for (auto &sseq : sseqs) {
+        len += sseq.len;
+    }
+    if (lps_ptr->cores == nullptr) {
+        lps_ptr->size = 0;
+        lps_ptr->capacity = (len / CONSTANT_FACTOR);
+        lps_ptr->cores = (struct core *)malloc((len / CONSTANT_FACTOR) *
+                                               sizeof(struct core));
+        lps_ptr->level = 0;
+    } else {
+        if (lps_ptr->capacity < len / CONSTANT_FACTOR) {
+            lps_ptr->capacity = len / CONSTANT_FACTOR;
+
+            lps_ptr->cores = (struct core *)realloc(
+                lps_ptr->cores, (len / CONSTANT_FACTOR) * sizeof(struct core));
+        }
+    }
+    lps_ptr->size = parse1_CrumbledSubSeqs_syncmers(sseqs, lps_ptr, syncmer_functor);
+}
+
 inline void parse_cores_from_bam_record(const uint8_t *data, size_t len,
                                         int lcp_level, lps *str,
                                         const auto &syncmer_functor,
                                         charsi &chs, lcp_read &lr,
                                         bool reversed = false) {
-    // uint64_t estimated_core_size = (int)(len / std::pow(1.5, lcp_level));
-
-    // onehotto2bitDNA_bivec_chs(data, len, chs);  // TODO Make this not
-    // allocate work
-    //  on a scratch space per thread.
-    //
     chs.require(len);
-    //    nibble2base((uint8_t *)data, (char *)chs.data, (int)len);
     if (reversed) {
         onehotto2bitDNA_bivec_chs_reverse(data, len, chs);
     } else {

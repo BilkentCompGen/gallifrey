@@ -1,6 +1,7 @@
 #include "lcmer.h"
 
 #include <cstdint>
+#include <string_view>
 
 #include "ext/doctest.h"
 #include "ext/lcptools/lcptools_ho.h"
@@ -246,11 +247,88 @@ TEST_CASE("Nibbles to Crumbs") {
     }
 }
 
+TEST_CASE("CrumbledSubSeq reverse complement") {
+    auto expected_rc = [](std::string_view seq) {
+        auto complement = [](char base) {
+            switch (base) {
+                case 'A':
+                    return 'T';
+                case 'C':
+                    return 'G';
+                case 'G':
+                    return 'C';
+                case 'T':
+                    return 'A';
+                default:
+                    return 'N';
+            }
+        };
+        std::string rc;
+        rc.reserve(seq.size());
+        for (auto it = seq.rbegin(); it != seq.rend(); ++it) {
+            rc.push_back(complement(*it));
+        }
+        return rc;
+    };
+
+    SUBCASE("ASCII constructor maintains order") {
+        const std::string sequence =
+            "CTCGCGACCTGGCTGCCCAGATGGGCCTGTTCCCCAGCCCCGAGCTCCTAGGCTATGACAGCTTAC"
+            "CAAGGTTCCGGCCACTTGTCAGATAGCAGAGTCGGCCACGGGGCTCAAGGCTGACTTGTACTTCCC"
+            "TCTGGCTGCTCGTAGGACGCCACCCTGAGAATGGACCGCAGTACCAGCCTGCTGT";
+        CrumbledSubSeq crumb{sequence.c_str(), 0, sequence.size(),
+                             CrumbledSubSeq::from_ascii{}};
+        std::string forward(sequence.size(), '\0');
+        crumb.convert_to_ascii(forward.data());
+        CHECK_EQ(sequence, forward);
+
+        auto rc = crumb.reverse_complement();
+        std::string rc_ascii(sequence.size(), '\0');
+        rc.convert_to_ascii(rc_ascii.data());
+        CHECK_EQ(expected_rc(sequence), rc_ascii);
+    }
+
+    SUBCASE("Nibble constructor respects skip offset") {
+        const std::string raw =
+            "CGGGGTGAGCACCTCAGGAAAAGCAGGCTGGGGGTCGGGGGCAAGCTCCGCTTTGGCCGGGCTGAG"
+            "GTCAAGGCACCTGTGAGTGAGTTGGAGTGAGGGGAGGAGCGGCAGGGCCCTGGAGTAGAGTCCAGG"
+            "GGAGGTCCCAAGCCCAGGGATAAGCTCTGTCATGGGGTGAGAGACAGGGCAGAGACAGACTGGAGG"
+            "CTGGGAGGCCAGGAGAAGGGCTGGAGTCAGGGACAGGGGTCTATACCCACCCTCCCCCCGCCACCC"
+            "CACTGGTGTCTGAGAAAGGACTCCCACAGGGTCCCCAGAACTTGGTCTGAGTTCCTCAGTGTGCAC"
+            "TGGTCACTACTAGCATGGACTGGAAAGCCGGGCGTGGAG";
+        auto encode_bam = [](std::string_view seq) {
+            gtl::vector<uint8_t> packed((seq.size() + 1) / 2, 0);
+            for (size_t i = 0; i < seq.size(); ++i) {
+                uint8_t nibble = seq_nt16_table[(uint8_t)seq[i]];
+                if ((i & 1U) == 0) {
+                    packed[i / 2] = nibble << 4;
+                } else {
+                    packed[i / 2] |= nibble & 0x0F;
+                }
+            }
+            return packed;
+        };
+        auto bam_bytes = encode_bam(raw);
+        size_t from = 3;  // force skip_first_n != 0
+        size_t to = 3 + 5;
+        CrumbledSubSeq crumb{bam_bytes.data(), from, to,
+                             CrumbledSubSeq::from_nibbles{}};
+        std::string view(to - from, '\0');
+        crumb.convert_to_ascii(view.data());
+        CHECK_EQ(raw.substr(from, to - from), view);
+
+        auto rc = crumb.reverse_complement();
+        std::string rc_ascii(view.size(), '\0');
+        rc.convert_to_ascii(rc_ascii.data());
+        CHECK_EQ(expected_rc(raw.substr(from, to - from)), rc_ascii);
+    }
+}
+
 TEST_CASE("K-mer view on Crumbs") {
     gtl::vector<uint8_t> bytes{{0, 1, 2, 3, 0, 1, 2, 3}};
     SUBCASE("K==4") {
         static constexpr int K = 4;
-        KmerViewOnCrumbs<uint64_t, 2> kview(K);
+        KmerViewOnInts<uint64_t, 2> kview(K);
         size_t i = kview.fill(bytes.data());
         uint32_t expected =
             bytes[0] << 6 | bytes[1] << 4 | bytes[2] << 2 | bytes[3];
@@ -264,7 +342,7 @@ TEST_CASE("K-mer view on Crumbs") {
     }
     SUBCASE("K==5") {
         static constexpr int K = 5;
-        KmerViewOnCrumbs<uint64_t, 2> kview(K);
+        KmerViewOnInts<uint64_t, 2> kview(K);
         size_t i = kview.fill(bytes.data());
         uint32_t expected = bytes[0] << 8 | bytes[1] << 6 | bytes[2] << 4 |
                             bytes[3] << 2 | bytes[4];
@@ -451,7 +529,8 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
         for (int casei = 0; casei < N_RANDOM_CASES; ++casei) {
             int to = rand() % (seqlen - 100) + 100;
             int from = to - 100 - (rand() % 12);
-            copied.emplace_back(bam_get_seq(rec), from, to, CrumbledSubSeq::from_nibbles{});
+            copied.emplace_back(bam_get_seq(rec), from, to,
+                                CrumbledSubSeq::from_nibbles{});
             froms.push_back(from);
             tos.push_back(to);
         }

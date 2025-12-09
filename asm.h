@@ -96,6 +96,7 @@ struct asm_config {
     bool rle = true;
     syncmer_params syncmer;
     bool print_precleanup_graph = false;
+    bool silent = false;
     struct {
         uint64_t projected_count = 100'000'000;
         double false_positive_rate = 0.001;
