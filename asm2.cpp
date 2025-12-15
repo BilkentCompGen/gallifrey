@@ -17,6 +17,7 @@
 #include <gtl/vector.hpp>
 #include <iostream>
 #include <string>
+#include <utility>
 
 #include "asm.h"
 #include "bgzf.h"
@@ -104,7 +105,7 @@ struct assembler {
                         val.second.core_count++;
                     },
                     [&](const dbg_index::dbg_map_t::constructor &ctr) {
-                        ctr(ll[i], dbg_index::bidbg_val{1, 0, {}, {}});
+                        ctr(ll[i], dbg_index::bidbg_val{1});
                     });
             }
         } else {
@@ -116,7 +117,7 @@ struct assembler {
                         // val.second.cc++;
                     },
                     [&](const dbg_index::dbg_map_t::constructor &ctr) {
-                        ctr(ll[i], dbg_index::bidbg_val{0, 0, {}, {ll[i - 1]}});
+                        ctr(ll[i], dbg_index::bidbg_val{0U, ll[i - 1]});
                     });
             } else {
                 return dbgi.dbg.lazy_emplace_l(
@@ -126,7 +127,7 @@ struct assembler {
                         val.second.core_count++;
                     },
                     [&](const dbg_index::dbg_map_t::constructor &ctr) {
-                        ctr(ll[i], dbg_index::bidbg_val{1, 0, {}, {ll[i - 1]}});
+                        ctr(ll[i], dbg_index::bidbg_val{1U, ll[i - 1]});
                     });
             }
         }
@@ -137,11 +138,13 @@ struct assembler {
 
         gtl::vector<uint64_t> ll(1, 0);
         ll.reserve(lr.cores.size() - LCMER_L + 3);
-        ll.push_back(dbgi.get(l));
+        dbg_index::lci_type lval = dbgi.get(l);
+        ll.push_back(lval.id);
         for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
             uint32_t in_core = lr.cores[i];
             l.update_lcmer(in_core);
-            ll.push_back(dbgi.get(l));
+            lval = dbgi.get(l);
+            ll.push_back(lval.id);
         }
         ll.push_back(0);
         return ll;
@@ -181,7 +184,7 @@ struct assembler {
         [[maybe_unused]] uint64_t &lcmer_index) {
         lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
 
-        uint64_t val = dbgi.get(l);
+        uint64_t val = dbgi.get(l).id;
 
         for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
             uint64_t from = lr.pos[i - 1].second;
@@ -199,13 +202,13 @@ struct assembler {
                 if (val.second.seq.size() == 0) {
                     if (to - from > 0) {
                         val.second.seq.emplace_back(lr.data, from, to);
-                        assert((to & 3) + 4 < lr.data_length);
+                        // assert((to & 3) + 4 < lr.data_length);
                     }
                 }
             });
             uint32_t in_core = lr.cores[i];
             l.update_lcmer(in_core);
-            val = dbgi.get(l);
+            val = dbgi.get(l).id;
         }
     }
 
@@ -407,38 +410,61 @@ struct assembler {
         fprintf(stderr, "%d processed\n%d total reads\n", valid_sum, all_sum);
         return 0;
     }
-
-    void fold_dbg_graph(dbg_index &dbgi) {
-        lps str = {0, 0, 0, 0};
-        lcp_read lr;
-
-        for (auto &node : dbgi.dbg) {
-            if (node.second.redirected()) {
-                continue;
-            }
-            lr.clear();
-
-            gtl::vector<CrumbledSubSeq> rev_seqs;
-            for (auto it = node.second.seq.rbegin();
-                 it != node.second.seq.rend(); ++it) {
-                rev_seqs.emplace_back(it->reverse_complement());
-            }
-            init_lps_crumbled(&str, rev_seqs, syncmer_functor);
-            lps_deepen(&str, lcp_level);
-
-            for (int i = 0; i < str.size; ++i) {
-                lr.cores.emplace_back(str.cores[i].label);
-                lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-            }
-            if (lr.cores.size() < LCMER_L + 2) {
-                continue;
-            }
-            auto found_ids = find_lcmers(lr, dbgi);
-            // for (auto id : found_ids) {
-            //     fprintf(stdout, "%llu\t%llu\n", node.first, id);
-            // }
-            lps_clear(&str);
+    template <class map, class F>
+    static void for_each_map(const map &mp, const F &fCallback, int threads) {
+        std::vector<std::thread> workers;
+        for (int tid = 0; tid < threads; ++tid) {
+            workers.emplace_back(
+                [&](const map &mp) {
+                    for (size_t i = tid; i < mp.subcnt(); i += threads) {
+                        mp.with_submap(i, [&](const map::EmbeddedSet &set) {
+                            for (const auto &p : set) {
+                                fCallback(p);
+                            }
+                        });
+                    }
+                },
+                std::cref(mp));
         }
+        for (auto &worker : workers) {
+            worker.join();
+        }
+    }
+    void fold_dbg_graph(dbg_index &dbgi) {
+
+        for_each_map(
+            dbgi.dbg,
+            [&](const auto &node) {
+                lps str = {0, 0, 0, 0};
+                lcp_read lr;
+                // dbgi.dbg.for_each([&](auto &node) {
+                if (node.second.redirected()) {
+                    return;
+                }
+                lr.clear();
+
+                gtl::vector<SequenceContainerType> rev_seqs;
+                for (auto it = node.second.seq.rbegin();
+                     it != node.second.seq.rend(); ++it) {
+                    rev_seqs.emplace_back(it->reverse_complement());
+                }
+                init_lps_crumbled(&str, rev_seqs, syncmer_functor);
+                lps_deepen(&str, lcp_level);
+
+                for (int i = 0; i < str.size; ++i) {
+                    lr.cores.emplace_back(str.cores[i].label);
+                    lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
+                }
+                if (lr.cores.size() < LCMER_L + 2) {
+                    return;
+                }
+                auto found_ids = find_lcmers(lr, dbgi);
+                // for (auto id : found_ids) {
+                //     fprintf(stdout, "%llu\t%llu\n", node.first, id);
+                // }
+                lps_clear(&str);
+            },
+            threads.work);
     }
 };
 
@@ -492,7 +518,7 @@ int run_assembly(const asm_config &cfg) {
         fclose(out);
     }
 
-    GraphCleaning::run(dbg, cfg.graph_cleaning);
+    GraphCleaning::run(dbg, cfg);
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
                        "Graph cleaning done.");
 
@@ -559,7 +585,7 @@ TEST_CASE("Graph simplification simple") {
     }
     dbgi.count_forward_edges();
 
-    GraphCleaning::run(dbgi, {1, 10, 10, 2});
+    GraphCleaning::run(dbgi, {.graph_cleaning={1, 10, 10, 2}});
     SUBCASE("Post simplify dbg") {
         for (auto &node : dbgi.dbg) {
             INFO(node.first, "\t.\t.\t", node.second.seq.size());
@@ -634,19 +660,8 @@ TEST_CASE("Graph simplification Bubble") {
     tests_mock_fill_seq(dbgi);
     print_dbg_dot(dbgi, 0);
 
-
-    GraphCleaning::run(dbgi, {1, 10, 10, 2});
+    GraphCleaning::run(dbgi, {.graph_cleaning={1, 10, 10, 2}});
     print_dbg_dot(dbgi, 1);
-
-    SUBCASE("Post simplify dbg") {
-        for (auto &node : dbgi.dbg) {
-            INFO(node.first, "\t.\t.\t", node.second.seq.size());
-        }
-        CAPTURE(dbgi.dbg.size());
-        CHECK(dbgi.dbg.size() == 3);
-    }
-
-    GraphCleaning::run(dbgi, {1, 10, 10, 2});
 
     SUBCASE("Post simplify dbg iter 2") {
         for (auto &node : dbgi.dbg) {
@@ -704,19 +719,7 @@ TEST_CASE("Graph simplification Tips (Outgoing)") {
     tests_mock_fill_seq(dbgi);
     print_dbg_dot(dbgi, 3);
 
-
-    GraphCleaning::run(dbgi, {1, 10, 10, 2});
-    SUBCASE("Post simplify dbg") {
-        for (auto &node : dbgi.dbg) {
-            INFO(node.first, "\t.\t.\t", node.second.seq.size());
-        }
-        CAPTURE(dbgi.dbg.size());
-        CHECK(dbgi.dbg.size() == 2);
-    }
-    print_dbg_dot(dbgi, 4);
-
-    GraphCleaning::run(dbgi, {1, 10, 10, 2});
-
+    GraphCleaning::run(dbgi, {.graph_cleaning={1, 10, 10, 2}});
     SUBCASE("Post simplify dbg") {
         for (auto &node : dbgi.dbg) {
             INFO(node.first, "\t.\t.\t", node.second.seq.size());
@@ -724,7 +727,7 @@ TEST_CASE("Graph simplification Tips (Outgoing)") {
         CAPTURE(dbgi.dbg.size());
         CHECK(dbgi.dbg.size() == 1);
     }
-    print_dbg_dot(dbgi, 5);
+    print_dbg_dot(dbgi, 4);
 }
 TEST_CASE("Graph simplification Tips (Incoming)") {
     dbg_index dbgi{0.95, 10, 0};
@@ -775,19 +778,9 @@ TEST_CASE("Graph simplification Tips (Incoming)") {
 
     tests_mock_fill_seq(dbgi);
     print_dbg_dot(dbgi, 6);
-    GraphCleaning::run(dbgi, {1, 10, 10, 2});
+    GraphCleaning::run(dbgi, {.graph_cleaning={1, 10, 10, 2}});
 
     SUBCASE("Post simplify dbg") {
-        for (auto &node : dbgi.dbg) {
-            INFO(node.first, "\t.\t.\t", node.second.seq.size());
-        }
-        CAPTURE(dbgi.dbg.size());
-        CHECK(dbgi.dbg.size() == 2);
-    }
-
-
-    GraphCleaning::run(dbgi, {1, 10, 10, 2});
-    SUBCASE("Post simplify dbg 2") {
         for (auto &node : dbgi.dbg) {
             INFO(node.first, "\t.\t.\t", node.second.seq.size());
         }

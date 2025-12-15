@@ -309,18 +309,35 @@ TEST_CASE("CrumbledSubSeq reverse complement") {
             return packed;
         };
         auto bam_bytes = encode_bam(raw);
-        size_t from = 3;  // force skip_first_n != 0
-        size_t to = 3 + 5;
-        CrumbledSubSeq crumb{bam_bytes.data(), from, to,
-                             CrumbledSubSeq::from_nibbles{}};
-        std::string view(to - from, '\0');
-        crumb.convert_to_ascii(view.data());
-        CHECK_EQ(raw.substr(from, to - from), view);
+        for (int i = 0; i < raw.size() - 8; ++i) {
+            size_t from = 3;  // force skip_first_n != 0
+            size_t to = 3 + 5 + i;
+            CrumbledSubSeq crumb{bam_bytes.data(), from, to,
+                                 CrumbledSubSeq::from_nibbles{}};
+            std::string view(to - from, '\0');
+            crumb.convert_to_ascii(view.data());
+            CHECK_EQ(raw.substr(from, to - from), view);
 
-        auto rc = crumb.reverse_complement();
-        std::string rc_ascii(view.size(), '\0');
-        rc.convert_to_ascii(rc_ascii.data());
-        CHECK_EQ(expected_rc(raw.substr(from, to - from)), rc_ascii);
+            auto rc = crumb.reverse_complement();
+            std::string rc_ascii(view.size(), '\0');
+            rc.convert_to_ascii(rc_ascii.data());
+            CHECK_EQ(expected_rc(raw.substr(from, to - from)), rc_ascii);
+
+            CrumbledSubSeq64 crumb64{bam_bytes.data(), from, to,
+                                     CrumbledSubSeq64::from_nibbles{}};
+            auto rc64_old = crumb64.reverse_complement_old();
+            std::string rc_old_ascii(view.size(), '\0');
+            rc64_old.convert_to_ascii(rc_old_ascii.data());
+            CHECK_EQ(expected_rc(raw.substr(from, to - from)), rc_old_ascii);
+            INFO(crumb64.skip_first_n);
+
+            auto rc64_fast = crumb64.reverse_complement();
+            std::string rc_fast_ascii(view.size(), '\0');
+            rc64_fast.convert_to_ascii(rc_fast_ascii.data());
+            INFO(rc64_fast.skip_first_n);
+            CHECK_EQ(expected_rc(raw.substr(from, to - from)), rc_fast_ascii);
+            CHECK_EQ(rc_old_ascii, rc_fast_ascii);
+        }
     }
 }
 

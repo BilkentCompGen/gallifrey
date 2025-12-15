@@ -1,7 +1,9 @@
 #ifndef NIBBLE2BASE_HPP
 #define NIBBLE2BASE_HPP
 // #include <sys/_types/_u_char.h>
+#include <algorithm>
 #include "htslib/hts.h"
+
 typedef unsigned int u_int;
 typedef unsigned char u_char;
 typedef unsigned short u_short;
@@ -229,8 +231,6 @@ static __attribute__((constructor)) CPUType nibble2base_resolve(void) {
 #endif
 #endif  // BUILDING_SIMD_NIBBLE2BASE
 
-
-
 struct bam_nibble_data {
     size_t len : 63;
     bool skip_first : 1;
@@ -241,7 +241,6 @@ struct bam_nibble_data {
           skip_first(from % 2 == 1),
           data(new uint8_t[len / 2 + 1]) {  //(skip_first?1:0)]) {
         memcpy(data, nibbles + (from / 2), (len / 2) + 1);
-
     }
     bam_nibble_data() : len(0), skip_first(false), data(nullptr) {}
     bam_nibble_data(bam_nibble_data &&other)
@@ -303,8 +302,8 @@ struct CrumbledSubSeq {
     uint8_t *chars2crumb(uint8_t *dest, const char *src, size_t from,
                          size_t to) {
         for (size_t i = from; i < to; i++) {
-            size_t write_index = (i-from) / 4;
-            size_t write_crumb = (i-from) % 4;
+            size_t write_index = (i - from) / 4;
+            size_t write_crumb = (i - from) % 4;
             if (write_crumb == 0) {
                 dest[write_index] = 0;
             }
@@ -339,14 +338,15 @@ struct CrumbledSubSeq {
         }
         return dest;
     }
-    CrumbledSubSeq(const char *nibbles, size_t from, size_t to, from_ascii)
+    CrumbledSubSeq(const char *nibbles, size_t from, size_t to,
+                   from_ascii) noexcept
         : len((to - from)),
           skip_first_n(0),
           data(new uint8_t[len / 4 + 4]) {  //(skip_first?1:0)]) {
         chars2crumb(data, nibbles, from, to);
-
     }
-    CrumbledSubSeq(const uint8_t *nibbles, size_t from, size_t to, from_nibbles) noexcept
+    CrumbledSubSeq(const uint8_t *nibbles, size_t from, size_t to,
+                   from_nibbles) noexcept
         : len((to - from)),
           skip_first_n(from & 3),
           data(new uint8_t[len / 4 + 4]) {  //(skip_first?1:0)]) {
@@ -357,7 +357,6 @@ struct CrumbledSubSeq {
           skip_first_n(from & 3),
           data(new uint8_t[len / 4 + 4]) {  //(skip_first?1:0)]) {
         nibble2crumb(data, nibbles, from, to);
-
     }
     CrumbledSubSeq(size_t length, uint8_t skip) noexcept
         : len(length),
@@ -398,6 +397,277 @@ struct CrumbledSubSeq {
             const size_t dst_shift = (i % 4) * 2;
             rc.data[dst_byte] |= static_cast<uint8_t>(complement << dst_shift);
         }
+        return rc;
+    }
+};
+
+// https://github.com/ruanjue/wtdbg2/blob/b77c5657c8095412317e4a20fe3668f5bde6b1ac/dna.h#L108
+template <class T>
+T reverse_complement_kmer(T kmer, int K) {
+    uint32_t shift_count = (sizeof(T) * 8) - 2 * K;
+    kmer = ~kmer;
+    kmer = ((kmer & 0x3333333333333333LLU) << 2) |
+           ((kmer & 0xCCCCCCCCCCCCCCCCLLU) >> 2);
+    kmer = ((kmer & 0x0F0F0F0F0F0F0F0FLLU) << 4) |
+           ((kmer & 0xF0F0F0F0F0F0F0F0LLU) >> 4);
+    if constexpr (sizeof(T) == 8) {
+        kmer = __builtin_bswap64(kmer);
+    } else if constexpr (sizeof(T) == 4) {
+        kmer = __builtin_bswap32(kmer);
+    } else if constexpr (sizeof(T) == 2) {
+        kmer = __builtin_bswap16(kmer);
+    }
+    kmer = kmer >> shift_count;
+    return kmer;
+}
+// 64-bit packed variant: 32 bases per word, 2 bits per base.
+struct CrumbledSubSeq64 {
+    size_t len : 59;
+    uint8_t skip_first_n : 6;  // offset within first word in bases (0-31)
+    uint64_t *data;
+    struct from_ascii {};
+    struct from_nibbles {};
+
+    static constexpr size_t bases_per_word = 32;
+    static constexpr size_t storage_size(size_t bases) noexcept {
+        return bases / bases_per_word + 1;  // extra word for padding
+    }
+
+    static inline uint8_t base_to_code(char c) {
+        switch (c) {
+            case 'a':
+            case 'A':
+                return 0;
+            case 'c':
+            case 'C':
+                return 1;
+            case 'g':
+            case 'G':
+                return 2;
+            case 'u':
+            case 'U':
+            case 't':
+            case 'T':
+                return 3;
+            default:
+                return 0;
+        }
+    }
+
+    template <class FetchCode>
+    void pack_range(uint64_t *dest, size_t aligned_from, size_t to,
+                    FetchCode &&fetch) {
+        const size_t total_bases = to - aligned_from;
+        for (size_t i = 0; i < total_bases; ++i) {
+            const uint64_t code = fetch(aligned_from + i) & 0x3;
+            const size_t bit_index = i * 2;
+            dest[bit_index >> 6] |= code << (bit_index & 63);
+        }
+    }
+
+    CrumbledSubSeq64(const uint8_t *nibbles, size_t from, size_t to,
+                     from_nibbles) noexcept
+        : len(to - from),
+          skip_first_n(static_cast<uint8_t>(from & 31)),
+          data(nullptr) {
+        const size_t aligned_from = from & ~static_cast<size_t>(31);
+        const size_t total_bases = (to - aligned_from);
+        data = new uint64_t[storage_size(total_bases)]();
+        pack_range(data, aligned_from, to, [&](size_t idx) {
+            return static_cast<uint64_t>(seq_nt16_int[bam_seqi(nibbles, idx)]);
+        });
+    }
+
+    CrumbledSubSeq64(const uint8_t *nibbles, size_t from, size_t to) noexcept
+        : CrumbledSubSeq64(nibbles, from, to, from_nibbles{}) {}
+
+    CrumbledSubSeq64(const char *bases, size_t from, size_t to,
+                     from_ascii) noexcept
+        : len(to - from),
+          skip_first_n(static_cast<uint8_t>(from & 31)),
+          data(nullptr) {
+        const size_t aligned_from = from & ~static_cast<size_t>(31);
+        const size_t total_bases = (to - aligned_from);
+        data = new uint64_t[storage_size(total_bases)]();
+        pack_range(data, aligned_from, to, [&](size_t idx) {
+            return static_cast<uint64_t>(base_to_code(bases[idx]));
+        });
+    }
+
+    CrumbledSubSeq64(size_t length, uint8_t skip_bases) noexcept
+        : len(length),
+          skip_first_n(static_cast<uint8_t>(skip_bases & 63)),
+          data(new uint64_t[storage_size(length + skip_bases)]()) {}
+    CrumbledSubSeq64() noexcept : CrumbledSubSeq64(0, 0) {}
+    CrumbledSubSeq64(CrumbledSubSeq64 &&other) noexcept
+        : len(other.len),
+          skip_first_n(other.skip_first_n),
+          data(other.data) {
+        other.data = nullptr;
+    }
+    CrumbledSubSeq64(const CrumbledSubSeq64 &other) = delete;
+    CrumbledSubSeq64 &operator=(const CrumbledSubSeq64 &other) = delete;
+    ~CrumbledSubSeq64() { delete[] data; }
+    CrumbledSubSeq64 &operator=(CrumbledSubSeq64 &&other) noexcept {
+        if (this != &other) {
+            delete[] data;
+            data = other.data;
+            skip_first_n = other.skip_first_n;
+            len = other.len;
+            other.data = nullptr;
+        }
+        return *this;
+    }
+
+    char *convert_to_ascii(char *buffer) const {
+        static constexpr const char *lut = "ACGT";
+        size_t base_index = 0;
+
+
+        auto scalar_emit = [&](size_t count) {
+            const size_t bit_base = static_cast<size_t>(skip_first_n) * 2;
+            for (size_t i = 0; i < count; ++i) {
+                const size_t bit_index = bit_base + (base_index + i) * 2;
+                const uint64_t word = data[bit_index >> 6];
+                buffer[base_index + i] =
+                    lut[(word >> (bit_index & 63)) & 0x3];
+            }
+            base_index += count;
+        };
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        // Align to word boundary so the NEON path works for any skip_first_n.
+        if (len >= bases_per_word) {
+            const size_t total = len + skip_first_n;
+            const size_t blocks =
+                (total + bases_per_word - 1) / bases_per_word;
+            const uint64_t *word_ptr = data;
+            auto *out = reinterpret_cast<uint8_t *>(buffer);
+
+            static const uint8x8_t ascii_table =
+                {'A', 'C', 'G', 'T', 'A', 'C', 'G', 'T'};
+            const uint8x8_t mask = vdup_n_u8(0x3);
+
+            for (size_t b = 0; b < blocks; ++b) {
+                const uint8x8_t packed =
+                    vld1_u8(reinterpret_cast<const uint8_t *>(word_ptr));
+
+                const uint8x8_t c0 = vand_u8(packed, mask);
+                const uint8x8_t c1 = vand_u8(vshr_n_u8(packed, 2), mask);
+                const uint8x8_t c2 = vand_u8(vshr_n_u8(packed, 4), mask);
+                const uint8x8_t c3 = vand_u8(vshr_n_u8(packed, 6), mask);
+
+                uint8x8x4_t expanded;
+                expanded.val[0] = vtbl1_u8(ascii_table, c0);
+                expanded.val[1] = vtbl1_u8(ascii_table, c1);
+                expanded.val[2] = vtbl1_u8(ascii_table, c2);
+                expanded.val[3] = vtbl1_u8(ascii_table, c3);
+
+                vst4_u8(out, expanded);
+
+                word_ptr++;
+                out += bases_per_word;
+            }
+            buffer[total] = '\0';
+            return buffer + skip_first_n;
+        }
+#elif defined(__SSSE3__) || defined(__AVX2__) // Not tested ever
+        // SSSE3 path mirrors the NEON strategy.
+        if (len >= bases_per_word) {
+            size_t remaining = len;
+            const size_t rem = (skip_first_n + base_index) & (bases_per_word - 1);
+            const size_t prefix =
+                std::min(remaining, (bases_per_word - rem) & (bases_per_word - 1));
+            if (prefix) {
+                scalar_emit(prefix);
+                remaining -= prefix;
+            }
+
+            const uint64_t *word_ptr =
+                data + ((bit_base + base_index * 2) >> 6);
+            auto *out = reinterpret_cast<uint8_t *>(buffer + base_index);
+
+            const __m128i lut = _mm_setr_epi8('A', 'C', 'G', 'T', 'A', 'C', 'G',
+                                              'T', 'A', 'C', 'G', 'T', 'A', 'C',
+                                              'G', 'T');
+            const __m128i mask = _mm_set1_epi8(0x3);
+
+            while (remaining > 0) {
+                // Load 8 bytes -> 32 bases spread across bytes.
+                __m128i packed =
+                    _mm_loadl_epi64(reinterpret_cast<const __m128i *>(word_ptr));
+
+                __m128i c0 = _mm_and_si128(packed, mask);
+                __m128i c1 = _mm_and_si128(_mm_srli_epi16(packed, 2), mask);
+                __m128i c2 = _mm_and_si128(_mm_srli_epi16(packed, 4), mask);
+                __m128i c3 = _mm_and_si128(_mm_srli_epi16(packed, 6), mask);
+
+                c0 = _mm_shuffle_epi8(lut, c0);
+                c1 = _mm_shuffle_epi8(lut, c1);
+                c2 = _mm_shuffle_epi8(lut, c2);
+                c3 = _mm_shuffle_epi8(lut, c3);
+
+                // Interleave to restore base order.
+                __m128i t0lo = _mm_unpacklo_epi8(c0, c1);
+                __m128i t0hi = _mm_unpackhi_epi8(c0, c1);
+                __m128i t1lo = _mm_unpacklo_epi8(c2, c3);
+                __m128i t1hi = _mm_unpackhi_epi8(c2, c3);
+
+                __m128i o0 = _mm_unpacklo_epi16(t0lo, t1lo);
+                __m128i o1 = _mm_unpackhi_epi16(t0lo, t1lo);
+                __m128i o2 = _mm_unpacklo_epi16(t0hi, t1hi);
+                __m128i o3 = _mm_unpackhi_epi16(t0hi, t1hi);
+
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(out), o0);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + 16), o1);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + 32), o2);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + 48), o3);
+
+                size_t step = std::min(remaining, bases_per_word);
+                word_ptr++;
+                out += step;
+                base_index += step;
+                remaining -= step;
+            }
+            buffer[len] = '\0';
+            return buffer + skip_first_n;
+        }
+#endif
+        scalar_emit(len);
+        buffer[len] = '\0';
+        return buffer;
+    }
+
+    [[nodiscard]] CrumbledSubSeq64 reverse_complement_old() const {
+        CrumbledSubSeq64 rc{len, 0};
+        for (size_t i = 0; i < len; ++i) {
+            const size_t src_bit = (skip_first_n + (len - 1 - i)) * 2;
+            const uint64_t code =
+                (data[src_bit >> 6] >> (src_bit & 63)) & 0x3;
+            const uint64_t complement = code ^ 0x3;
+            const size_t dst_bit = i * 2;
+            rc.data[dst_bit >> 6] |= complement << (dst_bit & 63);
+        }
+        return rc;
+    }
+    [[nodiscard]] CrumbledSubSeq64 reverse_complement() const {
+        CrumbledSubSeq64 rc{len, 31};
+        if(len < 32){
+            // Fix the skip_first
+            uint64_t word = (data[0] >> skip_first_n * 2);
+            if(storage_size(len+skip_first_n) > 1){
+                word |= (data[1] << (64 - skip_first_n * 2));
+            }
+
+            rc.data[0] = reverse_complement_kmer(word, len);
+            rc.skip_first_n = 0;
+            return rc;
+        }
+        size_t num_blocks = storage_size(len + skip_first_n);
+        for(size_t i = 0 ; i < num_blocks; ++i){
+            rc.data[num_blocks - i - 1] = reverse_complement_kmer(data[i], 32);
+        }
+        rc.skip_first_n =  (num_blocks * 32 - len) - skip_first_n;
         return rc;
     }
 };
