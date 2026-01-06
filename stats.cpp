@@ -55,7 +55,7 @@ int run_stats(const std::string &input, int update_frequency, int lcmer_level, d
     struct tb_event ev;
     lps str = {0, 0, 0, 0};
     syncmer::DensitySyncmerRule<uint32_t, syncmer::MurMur> syncmer_functor{
-        SYNCMER_K,
+        8,
         density, 423U, static_cast<unsigned int>(-1)};
     charsi chs;
     lcp_read lcps;

@@ -8,16 +8,18 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <gtl/vector.hpp>
 #include <iterator>
+#include <string>
 
 #include "ext/lcptools/lcptools_ho.h"
 using SequenceContainerType = CrumbledSubSeq64;
 
 // Makes sure we have enough scratch space
-template <class T, double GF = 2, size_t ALIGN_BLOCK_BITS=5>
+template <class T, double GF = 2, size_t ALIGN_BLOCK_BITS = 5>
 struct charsi_base {
-    static constexpr size_t align_block_bits= ALIGN_BLOCK_BITS;
+    static constexpr size_t align_block_bits = ALIGN_BLOCK_BITS;
     static constexpr size_t align_block_mask = (1 << align_block_bits) - 1;
     T *data;
     size_t capacity;
@@ -48,7 +50,7 @@ struct charsi_base {
             capacity = cap * GF;
             free(data);
             size_t target_cap = capacity * sizeof(T);
-            target_cap = (target_cap|align_block_mask) + 1;
+            target_cap = (target_cap | align_block_mask) + 1;
             data = (decltype(data))std::aligned_alloc(32, target_cap);
         }
         return data == NULL;
@@ -215,12 +217,16 @@ struct KmerViewOnInts {
     int_type k;
     int_type KMASK;
     int_type value;
+    uint8_t prev;
 
     static constexpr INT_TYPE BIT_MASK = -1;
     // static constexpr INT_TYPE BIT_MASK = ((INT_TYPE)1 << BIT_WIDTH) - 1;
 
     KmerViewOnInts(int_type k)
-        : k{k}, KMASK{((int_type)1 << (BIT_WIDTH * k)) - 1}, value{0} {}
+        : k{k},
+          KMASK{((int_type)1 << (BIT_WIDTH * k)) - 1},
+          value{0},
+          prev{0xff} {}
 
     int fill(const uint8_t *data_address) {
         int_type i;
@@ -232,9 +238,10 @@ struct KmerViewOnInts {
 
     int fill_rle(const uint8_t *data_address, int_type cap) {
         int_type i;
-        int_type it = move_get_rle(-1, data_address, 0, cap);
+        prev = 0xff;
+        int_type it = move_get_rle(data_address, 0, cap);
         for (i = 0; i < k && it < cap; i++) {
-            it = move_get_rle(data_address[it - 1], data_address, it, cap);
+            it = move_get_rle(data_address, it, cap);
         }
         return it;
     }
@@ -256,10 +263,11 @@ struct KmerViewOnInts {
         value |= (data_address[index] & BIT_MASK);
         return index + 1;
     }
-    int_type move_get_rle(uint8_t prev, const uint8_t *data_address,
-                          int_type index, int_type cap) {
+
+    int_type move_get_rle(const uint8_t *data_address, int_type index,
+                          int_type cap) {
         const uint8_t *p = data_address + index;
-        const uint8_t *end = data_address + cap;
+        const uint8_t *const end = data_address + cap;
 
         while (p < end && *p == prev) {
             ++p;
@@ -267,6 +275,7 @@ struct KmerViewOnInts {
         if (p == end) {
             return cap;
         }
+        prev = *p;
         value = ((value << BIT_WIDTH) & KMASK) | (*p & BIT_MASK);
         return static_cast<int_type>((p - data_address) + 1);
     }
@@ -325,8 +334,7 @@ struct KmerViewOnCrumbs64 {
     static constexpr uint8_t mask = 3U;
 
     KmerViewOnCrumbs64(int_type k)
-        : k{k},
-          kmask{((int_type)1 << (2 * k)) - 1}, value{0}, prev{255} {}
+        : k{k}, kmask{((int_type)1 << (2 * k)) - 1}, value{0}, prev{255} {}
 
     static inline uint8_t base_at(const uint64_t *data_words, size_t index) {
         const size_t bit_index = index * 2;
@@ -334,9 +342,10 @@ struct KmerViewOnCrumbs64 {
             (data_words[bit_index >> 6] >> (bit_index & 63)) & mask);
     }
 
-    int fill_rle(const uint64_t *data_words, int_type cap) {
+    int fill_rle(const uint64_t *data_words, int_type cap,
+                 int_type skip_first_n) {
         int_type i;
-        int_type it = move_get_rle(data_words, 0, cap);
+        int_type it = move_get_rle(data_words, skip_first_n, cap);
         for (i = 0; i < k && it < cap; i++) {
             it = move_get_rle(data_words, it, cap);
         }
@@ -361,6 +370,15 @@ struct KmerViewOnCrumbs64 {
         return index + 1;
     }
     constexpr int_type get() const noexcept { return value; }
+    char *to_string() const {
+        static const char *lut = "ACGT";
+        char *buffer = malloc(k + 1);
+        for (int i = 0; i < k; i++) {
+            buffer[i] = lut[(value >> (2 * (k - i - 1))) & 3];
+        }
+        buffer[k] = '\0';
+        return buffer;
+    }
 };
 
 template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
@@ -441,23 +459,24 @@ void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
                    uint64_t si, uint64_t ei);
 
 template <typename _T, int WIDTH = 2>
-void init_core_kmer(struct core *cr, _T Kval, uint64_t si, uint64_t ei) {
+void init_core_kmer(struct core *cr, _T Kval, uint64_t si, uint64_t ei, int k) {
     cr->start = si;
     cr->end = ei;
     cr->label = 0;
     cr->label |= Kval;
     cr->bit_rep = 0x8000000000000000 | cr->label;
-    cr->bit_size = WIDTH * SYNCMER_K;
+    cr->bit_size = WIDTH * k;
 }
 
 template <typename _T>
-void init_core_kmer_xor(struct core *cr, _T Kval, uint64_t si, uint64_t ei) {
+void init_core_kmer_xor(struct core *cr, _T Kval, uint64_t si, uint64_t ei,
+                        int k) {
     cr->start = si;
     cr->end = ei;
     cr->label = 0;
-    cr->label |= (Kval ^ reverse_complement_kmer(Kval, SYNCMER_K));
+    cr->label |= (Kval ^ reverse_complement_kmer(Kval, k));
     cr->bit_rep = 0x8000000000000000 | cr->label;
-    cr->bit_size = 2 * SYNCMER_K;
+    cr->bit_size = 2 * k;
 }
 
 uint8_t *onehotto2bitDNA(const uint8_t *data, size_t len);
@@ -471,20 +490,24 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
                                     struct lps *str,
                                     const auto &syncmer_functor) {
     int core_index = 0;
-    KmerViewOnInts<uint64_t, 2> kmer_view{syncmer_functor.k()};
+    const auto k = syncmer_functor.k();
+    KmerViewOnInts<uint64_t, 2> kmer_view{k};
     int64_t it1 = kmer_view.fill_rle(data, len);
     if (str->capacity < len * CONSTANT_FACTOR) {
         str->capacity = 2 * len * CONSTANT_FACTOR;
         str->cores = (struct core *)realloc(
             str->cores, (str->capacity) * sizeof(struct core));
     }
-    for (; it1 + SYNCMER_K < len;) {
-        if (syncmer_functor(kmer_view.get())) {
-            init_core_kmer<uint32_t>(&(str->cores[core_index]), kmer_view.get(),
-                                     it1, it1 + SYNCMER_K);
+    const int64_t limit = len - k;
+    auto *cores = str->cores;
+    for (; it1 < limit;) {
+        const auto kmer = kmer_view.get();
+        if (syncmer_functor(kmer)) {
+            init_core_kmer<uint32_t>(&(cores[core_index]), kmer, it1, it1 + k,
+                                     k);
             core_index++;
         }
-        it1 = kmer_view.move_get_rle(data[it1 - 1], data, it1, len);
+        it1 = kmer_view.move_get_rle(data, it1, len);
     }
     return core_index;
 }
@@ -498,19 +521,22 @@ inline uint64_t parse1_CrumbledSubSeqs_syncmers(
     }
     KmerViewOnCrumbs64<uint64_t> kmer_view{syncmer_functor.k()};
     size_t it1 =
-        kmer_view.fill_rle(sseqs[0].data + sseqs[0].skip_first_n, sseqs[0].len);
-    it1 += sseqs[0].skip_first_n;
+        kmer_view.fill_rle(sseqs[0].data, sseqs[0].len + sseqs[0].skip_first_n,
+                           sseqs[0].skip_first_n);
     size_t l_so_far = 0;
     for (size_t i = 0; i < sseqs.size(); ++i) {
-        for (; it1 < sseqs[i].len;) {
+        for (; it1 < sseqs[i].len + sseqs[i].skip_first_n;) {
             if (syncmer_functor(kmer_view.get())) {
-                init_core_kmer<uint32_t>(
-                    &(str->cores[core_index]), kmer_view.get(),
-                    l_so_far + it1 - sseqs[i].skip_first_n,
-                    l_so_far + it1 + SYNCMER_K - sseqs[i].skip_first_n);
+                init_core_kmer<uint32_t>(&(str->cores[core_index]),
+                                         kmer_view.get(),
+                                         l_so_far + it1 - sseqs[i].skip_first_n,
+                                         l_so_far + it1 + syncmer_functor.k() -
+                                             sseqs[i].skip_first_n,
+                                         syncmer_functor.k());
                 core_index++;
             }
-            it1 = kmer_view.move_get_rle(sseqs[i].data, it1, sseqs[i].len);
+            it1 = kmer_view.move_get_rle(sseqs[i].data, it1,
+                                         sseqs[i].len + sseqs[i].skip_first_n);
         }
         if (sseqs.size() > i + 1) {
             it1 = sseqs[i + 1].skip_first_n;
@@ -524,8 +550,8 @@ uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores);
 
 /// @brief Initializes an lps struct with a given sequence in the bam compressed
 // void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len);
-inline void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len,
-                         const auto &syncmer_functor) {
+//
+inline void prepare_lps(lps *lps_ptr, size_t len) {
     lps_ptr->level = 1;
     if (lps_ptr->cores == nullptr) {
         lps_ptr->size = 0;
@@ -539,9 +565,10 @@ inline void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len,
                 lps_ptr->cores, (len / CONSTANT_FACTOR) * sizeof(struct core));
         }
     }
-
-    //    lps_ptr->size = parse1_bam_syncmers_nthash(data, len, lps_ptr,
-    //    syncmer_functor);
+}
+inline void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len,
+                         const auto &syncmer_functor) {
+    prepare_lps(lps_ptr, len);
     lps_ptr->size = parse1_bam_syncmers(data, len, lps_ptr, syncmer_functor);
 }
 
@@ -558,7 +585,7 @@ inline void init_lps_crumbled(lps *lps_ptr,
         lps_ptr->capacity = (len / CONSTANT_FACTOR);
         lps_ptr->cores = (struct core *)malloc((len / CONSTANT_FACTOR) *
                                                sizeof(struct core));
-        lps_ptr->level = 0;
+        lps_ptr->level = 1;
     } else {
         if (lps_ptr->capacity < len / CONSTANT_FACTOR) {
             lps_ptr->capacity = len / CONSTANT_FACTOR;
@@ -569,6 +596,7 @@ inline void init_lps_crumbled(lps *lps_ptr,
     }
     lps_ptr->size =
         parse1_CrumbledSubSeqs_syncmers(sseqs, lps_ptr, syncmer_functor);
+    assert(lps_ptr->size < lps_ptr->capacity);
 }
 
 inline void parse_cores_from_bam_record(const uint8_t *data, size_t len,
@@ -593,5 +621,105 @@ inline void parse_cores_from_bam_record(const uint8_t *data, size_t len,
     lr.data = data;
 }
 
+template <int lanes = 4>
+inline std::array<std::pair<uint8_t *, uint8_t *>, lanes> scalar_rlc(charsi &c1,
+                                                                     charsi &c2,
+                                                                     int len) {
+    int lane_len = len / 4;
+
+    uint8_t *rptrs[lanes + 1] = {
+        // TODO alignments
+        c1.data,
+        c1.data + lane_len,
+        c1.data + 2 * lane_len,
+        c1.data + 3 * lane_len,
+        c1.data + 4 * lane_len,
+    };
+    uint8_t *wptrs[lanes + 1] = {
+        c2.data,
+        c2.data + lane_len,
+        c2.data + 2 * lane_len,
+        c2.data + 3 * lane_len,
+        c2.data + 4 * lane_len,
+    };
+    uint8_t *endings[lanes] = {0, 0, 0, 0};
+    for (int l = 0; l < lanes; ++l) {
+        uint8_t *_from = rptrs[l];
+        uint8_t *_to = rptrs[l + 1];
+        uint8_t *writ = wptrs[l];
+        *writ = *_from;
+        for (uint8_t *it = _from + 1; it < _to; ++it) {
+            if (*it != *writ) {
+                ++writ;
+                *writ = *it;
+            }
+        }
+        endings[l] = writ;
+    }
+    return {
+        {wptrs[0], endings[0]},
+        {wptrs[1], endings[1]},
+        {wptrs[2], endings[2]},
+        {wptrs[3], endings[3]},
+    };
+}
+template <int lanes = 4>
+inline uint64_t parse1_bam_syncmer_with_lanes(
+    std::array<std::pair<uint8_t *, uint8_t *>, lanes> data, int64_t len,
+    struct lps *str, const auto &syncmer_functor) {
+    const auto k = syncmer_functor.k();
+
+    if (str->capacity < len * CONSTANT_FACTOR) {
+        str->capacity = 2 * len * CONSTANT_FACTOR;
+        str->cores = (struct core *)realloc(
+            str->cores, (str->capacity) * sizeof(struct core));
+    }
+    auto *cores = str->cores;
+    for (int l = 0; l < lanes; ++l) {
+        int core_index = 0;
+        KmerViewOnInts<uint64_t, 2> kmer_view{k};
+        int64_t it1 = [&data, len, l, k]() {
+            if (l == 0) {
+                return kmer_view.fill(data[l].first,
+                                      len);  // Fill from beginning
+            } else {
+                return kmer_view.fill(data[l - 1].second - k + 1,
+                                      len);  // Fill from previous ending-K
+            }
+        }();
+        const uint8_t *ending = data[l].second;
+        for (uint8_t *it = data[l].first + it1; it != ending; ++it) {
+            const auto kmer = kmer_view.get();
+            if (syncmer_functor(kmer)) {
+                init_core_kmer<uint32_t>(&(cores[core_index]), kmer, it1,
+                                         it1 + k,
+                                         k);  // TODO fix si, ei
+                core_index++;
+            }
+            it1 = kmer_view.move_get(data, it1, len);
+        }
+    }
+    return 0;
+}
+inline void parse_cores_from_bam_record2(const uint8_t *data, size_t len,
+                                         int lcp_level, lps *str,
+                                         const auto &syncmer_functor,
+                                         charsi &chs, charsi &chs2,
+                                         lcp_read &lr) {
+    chs.require(len);
+    chs2.require(len);
+    onehotto2bitDNA_bivec_chs(data, len, chs);
+    std::array<std::pair<uint8_t *, uint8_t *>, 4> lane_boundary =
+        scalar_rlc<4>(chs, chs2, len);
+    prepare_lps(str, len);
+    parse1_bam_syncmer_with_lanes(lane_boundary, len, str, syncmer_functor);
+    lps_deepen(str, lcp_level);
+
+    for (int i = 0; i < str->size; ++i) {
+        lr.cores.emplace_back(str->cores[i].label);
+        lr.pos.emplace_back(str->cores[i].start, str->cores[i].end);
+    }
+    lr.data = data;
+}
 lcp_read parse_cores_from_kseq(const char *data, size_t len, int lcp_level);
 #endif

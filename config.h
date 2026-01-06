@@ -5,14 +5,6 @@
 #define LCMER_L 8
 #endif
 
-#ifndef SYNCMER_K
-#define SYNCMER_K 8
-#endif
-
-#ifndef SYNCMER_RULE
-#define SYNCMER_RULE DensitySyncmerRule
-#endif
-
 #ifndef BAMREAD_CHUNK_SIZE
 #define BAMREAD_CHUNK_SIZE 256ULL
 #endif

@@ -68,7 +68,7 @@ void sw_forward(const gtl::vector<uint32_t>& A, const gtl::vector<uint32_t>& B,
 // Also O(m) memory
 //
 void sw_reverse(const gtl::vector<uint32_t>& A, const gtl::vector<uint32_t>& B,
-                int gap, int end_i, int end_j, int best_score,
+                int gap, int end_i, int end_j, [[maybe_unused]] int best_score,
                 gtl::vector<int>& prev, gtl::vector<int>& curr, int& start_i,
                 int& start_j) {
     gtl::vector<uint32_t> Ar(A.begin(), A.begin() + end_i);
@@ -87,8 +87,6 @@ void sw_reverse(const gtl::vector<uint32_t>& A, const gtl::vector<uint32_t>& B,
 
 SWResult smith_waterman_linear(const gtl::vector<uint32_t>& A,
                                const gtl::vector<uint32_t>& B, int gap = -1) {
-    int n = A.size(), m = B.size();
-
     gtl::vector<int> prev, curr;
 
     // 1. Forward DP gives alignment endpoint
@@ -395,18 +393,16 @@ struct Segment {
     Interval ref;
     int elements;
 };
-gtl::vector<Segment> chain_multiple(u32 me, gtl::vector<SeedHit>& hits,
-                                    int MAX_DIAG_DELTA = 1000,
-                                    float SECONDARY_CUTOFF = 0.6f,
-                                    int MIN_CHAIN_SCORE = 3) {
+gtl::vector<Segment> chain_multiple(u32 me, gtl::vector<SeedHit>& hits) {
     // Simplify hit streaks
     gtl::vector<Segment> segments;
     if (hits.empty()) {
         return {};
     }
     if (hits.size() == 1) {
-        return {{{me, hits[0].qpos, hits[0].qpos}},
-                {{hits[0].contig, hits[0].rpos, hits[0].rpos}, {1}}};
+        return {
+            {Segment{Interval{me, hits[0].qpos, hits[0].qpos},
+                     Interval{hits[0].contig, hits[0].rpos, hits[0].rpos}, 1}}};
     }
 
     std::sort(hits.begin(), hits.end(), [](const SeedHit& a, const SeedHit& b) {
@@ -446,8 +442,8 @@ int run_mapping(const asm_config& param) {
     TIME_CHECKPOINT(Mapping, stderr, "Read input files %s and %s",
                     param.input.c_str(), param.output.c_str());
     // auto ref = map.read_hts(
-    //     param.output);  // I am reusing output here for passing str, I dont
-    //     want
+    //     param.output);  // I am reusing output here for passing str, I
+    //     dont want
     //                     // to rewiret or modify the asm_confgi
 
     int K = 3;

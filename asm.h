@@ -70,6 +70,7 @@ struct syncmer_params {
     }
     void print_cfg(FILE *f) const {
         fprintf(f, "spaced-seed-mask: \"%s\"\n", spaced_seed_mask.c_str());
+        fprintf(f, "k: %d\n", k);
         if (invalid_density != invalid_param_value) {
             fprintf(f, "kmer-selection: \"density\"\n");
             fprintf(f, "Density: %f\n", density);

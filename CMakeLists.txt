@@ -105,7 +105,6 @@ add_custom_target(debug
 target_compile_definitions(${PROJECT_NAME} PUBLIC
     SYNCMER_RULE=DensitySyncmerRule
     LCMER_L=8
-    SYNCMER_K=8
 )
 
 

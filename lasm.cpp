@@ -2,7 +2,6 @@
 #include <string>
 
 #include "CLI/CLI.hpp"
-#include "nibble2base.hpp"
 
 #define LCPTOOLS_IMPL
 #include "asm.h"
@@ -15,11 +14,11 @@
 
 using std::string;
 
-auto lam = []() -> int {
-    CPUType type = nibble2base_resolve();
-    std::cerr << "CPU Type: " << (int)type << std::endl;
-    return 0;
-}();
+// auto lam = []() -> int {
+//     CPUType type = nibble2base_resolve();
+//     std::cerr << "CPU Type: " << (int)type << std::endl;
+//     return 0;
+// }();
 struct bloom_parameters;
 int asm_program(CLI::App &parent) {
     auto *app_ = parent.add_subcommand("hifi", "run hifi assembly");
@@ -31,7 +30,8 @@ int asm_program(CLI::App &parent) {
         ->required();
     app.add_option("-t,--threads", p->threads.work, "Number of worker threads")
         ->capture_default_str();
-    app.add_option("-@,--io-threads", p->threads.io, "Number of IO threads")
+    app.add_option("-@,--io-threads", p->threads.io,
+                   "Number of IO threads (Used by htslib for decompressing)")
         ->capture_default_str();
     app.add_option("--random-seed", p->seed, "Random seed")
         ->capture_default_str();
@@ -39,24 +39,28 @@ int asm_program(CLI::App &parent) {
     app.add_flag("--rle", p->rle, "Enable Run Length Encoding")
         ->capture_default_str();
 
-    app.add_flag("--print-raw-dbg", p->print_precleanup_graph, "Print DBG before cleanup (with .raw suffix)")
+    app.add_flag("--print-raw-dbg", p->print_precleanup_graph,
+                 "Print DBG before cleanup (with .raw suffix)")
         ->capture_default_str();
     app.add_flag("--silent", p->silent, "Do not print progress to stderr")
         ->capture_default_str();
     app.add_option("--spaced-seed-mask", p->syncmer.spaced_seed_mask,
-                   "Mask for spaced seeding. (0->skip, 1->keep, 2->mask left bit, 3->mask right bit.")
+                   "Mask for spaced seeding. (0->skip, 1->keep, 2->mask left "
+                   "bit, 3->mask right bit.")
         ->capture_default_str();
-    app.add_option("--syncmer-k", p->syncmer.k,
-                   "K-mer length")
+    app.add_option("--syncmer-k", p->syncmer.k, "K-mer length")
         ->capture_default_str();
     app.add_option("--density", p->syncmer.density,
-                   "Density of selected k-mers")->expected(0.0F,1.0F);
+                   "Density of selected k-mers")
+        ->expected(0.0F, 1.0F);
     app.add_option("--submer-s", p->syncmer.mincode.s,
                    "Size of submers for mincode syncmers")
         ->excludes("--density");
     app.add_option("--submer-t", p->syncmer.mincode.t,
-                   "Position of submers for mincode syncmers (Closed syncmer if omitted)")
-        ->excludes("--density")->needs("--submer-s");
+                   "Position of submers for mincode syncmers (Closed syncmer "
+                   "if omitted)")
+        ->excludes("--density")
+        ->needs("--submer-s");
     auto bfg =
         app.add_option_group("bloomfilter", "Parameters to setup bloom filter");
     bfg->add_option("--projected-element-count", p->bloom.projected_count,
@@ -106,19 +110,22 @@ int map_prog(CLI::App &parent) {
     app.add_flag("--rle", p->rle, "Enable Run Length Encoding")
         ->capture_default_str();
     app.add_option("--spaced-seed-mask", p->syncmer.spaced_seed_mask,
-                   "Mask for spaced seeding. (0->skip, 1->keep, 2->mask left bit, 3->mask right bit.")
+                   "Mask for spaced seeding. (0->skip, 1->keep, 2->mask left "
+                   "bit, 3->mask right bit.")
         ->capture_default_str();
-    app.add_option("--syncmer-k", p->syncmer.k,
-                   "K-mer length")
+    app.add_option("--syncmer-k", p->syncmer.k, "K-mer length")
         ->capture_default_str();
     app.add_option("--density", p->syncmer.density,
-                   "Density of selected k-mers")->expected(0.0F,1.0F);
+                   "Density of selected k-mers")
+        ->expected(0.0F, 1.0F);
     app.add_option("--submer-s", p->syncmer.mincode.s,
                    "Size of submers for mincode syncmers")
         ->excludes("--density");
     app.add_option("--submer-t", p->syncmer.mincode.t,
-                   "Position of submers for mincode syncmers (Closed syncmer if omitted)")
-        ->excludes("--density")->needs("--submer-s");
+                   "Position of submers for mincode syncmers (Closed syncmer "
+                   "if omitted)")
+        ->excludes("--density")
+        ->needs("--submer-s");
     app.callback([=]() {
         int ret = run_mapping(*p);
         delete p;
@@ -144,8 +151,8 @@ void stats_program(CLI::App &parent) {
     app.add_option("-l,--level", params->lcmer_level,
                    "Depth of lcmers to be computed")
         ->capture_default_str();
-    app.add_option("--density", params->density,
-                   "Density of selected k-mers")->required();
+    app.add_option("--density", params->density, "Density of selected k-mers")
+        ->required();
 
     app.callback([=]() {
         int ret = run_stats(params->input_file, params->update_frequency,
@@ -196,8 +203,8 @@ int sam_read_testing(CLI::App &parent) {
         ->required();
     app.add_option("-t,--threads", p->threads, "Number of threads")
         ->capture_default_str();
-    app.add_option("--density", p->density,
-                   "Density of selected k-mers")->required();
+    app.add_option("--density", p->density, "Density of selected k-mers")
+        ->required();
 
     std::map<std::string, SamReadTestingMode> SamReadTestingMode_map = {
         {"basic", SamReadTestingMode::BASIC},
@@ -223,8 +230,6 @@ int sam_read_testing(CLI::App &parent) {
     });
     return 0;
 }
-
-
 
 #define DOCTEST_CONFIG_IMPLEMENT
 #include "doctest.h"

@@ -1,7 +1,6 @@
 #ifndef _GRAPH_H_
 #define _GRAPH_H_
 
-#include <arm/param.h>
 #define PREV_WITH_VEC
 #define HT_SHARD_BC 8
 
@@ -10,13 +9,11 @@
 #include <gtl/vector.hpp>
 #include <mutex>
 #include <string>
-#include <thread>
 
 #include "asm.h"
 #include "bloomfilter.h"
 #include "config.h"
 #include "lcmer.h"
-#include "nibble2base.hpp"
 template <std::integral int_type>
 consteval int_type nextpowerof2(int_type v) {
     v--;
@@ -75,10 +72,10 @@ struct dbg_index {
         mutex_type>;
 
     struct lci_type {
-        u64 id : 63;
-        u64 moved : 1;
-        static constexpr size_t max_id = std::numeric_limits<u64>::max() >> 1;
-        static consteval lci_type empty() { return {0, 0}; }
+        u64 id;
+        // u64 moved : 1;
+        static constexpr size_t max_id = std::numeric_limits<u64>::max();
+        static consteval lci_type empty() { return {0}; }
         //    u64 pos; // TODO remove this
         // lci_type() : id(0), pos(-1) {}
         // lci_type(u64 _id, u64 _pos) : id(_id), pos(_pos) {}
@@ -92,8 +89,11 @@ struct dbg_index {
 
     dbg_map_t dbg;
     lcmer_index_t lci;
+    gtl::flat_hash_set<u64> active_set;
+    gtl::vector<std::pair<gtl::vector<u64>, gtl::vector<u64>>> lanes;
+    gtl::flat_hash_map<u64, gtl::vector<std::tuple<u64, u32, bool>>> lane_map;
     // merge_info_map_t merge_map;
-    bloom_interface<bloom_ext::RegisterBlockedBloomFilter<1>, null_mutex> bf;
+    bloom_interface<bloom_ext::BlockedLockedBloomFilter<0, std::mutex>> bf;
 
     dbg_index(double false_positive_rate, uint64_t projected_count,
               uint64_t seed)
@@ -558,12 +558,13 @@ struct GraphCleaning {
     using dbg_map_t = dbg_index::dbg_map_t;
     using lcmer_index_t = dbg_index::lcmer_index_t;
     static auto attempt_simplify_one_path(
-        dbg_map_t &dbg, lcmer_index_t &lci,
+        dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
         gtl::flat_hash_map<u64, u64> &redirect_deleted, u64 id,
-        auto starting_from) -> bool {
+        auto starting_from, auto &to_delete) -> bool {
         // Find a node we cannot simplify
         // Iterate backwards and merge until we cannot simplify
         // o->o->o->o->o->o -> o->o
+
         auto current = starting_from;
         if (current == dbg.end()) {
             return false;
@@ -571,17 +572,21 @@ struct GraphCleaning {
         unsigned first_fec = current->second.forward_edge_count;
         bool simplified = false;
         auto prev_it = dbg.find(current->second.prev[0]);
-        gtl::vector<SequenceContainerType> merged;
+        gtl::vector<dbg_map_t::iterator> merged;
         unsigned cc_sum = 0;
         while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
                prev_it->second.forward_edge_count == 1) {
             if (prev_it != dbg.end()) {
-                for (auto it = current->second.seq.rbegin();
-                     it != current->second.seq.rend(); ++it) {
-                    merged.emplace_back(std::move(*it));
-                }
+                // for (auto it = current->second.seq.rbegin();
+                //      it != current->second.seq.rend(); ++it) {
+                //     merged.push_back(*it)
+                // }
                 cc_sum += current->second.core_count;
-                dbg.erase(current->first);  // MARK
+                merged.push_back(current);
+                // current->second.seq.clear();
+
+                // dbg.erase(current->first);  // MARK
+                // to_delete.push_back(current->first);
                 simplified = true;
             } else {  // Prev is erased
             }
@@ -599,7 +604,18 @@ struct GraphCleaning {
         current->second.forward_edge_count = first_fec;
         current->second.core_count += cc_sum;
         for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
-            current->second.seq.emplace_back(std::move(*it));
+            // for (auto &seq : (*it)->second.seq)
+            gtl::vector<SequenceContainerType> &seqs = (*it)->second.seq;
+            for (auto sit = seqs.begin(); sit != seqs.end(); ++sit) {
+
+                to_delete.emplace(sit->origin_node, current->first);
+
+                current->second.seq.emplace_back(std::move(*sit));
+
+            }
+            seqs.clear();
+
+            to_delete.emplace((*it)->first, current->first);
         }
 
         // while (starting_from != current) {  // Redirect
@@ -613,78 +629,93 @@ struct GraphCleaning {
 
         return simplified;
     };
-    static void dfs_simplify(dbg_index::dbg_map_t &dbg,
-                             dbg_index::lcmer_index_t &lci,
-                             gtl::flat_hash_map<u64, u64> &redirect_deleted) {
-        auto dfs_visit = [](dbg_index::dbg_map_t &dm,
-                            dbg_index::dbg_map_t::value_type &val) -> void {
-            val.second.visited = true;
-        };
-        auto pop = [](gtl::vector<u64> &vec) {
-            u64 val = vec.back();
-            vec.pop_back();
-            return val;
-        };
-        auto modify_foo = [](dbg_map_t::value_type &val){
-            val.second.visited=true;
-        } ;
-        gtl::vector<u64> to_visit;
-        to_visit.reserve(1024);
-        for (auto &dbn : dbg) {
-            while (!to_visit.empty()) {
-                auto val = pop(to_visit);
-                auto it = dbg.find(val);
-                if (it != dbg.end()) {
-                    if (it->second.visited) {
-                        continue;
-                    }
-                    dfs_visit(dbg, *it);
-                    for (u64 neighbour : it->second.prev) {
-                        to_visit.push_back(neighbour);
-                    }
-                }
-            }
-            if (!dbn.second.visited) {
-                to_visit.push_back(dbn.first);
-            }
-        }
-    }
+    // static void dfs_simplify(dbg_index::dbg_map_t &dbg,
+    //                          dbg_index::lcmer_index_t &lci,
+    //                          gtl::flat_hash_map<u64, u64> &redirect_deleted)
+    //                          {
+    //     auto dfs_visit = [](dbg_index::dbg_map_t &dm,
+    //                         dbg_index::dbg_map_t::value_type &val) -> void {
+    //         val.second.visited = true;
+    //     };
+    //     auto pop = [](gtl::vector<u64> &vec) {
+    //         u64 val = vec.back();
+    //         vec.pop_back();
+    //         return val;
+    //     };
+    //     auto modify_foo = [](dbg_map_t::value_type &val) {
+    //         val.second.visited = true;
+    //     };
+    //     gtl::vector<u64> to_visit;
+    //     to_visit.reserve(1024);
+    //     for (auto &dbn : dbg) {
+    //         while (!to_visit.empty()) {
+    //             auto val = pop(to_visit);
+    //             auto it = dbg.find(val);
+    //             if (it != dbg.end()) {
+    //                 if (it->second.visited) {
+    //                     continue;
+    //                 }
+    //                 dfs_visit(dbg, *it);
+    //                 for (u64 neighbour : it->second.prev) {
+    //                     to_visit.push_back(neighbour);
+    //                 }
+    //             }
+    //         }
+    //         if (!dbn.second.visited) {
+    //             to_visit.push_back(dbn.first);
+    //         }
+    //     }
+    // }
     static void simplify_simple_paths(
         dbg_index::dbg_map_t &dbg, dbg_index::lcmer_index_t &lci,
-        gtl::flat_hash_map<u64, u64> &redirect_deleted) {
-        for (auto &dn : lci) {
-            auto current = dbg.find(dn.second.id);
+        gtl::flat_hash_map<u64, u64> &redirect_deleted, auto &active_set) {
+        // TODO Parallel idea
+        // First run a parallel discovery step which does not modify the graph
+        // and finds the pairs of nodes we want to simplify (from, to) and
+        // extracts the sequences. On a single thread we fix the edges and add
+        // sequences to the target. Then in parallel we redirect marked nodes to
+        // simplified () Should reduce the time needed 4X (20s to 5s on HG) with
+        // 8 threads
+
+        // for (auto &dn : lci) {
+        gtl::flat_hash_map<u64, u64> to_delete;
+        for (u64 node : active_set) {
+            auto current = dbg.find(node);
             if (current == dbg.end()) {
-                dn.second.id = lci_type::max_id;
-                // dn.second.id = redirect_deleted[dn.second.id];
-                // dn.second.moved = 1;
+                to_delete.emplace(node, 0);
                 continue;
             }
-            if (current->second.redirected()) {
-                dn.second.moved = true;
-                dn.second.id = current->second.prev[0];
-                dbg.erase(current);
-                // dn.second.id = lci_type::max_id;
-            }
+
             // Simple paths
             if ((current->second.forward_edge_count != 1 &&
                  current->second.prev.size() == 1)) {
-                attempt_simplify_one_path(dbg, lci, redirect_deleted,
-                                          dn.second.id, current);
+                attempt_simplify_one_path(dbg, lci, redirect_deleted, node,
+                                          current, to_delete);
             } else if (current->second.prev.size() > 1) {
                 for (auto &prev_id : current->second.prev) {
                     auto prev_it = dbg.find(prev_id);
                     if (prev_it != dbg.end() &&
                         prev_it->second.prev.size() == 1) {
                         attempt_simplify_one_path(dbg, lci, redirect_deleted,
-                                                  prev_id, prev_it);
+                                                  prev_id, prev_it, to_delete);
                     }
                 }
             }
         }
 
+        for (auto &node : lci) {
+            auto it = to_delete.find(node.second.id);
+            if(it != to_delete.end()){
+                if(it->second != 0){
+                    node.second.id = it->second; // Redirect to new node
+                }
+            }
+        }
+        for (auto [del, to] : to_delete) {
+            active_set.erase(del);
+        }
+
         for (auto &node : dbg) {
-            size_t idx = 0;
             int self_idx = -1;
             for (auto &p : node.second.prev) {
                 auto it = redirect_deleted.find(p);
@@ -692,26 +723,25 @@ struct GraphCleaning {
                     p = it->second;
                 } else if (p == node.first) {  // Self edge // TODO: reconsider
                                                // how this is done
-                    node.second.forward_edge_count--;
-                    self_idx = idx;
+                    // node.second.forward_edge_count--;
+                    // self_idx = idx;
                 }
-                ++idx;
             }
             if (self_idx != -1) {
                 node.second.prev.erase(node.second.prev.begin() + self_idx);
             }
         }
     }
-    static void cut_tips(dbg_map_t &dbg, lcmer_index_t &lci, int min_core_depth,
-                         size_t max_tip_length) {
-        for (auto &dn : lci) {
-            auto current = dbg.find(dn.second.id);
+    static void cut_tips(dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
+                         int min_core_depth, size_t max_tip_length,
+                         auto &active_set) {
+        // for (auto &dn : lci) {
+        for (u64 node : active_set) {
+            auto current = dbg.find(node);
             if (current == dbg.end()) {
-                dn.second.id = lci_type::max_id;
                 continue;
             }
             if (current->second.redirected()) {
-                dn.second.id = current->second.prev[0];
                 continue;
             }
             if (current->second.avg_core_count() < min_core_depth) {
@@ -775,12 +805,14 @@ struct GraphCleaning {
             }
         }
     }
-    static void pop_bubbles(dbg_map_t &dbg, lcmer_index_t &lci,
-                            double bubble_depth_epsilon) {
-        for (auto &dn : lci) {
-            auto current = dbg.find(dn.second.id);
+
+    // Bubble depth delta calculation
+    ///
+    static void pop_bubbles(dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
+                            double bubble_depth_epsilon, auto &active_set) {
+        for (u64 node : active_set) {
+            auto current = dbg.find(node);
             if (current == dbg.end() || current->second.redirected()) {
-                dn.second.id = -1;
                 continue;
             }
 
@@ -828,10 +860,11 @@ struct GraphCleaning {
             }
         }
     }
-    static void cut_low_support_edges(dbg_map_t &dbg, lcmer_index_t &lci) {
+    static void cut_low_support_edges(dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
+                                      auto &active_set) {
         // Death by thousand cuts
-        for (auto &dn : lci) {
-            auto current = dbg.find(dn.second.id);
+        for (auto &node : active_set) {
+            auto current = dbg.find(node);
             if (current == dbg.end()) {
                 continue;
             }
@@ -844,9 +877,10 @@ struct GraphCleaning {
             }
         }
     }
-    static void open_simple_loops(dbg_map_t &dbg, lcmer_index_t &lci) {
-        for (auto &dn : lci) {
-            auto current = dbg.find(dn.second.id);
+    static void open_simple_loops(dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
+                                  auto &active_set) {
+        for (auto &node : active_set) {
+            auto current = dbg.find(node);
             if (current == dbg.end() || current->second.redirected()) {
                 continue;
             }
@@ -856,7 +890,7 @@ struct GraphCleaning {
                 if (prev_it != dbg.end() && !prev_it->second.redirected()) {
                     auto &prepre = prev_it->second.prev;
                     for (auto pp = prepre.begin(); pp != prepre.end(); ++pp) {
-                        if (*pp == dn.second.id) {  // Loop here
+                        if (*pp == node) {  // Loop here
                             *pp = std::numeric_limits<u64>::max();
                             if (current->second.core_count >=
                                 2 * prev_it->second
@@ -880,7 +914,8 @@ struct GraphCleaning {
             }
         }
     }
-    static void fix_edges(dbg_map_t &dbg, lcmer_index_t &lci) {
+    static void fix_edges(dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
+                          [[maybe_unused]] const auto &active_set) {
         // Fix edges
         for (auto &node : dbg) {
             if (node.second.redirected()) continue;
@@ -898,61 +933,75 @@ struct GraphCleaning {
                            }),
                        pvec.end());
         }
-        gtl::vector<decltype(lci.begin())> to_purge;
-        for (auto it = lci.begin(); it != lci.end(); ++it) {
-            auto dbg_it = dbg.find(it->second.id);
-            if (dbg_it == dbg.end()) {
-                to_purge.emplace_back(it);
-            }
-        }
+        // gtl::vector<decltype(lci.begin())> to_purge;
+        // for (auto it = lci.begin(); it != lci.end(); ++it) {
+        //     auto dbg_it = dbg.find(it->second.id);
+        //     if (dbg_it == dbg.end()) {
+        //         to_purge.emplace_back(it);
+        //     }
+        // }
 
-        for (auto it : to_purge) {
-            lci.erase(it);
-        }
+        // for (auto it : to_purge) {
+        //     lci.erase(it);
+        // }
     }
-    static void parallel_run(dbg_index &dbgi,
-                             decltype(asm_config::graph_cleaning) cfg,
-                             int threads) {
-        gtl::flat_hash_map<u64, u64> redirect_deleted;
-        simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted);
+    // static void parallel_run(dbg_index &dbgi,
+    //                          decltype(asm_config::graph_cleaning) cfg,
+    //                          int threads) {
+    //     gtl::flat_hash_map<u64, u64> redirect_deleted;
+    //     simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted);
 
-        // Find Connected Components
-        // For each connected component simplify
-        for (int i = 0; i < cfg.iterations; ++i) {
-            cut_tips(dbgi.dbg, dbgi.lci, 3, cfg.max_tip_length);
-            pop_bubbles(dbgi.dbg, dbgi.lci,
-                        cfg.min_bubble_depth_difference_percentage);
-            // cut_low_support_edges(dbgi.dbg, dbgi.lci);
-            open_simple_loops(dbgi.dbg, dbgi.lci);
-            fix_edges(dbgi.dbg, dbgi.lci);
-            redirect_deleted.clear();
-            simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted);
-        }
-    }
+    //     // Find Connected Components
+    //     // For each connected component simplify
+    //     for (int i = 0; i < cfg.iterations; ++i) {
+    //         cut_tips(dbgi.dbg, dbgi.lci, 3, cfg.max_tip_length);
+    //         pop_bubbles(dbgi.dbg, dbgi.lci,
+    //                     cfg.min_bubble_depth_difference_percentage);
+    //         // cut_low_support_edges(dbgi.dbg, dbgi.lci);
+    //         open_simple_loops(dbgi.dbg, dbgi.lci);
+    //         fix_edges(dbgi.dbg, dbgi.lci);
+    //         redirect_deleted.clear();
+    //         simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted);
+    //     }
+    // }
     static void run(dbg_index &dbgi, const asm_config &acfg) {
         auto cfg = acfg.graph_cleaning;
         INIT_TIMERS(GraphCleaning);
         gtl::flat_hash_map<u64, u64> redirect_deleted;
-        //dfs_simplify(dbgi.dbg, dbgi.lci, redirect_deleted);
-        //IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
-        //                   "DFS Simplification");
-        simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted);
-        IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
-                           "Initial Simplification");
-        for (int i = 0; i < cfg.iterations; ++i) {
-            cut_tips(dbgi.dbg, dbgi.lci, 3, cfg.max_tip_length);
-            pop_bubbles(dbgi.dbg, dbgi.lci,
-                        cfg.min_bubble_depth_difference_percentage);
-            // cut_low_support_edges(dbgi.dbg, dbgi.lci);
-            open_simple_loops(dbgi.dbg, dbgi.lci);
-            fix_edges(dbgi.dbg, dbgi.lci);
-            redirect_deleted.clear();
-            erase_if(dbgi.lci, [](const auto &node) {  // MARK
-                return node.second.id == lci_type::max_id;
-            });
-            simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted);
+        decltype(dbgi.active_set) &active_set = dbgi.active_set;
+        active_set.reserve(dbgi.dbg.size() + 1);
+        for (const auto &node : dbgi.dbg) {
+            active_set.insert(node.first);
+        }
+        // active_set = gtl::flat_hash_set<u64> {dbgi.dbg.begin(),
+        // dbgi.dbg.end()}; dfs_simplify(dbgi.dbg, dbgi.lci, redirect_deleted);
+        // IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
+        //                    "DFS Simplification");
+        if (cfg.iterations > -1) {
+            simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted,
+                                  active_set);
             IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
-                               "Iteration %d done.", i);
+                               "Initial Simplification");
+            for (int i = 1; i < cfg.iterations; ++i) {
+                fix_edges(dbgi.dbg, dbgi.lci, active_set);
+                cut_tips(dbgi.dbg, dbgi.lci, 3, cfg.max_tip_length, active_set);
+                // TODO FIX pop_bubbles sequence problem fix
+                // pop_bubbles(dbgi.dbg, dbgi.lci,
+                //             cfg.min_bubble_depth_difference_percentage,
+                //             active_set);
+                cut_low_support_edges(dbgi.dbg, dbgi.lci, active_set);
+                // open_simple_loops(dbgi.dbg, dbgi.lci, active_set);
+
+                redirect_deleted.clear();
+                // erase_if(dbgi.lci, [](const auto &node) {  // MARK
+                //     return node.second.id == lci_type::max_id;
+                // });
+                simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted,
+                                      active_set);
+                IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
+                                   "Iteration %d done.", i);
+            }
+            fix_edges(dbgi.dbg, dbgi.lci, active_set);
         }
     }
 };
