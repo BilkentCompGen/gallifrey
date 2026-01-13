@@ -305,13 +305,13 @@ struct assembler {
         }
     }
 
-    auto generate_data(const std::string &input, dqt &data_queue,
-                       dqt &recycle_queue, int threads) {
+    [[nodiscard]] auto generate_data(const std::string &input, dqt &data_queue,
+                                     dqt &recycle_queue, int threads) {
         samFile *fp = sam_open(input.c_str(), "r");
 
         if (!fp) {
             std::cerr << "Error: Could not open " << input << std::endl;
-            return;
+            return false;
         }
         hts_set_threads(fp, threads);
         // htsThreadPool pool = {NULL, 0};
@@ -348,6 +348,7 @@ struct assembler {
         // if (pool.pool) {
         //     hts_tpool_destroy(pool.pool);
         // }
+        return true;
     }
     auto construct_dbg() {
         dqt data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
@@ -370,8 +371,10 @@ struct assembler {
                                  process_cores, std::cref(syncmer_functor));
         }
 
-        generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
-                      threads.io);
+        if (!generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
+                           threads.io)) {
+            exit(-1);
+        }
 
         done.store(true);
         for (auto &worker : workers) {
@@ -468,9 +471,7 @@ struct assembler {
         auto it = node_id_len.begin();
         assert(it != node_id_len.end());
         lps str;
-        auto calculate_reverse_utig = [](auto node) {
-            return lps{};
-        };
+        auto calculate_reverse_utig = [](auto node) { return lps{}; };
         auto move_forward_unitig = [&](u64 id) {
             auto node_it = dbgi.dbg.find(id);
             if (node_it != dbgi.dbg.end()) {
@@ -542,7 +543,7 @@ struct assembler {
                     lr.cores.emplace_back(str.cores[i].label);
                     lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
                 }
-                if (lr.cores.size() < LCMER_L + 2) {
+                if (lr.cores.size() < LCMER_L + 1) {
                     bad.fetch_add(1);
                     // good_n.fetch_sub(1);
                     free_lps(&str);
@@ -564,29 +565,42 @@ struct assembler {
             },
             threads.work);
 
-        for (const auto &[k, v] : dbgi.dbg) {
-            if (!v.redirected()) {
-                printf("+\t%llu\t%zu\t%zu\t%u\n", k, v.seq.size(),
-                       v.prev.size(), v.forward_edge_count);
-            }
-        }
+        // for (const auto &[k, v] : dbgi.dbg) {
+        //     if (!v.redirected()) {
+        //         printf("+\t%llu\t%zu\t%zu\t%u\n", k, v.seq.size(),
+        //                v.prev.size(), v.forward_edge_count);
+        //     }
+        // }
         gtl::flat_hash_map<u64, u64> reciprocal;
         for (const auto &[k, v] : matched) {
             for (const auto &match : v) {
-                if (k < match.node) {  // smaller node is the key
-                    auto it = matched.find(
-                        match.node);  // and matched node also has overlaps
-                    if (it != matched.end()) {
-                        auto ff = std::find_if(
-                            it->second.begin(), it->second.end(),
-                            [k](const auto &val) { return val.node == k; });
-                        if (ff !=
-                            it->second.end()) {  // and has the reverse match
-                            reciprocal.emplace(k, match.node);
-                            printf("%llu\t%llu\t%llu\t%llu\n", k, match.node,
-                                   match.from, match.to);
-                        }
+                // if (k < match.node) {  // smaller node is the key
+                auto it = matched.find(
+                    match.node);  // and matched node also has overlaps
+                if (it != matched.end()) {
+                    auto ff = std::find_if(
+                        it->second.begin(), it->second.end(),
+                        [k](const auto &val) { return val.node == k; });
+                    if (ff != it->second.end()) {  // and has the reverse match
+                        reciprocal.emplace(k, match.node);
+
+                        // printf("%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n", k,
+                        //        match.node, match.from, match.to,
+                        //        ff->from, ff->to);
+                        printf(
+                            "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%llu\t%"
+                            "llu\t%llu\t%llu\t%llu\t%d\n",
+                            k, match.size + LCMER_L, match.from, match.to,
+                            match.node, ff->size + LCMER_L, ff->from, ff->to,
+                            ff->to - ff->from, ff->to - ff->from, 250);
+                    } else { // Handle after reciprocals are good
+                        // printf(
+                        //     "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%d\t%d\t%d\t%"
+                        //     "d\t%d\t%d\n",
+                        //     k, match.size + LCMER_L, match.from, match.to,
+                        //     match.node, -1, -1, -1, -1, -1, 250);
                     }
+                    // }
                 }
 
                 // printf("%llu\t%llu\t%llu\t%llu\n", k, match.node, match.from,
