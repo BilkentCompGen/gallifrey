@@ -13,11 +13,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <gtl/btree.hpp>
 #include <gtl/phmap.hpp>
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <iostream>
+#include <ranges>
 #include <string>
+#include <tuple>
 #include <utility>
 
 #include "asm.h"
@@ -502,6 +505,99 @@ struct assembler {
         u64 to;
         u64 size;
     };
+
+    auto btg_connected_components(gtl::btree_multimap<u64, rev_match> &recig) {
+        gtl::vector<gtl::vector<u64>> components;
+        gtl::flat_hash_set<u64> visited;
+        for (const auto &[from, to] : recig) {
+            gtl::vector<u64> component;
+            gtl::vector<u64> stack;
+            stack.push_back(from);
+            while (!stack.empty()) {
+                u64 node = stack.back();
+                stack.pop_back();
+                if (visited.find(node) != visited.end()) {
+                    continue;
+                }
+                visited.emplace(node);
+                component.push_back(node);
+                auto range = recig.equal_range(node);
+                for (auto it = range.first; it != range.second; ++it) {
+                    if (visited.find(it->second.node) == visited.end()) {
+                        stack.push_back(it->second.node);
+                    }
+                }
+            }
+            if (component.size() > 1) {
+                components.push_back(component);
+            }
+        }
+        return components;
+    }
+
+    std::tuple<int, int> get_start_positions(
+        u64 current, u64 neighbor, gtl::btree_multimap<u64, rev_match> rmatch,
+        int cgroup) {
+        int qs = -9999, ts = -9999;
+        int qe = -9999, te = -9999;
+        int ql = -9999, tl = -9999;
+
+        auto range_c = rmatch.equal_range(current);
+        for (auto it = range_c.first; it != range_c.second; ++it) {
+            if (it->second.node == neighbor) {
+                qs = it->second.from;
+                qe = it->second.to + LCMER_L;
+                ql = it->second.size + LCMER_L;
+                break;
+            }
+        }
+        // Find the specific reciprocal entry for (neighbor -> current)
+        auto range_t = rmatch.equal_range(neighbor);
+        for (auto it = range_t.first; it != range_t.second; ++it) {
+            if (it->second.node == current) {
+                ts = it->second.from;
+                te = it->second.to + LCMER_L;
+                tl = it->second.size + LCMER_L;
+                break;
+            }
+        }
+        int ngroup = 1 - cgroup;
+        if (cgroup == 1) {
+            qs = ql - qe;
+        }
+        if (ngroup == 1) {
+            ts = tl - te;
+        }
+        return std::make_tuple(qs, ts);
+    }
+
+    auto find_comp_layout(
+        gtl::vector<u64> &component,
+        const gtl::flat_hash_map<u64, gtl::vector<std::tuple<u64, int>>>
+            delta_edges) {
+        gtl::flat_hash_map<u64, int> layout;
+
+        std::queue<u64> q;
+        u64 root = component.front();
+        q.push(root);
+        layout[root] = 0;
+
+        while (!q.empty()) {
+            u64 val = q.front();
+            q.pop();
+            for (auto [neighbor, delta] : delta_edges.at(val)) {
+                if (layout.find(neighbor) == layout.end()) {
+                    layout[neighbor] = layout[val] + delta;
+                    q.push(neighbor);
+                }
+            }
+        }
+
+        std::sort(component.begin(), component.end(),
+                  [&layout](u64 a, u64 b) { return layout[a] < layout[b]; });
+        assert(layout.size() == component.size());
+        return layout;
+    }
     void fold_dbg_graph(dbg_index &dbgi) {
         fprintf(stderr, "dbg_size: %zu\n", dbgi.dbg.size());
         fprintf(stderr, "lci_size: %zu\n", dbgi.lci.size());
@@ -571,7 +667,7 @@ struct assembler {
         //                v.prev.size(), v.forward_edge_count);
         //     }
         // }
-        gtl::flat_hash_map<u64, u64> reciprocal;
+        gtl::btree_multimap<u64, rev_match> reciprocal;
         for (const auto &[k, v] : matched) {
             for (const auto &match : v) {
                 // if (k < match.node) {  // smaller node is the key
@@ -582,7 +678,7 @@ struct assembler {
                         it->second.begin(), it->second.end(),
                         [k](const auto &val) { return val.node == k; });
                     if (ff != it->second.end()) {  // and has the reverse match
-                        reciprocal.emplace(k, match.node);
+                        reciprocal.emplace(k, match);
 
                         // printf("%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n", k,
                         //        match.node, match.from, match.to,
@@ -590,10 +686,11 @@ struct assembler {
                         printf(
                             "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%llu\t%"
                             "llu\t%llu\t%llu\t%llu\t%d\n",
-                            k, match.size + LCMER_L, match.from, match.to,
-                            match.node, ff->size + LCMER_L, ff->from, ff->to,
-                            ff->to - ff->from, ff->to - ff->from, 250);
-                    } else { // Handle after reciprocals are good
+                            k, match.size + LCMER_L, match.from,
+                            match.to + LCMER_L, match.node, ff->size + LCMER_L,
+                            ff->from, ff->to + LCMER_L, ff->to - ff->from,
+                            ff->to - ff->from, 250);
+                    } else {  // Handle after reciprocals are good
                         // printf(
                         //     "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%d\t%d\t%d\t%"
                         //     "d\t%d\t%d\n",
@@ -602,13 +699,66 @@ struct assembler {
                     }
                     // }
                 }
-
                 // printf("%llu\t%llu\t%llu\t%llu\n", k, match.node, match.from,
                 //        match.to);
             }
         }
         fprintf(stderr, "all:%d\ngood: %d nodes\nhits: %d\n", all_n.load(),
                 all_n.load() - bad.load(), hits.load());
+        // Find connected components
+
+        auto components = btg_connected_components(reciprocal);
+        int cc = 0;
+
+        for (auto &component : components) {
+            fprintf(stderr, "Component %d:\n", cc);
+
+            // Greedy bipartite partitioning
+            gtl::flat_hash_map<u64, int>
+                group;  // Map to store the group of each node (0 or 1)
+            std::queue<u64> q;
+            // gtl::vector<std::tuple<u64, u64, int>> delta_edges;
+            gtl::flat_hash_map<u64, gtl::vector<std::tuple<u64, int>>>
+                delta_edges;
+            // Start with the first node in the component
+            u64 first = component.front();
+            group[first] = 1;
+            q.push(first);
+
+            while (!q.empty()) {
+                u64 current = q.front();
+                q.pop();
+                // Assign neighbors to the opposite group
+                auto range = reciprocal.equal_range(current);
+                for (auto it = range.first; it != range.second; ++it) {
+                    u64 neighbor = it->second.node;
+
+                    if (group.find(neighbor) == group.end()) {
+                        group[neighbor] = - group[current];
+                        auto [qs, ts] = get_start_positions(
+                            current, neighbor, reciprocal, group[current]);
+
+                        delta_edges[current].emplace_back(neighbor, qs - ts);
+                        delta_edges[neighbor].emplace_back(current, ts - qs);
+                        q.push(neighbor);
+                    }
+                }
+            }
+            auto layout = find_comp_layout(component, delta_edges);
+            fprintf(stderr, "Layout: %zu \t Component: %zu\n", layout.size(),
+                    component.size());
+            // for(const auto [k,v] : layout){
+            //     fprintf(stderr, "C%llu\t%d\t%s\n", k, v, group[k]?"+":"-");
+            // }
+            fprintf(stderr, "Group 0:\n");
+            for (const auto &[node, grp] : group) {
+                fprintf(stderr, "C%llu\t%d\t%ld\t%s\n", node, layout[node],
+                        layout[node] + dbgi.dbg.at(node).seq.size(),
+                        grp==1? "+" : "-");
+            }
+
+            cc++;
+        }
     }
 };
 
