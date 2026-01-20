@@ -90,8 +90,8 @@ struct dbg_index {
     dbg_map_t dbg;
     lcmer_index_t lci;
     gtl::flat_hash_set<u64> active_set;
-    gtl::vector<std::pair<gtl::vector<u64>, gtl::vector<u64>>> lanes;
-    gtl::flat_hash_map<u64, gtl::vector<std::tuple<u64, u32, bool>>> lane_map;
+
+
     // merge_info_map_t merge_map;
     bloom_interface<bloom_ext::BlockedLockedBloomFilter<0, std::mutex>> bf;
 

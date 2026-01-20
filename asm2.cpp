@@ -683,13 +683,13 @@ struct assembler {
                         // printf("%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n", k,
                         //        match.node, match.from, match.to,
                         //        ff->from, ff->to);
-                        printf(
-                            "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%llu\t%"
-                            "llu\t%llu\t%llu\t%llu\t%d\n",
-                            k, match.size + LCMER_L, match.from,
-                            match.to + LCMER_L, match.node, ff->size + LCMER_L,
-                            ff->from, ff->to + LCMER_L, ff->to - ff->from,
-                            ff->to - ff->from, 250);
+                        // printf(
+                        //     "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%llu\t%"
+                        //     "llu\t%llu\t%llu\t%llu\t%d\n",
+                        //     k, match.size + LCMER_L, match.from,
+                        //     match.to + LCMER_L, match.node, ff->size + LCMER_L,
+                        //     ff->from, ff->to + LCMER_L, ff->to - ff->from,
+                        //     ff->to - ff->from, 250);
                     } else {  // Handle after reciprocals are good
                         // printf(
                         //     "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%d\t%d\t%d\t%"
@@ -710,55 +710,55 @@ struct assembler {
         auto components = btg_connected_components(reciprocal);
         int cc = 0;
 
-        for (auto &component : components) {
-            fprintf(stderr, "Component %d:\n", cc);
+        // for (auto &component : components) {
+        //     // fprintf(stderr, "Component %d:\n", cc);
 
-            // Greedy bipartite partitioning
-            gtl::flat_hash_map<u64, int>
-                group;  // Map to store the group of each node (0 or 1)
-            std::queue<u64> q;
-            // gtl::vector<std::tuple<u64, u64, int>> delta_edges;
-            gtl::flat_hash_map<u64, gtl::vector<std::tuple<u64, int>>>
-                delta_edges;
-            // Start with the first node in the component
-            u64 first = component.front();
-            group[first] = 1;
-            q.push(first);
+        //     // Greedy bipartite partitioning
+        //     gtl::flat_hash_map<u64, int>
+        //         group;  // Map to store the group of each node (0 or 1)
+        //     std::queue<u64> q;
+        //     // gtl::vector<std::tuple<u64, u64, int>> delta_edges;
+        //     gtl::flat_hash_map<u64, gtl::vector<std::tuple<u64, int>>>
+        //         delta_edges;
+        //     // Start with the first node in the component
+        //     u64 first = component.front();
+        //     group[first] = 1;
+        //     q.push(first);
 
-            while (!q.empty()) {
-                u64 current = q.front();
-                q.pop();
-                // Assign neighbors to the opposite group
-                auto range = reciprocal.equal_range(current);
-                for (auto it = range.first; it != range.second; ++it) {
-                    u64 neighbor = it->second.node;
+        //     while (!q.empty()) {
+        //         u64 current = q.front();
+        //         q.pop();
+        //         // Assign neighbors to the opposite group
+        //         auto range = reciprocal.equal_range(current);
+        //         for (auto it = range.first; it != range.second; ++it) {
+        //             u64 neighbor = it->second.node;
 
-                    if (group.find(neighbor) == group.end()) {
-                        group[neighbor] = - group[current];
-                        auto [qs, ts] = get_start_positions(
-                            current, neighbor, reciprocal, group[current]);
+        //             if (group.find(neighbor) == group.end()) {
+        //                 group[neighbor] = - group[current];
+        //                 auto [qs, ts] = get_start_positions(
+        //                     current, neighbor, reciprocal, group[current]);
 
-                        delta_edges[current].emplace_back(neighbor, qs - ts);
-                        delta_edges[neighbor].emplace_back(current, ts - qs);
-                        q.push(neighbor);
-                    }
-                }
-            }
-            auto layout = find_comp_layout(component, delta_edges);
-            fprintf(stderr, "Layout: %zu \t Component: %zu\n", layout.size(),
-                    component.size());
-            // for(const auto [k,v] : layout){
-            //     fprintf(stderr, "C%llu\t%d\t%s\n", k, v, group[k]?"+":"-");
-            // }
-            fprintf(stderr, "Group 0:\n");
-            for (const auto &[node, grp] : group) {
-                fprintf(stderr, "C%llu\t%d\t%ld\t%s\n", node, layout[node],
-                        layout[node] + dbgi.dbg.at(node).seq.size(),
-                        grp==1? "+" : "-");
-            }
+        //                 delta_edges[current].emplace_back(neighbor, qs - ts);
+        //                 delta_edges[neighbor].emplace_back(current, ts - qs);
+        //                 q.push(neighbor);
+        //             }
+        //         }
+        //     }
+        //     auto layout = find_comp_layout(component, delta_edges);
+        //     // fprintf(stderr, "Layout: %zu \t Component: %zu\n", layout.size(),
+        //     //         component.size());
+        //     // // for(const auto [k,v] : layout){
+        //     // //     fprintf(stderr, "C%llu\t%d\t%s\n", k, v, group[k]?"+":"-");
+        //     // // }
+        //     // fprintf(stderr, "Group 0:\n");
+        //     // for (const auto &[node, grp] : group) {
+        //     //     fprintf(stderr, "C%llu\t%d\t%ld\t%s\n", node, layout[node],
+        //     //             layout[node] + dbgi.dbg.at(node).seq.size(),
+        //     //             grp==1? "+" : "-");
+        //     // }
 
-            cc++;
-        }
+        //     cc++;
+        // }
     }
 };
 

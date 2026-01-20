@@ -179,7 +179,7 @@ struct BlockedLockedBloomFilter {
     std::pair<uint8_t *, uint32_t> GetBlock(uint32_t h1, uint32_t) {
         uint32_t block_idx = h1 % num_blocks;
         uint32_t byte_idx = block_idx * block_bytes;
-        return {(uint8_t *)bv.data() + byte_idx, block_idx/locks_per_n_blocks};
+        return {(uint8_t *)bv.data() + byte_idx, block_idx>>LOCKS_PER_2PN_BLOCKS};
     }
 
     void Insert(uint32_t h1, uint32_t h2) {

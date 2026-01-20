@@ -576,24 +576,11 @@ inline void init_lps_crumbled(lps *lps_ptr,
                               gtl::vector<SequenceContainerType> &sseqs,
                               const auto &syncmer_functor) {
     size_t len = 0;
-    lps_ptr->level = 1;
+
     for (auto &sseq : sseqs) {
         len += sseq.len;
     }
-    if (lps_ptr->cores == nullptr) {
-        lps_ptr->size = 0;
-        lps_ptr->capacity = (len / CONSTANT_FACTOR);
-        lps_ptr->cores = (struct core *)malloc((len / CONSTANT_FACTOR) *
-                                               sizeof(struct core));
-        lps_ptr->level = 1;
-    } else {
-        if (lps_ptr->capacity < len / CONSTANT_FACTOR) {
-            lps_ptr->capacity = len / CONSTANT_FACTOR;
-
-            lps_ptr->cores = (struct core *)realloc(
-                lps_ptr->cores, (len / CONSTANT_FACTOR) * sizeof(struct core));
-        }
-    }
+    prepare_lps(lps_ptr, len);
     lps_ptr->size =
         parse1_CrumbledSubSeqs_syncmers(sseqs, lps_ptr, syncmer_functor);
     assert(lps_ptr->size < lps_ptr->capacity);
