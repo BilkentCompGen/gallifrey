@@ -276,6 +276,79 @@
 //     }
 // };
 
+#include <arm_neon.h>
+#include <stddef.h>
+#include <stdint.h>
+
+static const uint8_t decode4_tbl[16] = {
+    /* 0 */ 0,
+    /* 1 */ 0,
+    /* 2 */ 1,
+    /* 3 */ 0,
+    /* 4 */ 2,
+    /* 5 */ 0,
+    /* 6 */ 0,
+    /* 7 */ 0,
+    /* 8 */ 3,
+    /* 9 */ 0,
+    /* A */ 0,
+    /* B */ 0,
+    /* C */ 0,
+    /* D */ 0,
+    /* E */ 0,
+    /* F */ 0
+};
+
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__))
+inline void onehotto2bitDNA_neon( // TODO VERIFY TEST THIS
+    const uint8_t *__restrict data,
+    size_t len,
+    uint8_t *__restrict low,
+    uint8_t *__restrict high)
+{
+    // Load decode table into a vector register
+    const uint8x16_t tbl  = vld1q_u8(decode4_tbl);
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+
+    size_t i = 0;
+
+    // Main SIMD loop: 16 bytes at a time
+    for (; i + 16 <= len; i += 16) {
+        // Load 16 input bytes
+        uint8x16_t v = vld1q_u8(data + i);
+
+        // Extract nibbles
+        uint8x16_t lo = vandq_u8(v, mask);
+        uint8x16_t hi = vshrq_n_u8(v, 4);
+
+        // Table lookup
+        uint8x16_t dlo = vqtbl1q_u8(tbl, lo);
+        uint8x16_t dhi = vqtbl1q_u8(tbl, hi);
+
+        // Store results
+        vst1q_u8(low  + i, dlo);
+        vst1q_u8(high + i, dhi);
+    }
+
+    // Scalar tail
+    for (; i < len; ++i) {
+        uint8_t b = data[i];
+        low[i]  = decode4_tbl[b & 0x0F];
+        high[i] = decode4_tbl[b >> 4];
+    }
+}
+#endif
+
+inline void onehotto2bitDNA_vector(
+    const uint8_t *__restrict data,
+    size_t len,
+    uint8_t *__restrict low,
+    uint8_t *__restrict high)
+{
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__))
+    return onehotto2bitDNA_neon(data,  len,  low, high);
+#endif
+}
 // Uses naive conversions for now can be optimized later if necessary
 struct CrumbledSubSeq {
     size_t len : 62;
@@ -572,68 +645,6 @@ struct CrumbledSubSeq64 {
                 out += bases_per_word;
             }
             buffer[total] = '\0';
-            return buffer + skip_first_n;
-        }
-#elif defined(__SSSE3__) || defined(__AVX2__)  // Not tested ever
-        // SSSE3 path mirrors the NEON strategy.
-        if (len >= bases_per_word) {
-            size_t remaining = len;
-            const size_t rem =
-                (skip_first_n + base_index) & (bases_per_word - 1);
-            const size_t prefix = std::min(
-                remaining, (bases_per_word - rem) & (bases_per_word - 1));
-            if (prefix) {
-                scalar_emit(prefix);
-                remaining -= prefix;
-            }
-
-            const uint64_t *word_ptr =
-                data + ((bit_base + base_index * 2) >> 6);
-            auto *out = reinterpret_cast<uint8_t *>(buffer + base_index);
-
-            const __m128i lut =
-                _mm_setr_epi8('A', 'C', 'G', 'T', 'A', 'C', 'G', 'T', 'A', 'C',
-                              'G', 'T', 'A', 'C', 'G', 'T');
-            const __m128i mask = _mm_set1_epi8(0x3);
-
-            while (remaining > 0) {
-                // Load 8 bytes -> 32 bases spread across bytes.
-                __m128i packed = _mm_loadl_epi64(
-                    reinterpret_cast<const __m128i *>(word_ptr));
-
-                __m128i c0 = _mm_and_si128(packed, mask);
-                __m128i c1 = _mm_and_si128(_mm_srli_epi16(packed, 2), mask);
-                __m128i c2 = _mm_and_si128(_mm_srli_epi16(packed, 4), mask);
-                __m128i c3 = _mm_and_si128(_mm_srli_epi16(packed, 6), mask);
-
-                c0 = _mm_shuffle_epi8(lut, c0);
-                c1 = _mm_shuffle_epi8(lut, c1);
-                c2 = _mm_shuffle_epi8(lut, c2);
-                c3 = _mm_shuffle_epi8(lut, c3);
-
-                // Interleave to restore base order.
-                __m128i t0lo = _mm_unpacklo_epi8(c0, c1);
-                __m128i t0hi = _mm_unpackhi_epi8(c0, c1);
-                __m128i t1lo = _mm_unpacklo_epi8(c2, c3);
-                __m128i t1hi = _mm_unpackhi_epi8(c2, c3);
-
-                __m128i o0 = _mm_unpacklo_epi16(t0lo, t1lo);
-                __m128i o1 = _mm_unpackhi_epi16(t0lo, t1lo);
-                __m128i o2 = _mm_unpacklo_epi16(t0hi, t1hi);
-                __m128i o3 = _mm_unpackhi_epi16(t0hi, t1hi);
-
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(out), o0);
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + 16), o1);
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + 32), o2);
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + 48), o3);
-
-                size_t step = std::min(remaining, bases_per_word);
-                word_ptr++;
-                out += step;
-                base_index += step;
-                remaining -= step;
-            }
-            buffer[len] = '\0';
             return buffer + skip_first_n;
         }
 #endif

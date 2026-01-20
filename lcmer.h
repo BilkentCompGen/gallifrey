@@ -665,7 +665,7 @@ inline uint64_t parse1_bam_syncmer_with_lanes(
     for (int l = 0; l < lanes; ++l) {
         int core_index = 0;
         KmerViewOnInts<uint64_t, 2> kmer_view{k};
-        int64_t it1 = [&data, len, l, k]() {
+        int64_t it1 = [&data, len, l, k, &kmer_view]() {
             if (l == 0) {
                 return kmer_view.fill(data[l].first,
                                       len);  // Fill from beginning

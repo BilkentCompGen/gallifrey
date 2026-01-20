@@ -22,6 +22,8 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <queue>
+
 
 #include "asm.h"
 #include "bgzf.h"
