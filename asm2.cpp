@@ -424,8 +424,11 @@ struct assembler {
                 std::ref(all_read_counts[tid - 1]), process_cores_for_basespace,
                 std::cref(syncmer_functor));
         }
-        generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
-                      threads.io);
+        if (!generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
+                           threads.io)) {
+            fprintf(stderr, "Error in reading data for basespace conversion\n");
+            exit(-1);
+        }
 
         done.store(true);
         for (auto &worker : workers) {
@@ -452,46 +455,48 @@ struct assembler {
     }
     // I need to recompute the LCP, it is likely more expensive to find relavant
     // nodes.
-    void iterative_re_dbg(dbg_index &dbgi) {
-        gtl::vector<std::pair<u64, size_t>> node_id_len;
-        for (const auto &[k, v] : dbgi.dbg) {
-            node_id_len.emplace_back(k, v.seq.size());
-        }
-        std::sort(
-            node_id_len.begin(), node_id_len.end(),
-            [](const auto &a, const auto &b) { return a.second < b.second; });
-        // Check this again TODO.
-        dbg_index new_index(dbgi.bf.implementation.m, dbgi.bf.implementation.n,
-                            dbgi.bf.random_seed);
+    // void iterative_re_dbg(dbg_index &dbgi) {
+    //     gtl::vector<std::pair<u64, size_t>> node_id_len;
+    //     for (const auto &[k, v] : dbgi.dbg) {
+    //         node_id_len.emplace_back(k, v.seq.size());
+    //     }
+    //     std::sort(
+    //         node_id_len.begin(), node_id_len.end(),
+    //         [](const auto &a, const auto &b) { return a.second < b.second;
+    //         });
+    //     // Check this again TODO.
+    //     dbg_index new_index(dbgi.bf.implementation.m,
+    //     dbgi.bf.implementation.n,
+    //                         dbgi.bf.random_seed);
 
-        auto it = node_id_len.begin();
-        assert(it != node_id_len.end());
-        lps str;
-        auto calculate_reverse_utig = [](auto node) { return lps{}; };
-        auto move_forward_unitig = [&](u64 id) {
-            auto node_it = dbgi.dbg.find(id);
-            if (node_it != dbgi.dbg.end()) {
-                int len = count_seqv_len(node_it->second.seq);
-                prepare_lps(&str, len);
-                init_lps_crumbled(&str, node_it->second.seq, syncmer_functor);
-                lps_deepen(&str, lcp_level);
-            }
-        };
-        auto rev_contig_present_in_the_index =
-            [&](const dbg_index::dbg_map_t::value_type &node, auto ctg) {
-                return true;
-            };
-        move_forward_unitig(node_id_len.front().first);
-        ++it;
-        while (it != node_id_len.end()) {
-            auto rev_ctg = calculate_reverse_utig(*it);
-            if (rev_contig_present_in_the_index(*it, rev_ctg)) {
-            } else {
-                move_forward_unitig(it->first);
-            }
-            ++it;
-        }
-    }
+    //     auto it = node_id_len.begin();
+    //     assert(it != node_id_len.end());
+    //     lps str;
+
+    //     auto move_forward_unitig = [&](u64 id) {
+    //         auto node_it = dbgi.dbg.find(id);
+    //         if (node_it != dbgi.dbg.end()) {
+    //             int len = count_seqv_len(node_it->second.seq);
+    //             prepare_lps(&str, len);
+    //             init_lps_crumbled(&str, node_it->second.seq,
+    //             syncmer_functor); lps_deepen(&str, lcp_level);
+    //         }
+    //     };
+    //     auto rev_contig_present_in_the_index =
+    //         [&](const dbg_index::dbg_map_t::value_type &node, auto ctg) {
+    //             return true;
+    //         };
+    //     move_forward_unitig(node_id_len.front().first);
+    //     ++it;
+    //     while (it != node_id_len.end()) {
+    //         auto rev_ctg = calculate_reverse_utig(*it);
+    //         if (rev_contig_present_in_the_index(*it, rev_ctg)) {
+    //         } else {
+    //             move_forward_unitig(it->first);
+    //         }
+    //         ++it;
+    //     }
+    // }
     struct rev_match {
         u64 node;
         u64 from;  // target start in bases (ts)
@@ -504,7 +509,8 @@ struct assembler {
         // Matching LCMER indices.
         //
         // Convention:
-        // - *_query_* refer to the QUERY/SOURCE node (the map key / "from" node)
+        // - *_query_* refer to the QUERY/SOURCE node (the map key / "from"
+        // node)
         // - *_target_* refer to the TARGET node (rev_match::node)
         //
         // These indices are later used to "switch" between SequenceContainer
@@ -611,7 +617,7 @@ struct assembler {
             if (start > std::numeric_limits<int>::max() - (len - 1)) {
                 return std::numeric_limits<int>::max();
             }
-            if (start < std::numeric_limits<int>::min() - (len - 1)) {
+            if (start < std::numeric_limits<int>::min() + (len - 1)) {
                 return std::numeric_limits<int>::min();
             }
             return start + (len - 1);
@@ -691,9 +697,9 @@ struct assembler {
         }
         return layouts;
     }
+
     auto add_lcmers(const gtl::vector<SequenceContainerType> &subseqs,
-                    auto &node, dbg_index &dbgi, u64 &idx, int tid,
-                    bool reverse = false) {
+                    auto &node, dbg_index &dbgi, u64 &idx, int tid) {
         lps str = {0, 0, 0, 0};
         lcp_read lr;
         // dbgi.dbg.for_each([&](auto &node) {
@@ -705,47 +711,6 @@ struct assembler {
 
         // Extract a subsequence [from, to) from the concatenated rev_seqs
         // Returns a single CrumbledSubSeq64 containing the extracted range
-        auto get_sub_seq = [&subseqs](size_t from, size_t to) {
-            size_t sub_len = (from < to) ? (to - from) : 0;
-            CrumbledSubSeq64 result{sub_len, 0};
-
-            if (sub_len == 0 || subseqs.empty()) {
-                return result;
-            }
-
-            size_t cumulative = 0;
-            size_t dest_pos = 0;
-
-            for (size_t i = 0; i < subseqs.size() && dest_pos < sub_len; ++i) {
-                const auto &frag = subseqs[i];
-                size_t frag_start = cumulative;
-                size_t frag_end = cumulative + frag.len;
-
-                // Compute the overlap of [frag_start, frag_end) with [from, to)
-                size_t overlap_start = std::max(frag_start, from);
-                size_t overlap_end = std::min(frag_end, to);
-
-                if (overlap_start < overlap_end) {
-                    // Offset within this fragment
-                    size_t local_from = overlap_start - frag_start;
-                    size_t copy_len = overlap_end - overlap_start;
-
-                    // Copy bases from frag to result
-                    for (size_t b = 0; b < copy_len; ++b) {
-                        size_t src_bit =
-                            (frag.skip_first_n + local_from + b) * 2;
-                        uint64_t code =
-                            (frag.data[src_bit >> 6] >> (src_bit & 63)) & 0x3;
-                        size_t dst_bit = dest_pos * 2;
-                        result.data[dst_bit >> 6] |= code << (dst_bit & 63);
-                        ++dest_pos;
-                    }
-                    result.origin_node = frag.origin_node;
-                }
-                cumulative += frag.len;
-            }
-            return result;
-        };
 
         init_lps_crumbled(&str, subseqs, syncmer_functor);
         lps_deepen(&str, lcp_level);
@@ -772,14 +737,53 @@ struct assembler {
         for (size_t i = 1; i < ll.size() - 1; ++i) {
             if (insert_lcmer_helper(ll, i, dbgi)) {
                 dbgi.dbg.modify_if(
-                    ll[i], [&lr, i, &get_sub_seq](
-                               dbg_index::dbg_map_t::value_type &val) {
+                    ll[i],
+                    [&lr, i, &subseqs](dbg_index::dbg_map_t::value_type &val) {
                         val.second.seq.emplace_back(
-                            get_sub_seq(lr.pos[i + LCMER_L - 1].second,
-                                        lr.pos[i + LCMER_L].second));
+                            subseqs, lr.pos[i + LCMER_L - 1].second,
+                            lr.pos[i + LCMER_L].second);
                     });
             }
         }
+    }
+
+    auto find_rev_lcmers(const gtl::vector<SequenceContainerType> &subseqs,
+                         dbg_index &dbgi, int tid, u64 &idx)
+        -> gtl::vector<SequenceContainerType> {
+        lps str = {0, 0, 0, 0};
+        lcp_read lr;
+        lr.clear();
+
+        init_lps_crumbled(&str, subseqs, syncmer_functor);
+        lps_deepen(&str, lcp_level);
+
+        for (int i = 0; i < str.size; ++i) {
+            lr.cores.emplace_back(str.cores[i].label);
+            lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
+        }
+        if (lr.cores.size() < LCMER_L + 2) {
+            free_lps(&str);
+            return {};
+        }
+        lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
+        gtl::vector<u64> ll;
+
+        u64 lval = dbgi.emplace_nobloomfilter(l, idx, tid);
+        ll.emplace_back(lval);
+        for (size_t i = 2; i < lr.cores.size() - LCMER_L - 1; ++i) {
+            uint32_t in_core = lr.cores[i + LCMER_L];
+            l.update_lcmer(in_core);
+            lval = dbgi.emplace_nobloomfilter(l, idx, tid);
+            ll.emplace_back(lval);
+        }
+        gtl::vector<SequenceContainerType> seqs;
+        for (size_t i = 1; i < ll.size() - 1; ++i) {
+            seqs.emplace_back(subseqs, lr.pos[i + LCMER_L - 1].second,
+                              lr.pos[i + LCMER_L].second);
+            seqs.back().origin_node = ll[i];
+        }
+        // TODO: index it if needed
+        return seqs;
     }
     auto fold_dbg_graph(dbg_index &dbgi) {
         fprintf(stderr, "dbg_size: %zu\n", dbgi.dbg.size());
@@ -794,6 +798,7 @@ struct assembler {
         for_each_map(
             dbgi.dbg,
             [&](int tid, const auto &node) {
+                (void)tid;
                 all_n.fetch_add(1);
                 if (dbgi.active_set.find(node.first) == dbgi.active_set.end()) {
                     bad.fetch_add(1);
@@ -1063,13 +1068,13 @@ struct assembler {
     //     return 0;
     // }
 
-    static void merge_layouts_ultra(
+    void merge_layouts_ultra(
         FILE *out,
         const gtl::vector<gtl::flat_hash_map<u64, std::tuple<int, int, bool>>>
             &layouts,
         const gtl::btree_multimap<u64, rev_match> &reciprocal,
-        dbg_index::dbg_map_t &dbg) {
-
+        dbg_index &dbgi) {
+        auto &dbg = dbgi.dbg;
         auto identify_component_endpoints = [](const auto &layout) {
             u64 leftmost = 0;
             u64 rightmost = 0;
@@ -1100,35 +1105,77 @@ struct assembler {
             }
             return std::make_pair(leftmost, rightmost);
         };
-        auto find_rev = [&reciprocal] (u64 src, u64 step) {
+        auto find_rev = [&reciprocal](u64 src, u64 step) {
             auto range = reciprocal.equal_range(src);
             for (auto it = range.first; it != range.second; ++it) {
-                if(it->second.node == step){
+                if (it->second.node == step) {
                     return it;
                 }
             }
             return reciprocal.end();
         };
+        u64 new_index = std::numeric_limits<u64>::max() / 2 + 31;
+        u64 layout_no = 0;
+        u64 prev_lm_query = 0;
         for (const auto &layout : layouts) {
             // Find leftmost start and rightmost end on the layout.
             gtl::vector<gtl::vector<SequenceContainerType>>
                 merged_seqs;  // per entry we get hte sequences. Even forward
-
+            charsi chs;
             auto [source, target] = identify_component_endpoints(layout);
-            auto path = shortest_path_unweighted_bfs(reciprocal, source, target);
+            auto path =
+                shortest_path_unweighted_bfs(reciprocal, source, target);
             bool plus = true;
             source = path[0];
-            for(size_t i = 1; i < path.size(); ++i){
+            fprintf(out, ">M%llu ", layout_no++);
+            for (size_t i = 0; i < path.size(); ++i) {
+                fprintf(out, "->C%llu", path[i]);
+            }
+            fprintf(out, "\n");
+            for (size_t i = 1; i < path.size(); ++i) {
                 u64 step = path[i];
                 auto revit = find_rev(source, step);
                 assert(revit != reciprocal.end());
                 const rev_match &rv = revit->second;
-                fprintf(
-                    out, "C%llu\t%llu\t%llu\t%llu\t%c\tC%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%d\n",
-                    source, rv.qlen + LCMER_L, rv.qs, rv.qe,
-                    (plus ? '+' : '-'), step, rv.size + LCMER_L, rv.from,
-                    rv.to, rv.to - rv.from, rv.to - rv.from, 250);
 
+                auto source_node = dbg.find(source);
+                if (source_node == dbg.end()) {
+                    fprintf(stderr, "Source node %llu not found in dbg\n",
+                            source);
+                    continue;
+                }
+
+                if (plus) {
+                    for (const SequenceContainerType &seq :
+                         source_node->second.seq) {
+                        chs.require(seq.len);
+                        seq.convert_to_ascii((char *)chs.data);
+                        fprintf(out, "%s\n",
+                                (const char *)chs.data + seq.skip_first_n);
+
+                        // if (seq.origin_node ==
+                        //     rv.last_matching_lcmer_target) {
+                        //     break;
+                        // }
+
+                    }
+                } else {
+                    // auto lrs = find_rev_lcmers(source_node->second.seq,
+                    //                                  dbgi, 13, new_index);
+                    // auto it = lrs.begin();
+                    // while (it->origin_node != prev_lm_query) {
+                    //     ++it;
+                    // }
+                    // while (it->origin_node != rv.last_matching_lcmer_target) {
+                    //     SequenceContainerType &seq = *it;
+                    //     chs.require(seq.len);
+                    //     seq.convert_to_ascii((char *)chs.data);
+                    //     fprintf(out, "%s\n",
+                    //             (const char *)chs.data + seq.skip_first_n);
+                    //     ++it;
+                    // }
+                }
+                prev_lm_query = rv.first_matching_lcmer_target;
                 plus = !plus;
                 source = step;
             }
@@ -1151,14 +1198,6 @@ struct assembler {
         // `seq_len` below is in bases. If these units are mixed, overlap
         // trimming can delete/duplicate large sequence, potentially leading to
         // misassemblies. We don't change behavior here, but we warn.
-        auto warnf = [](const char *fmt, ...) {
-            va_list ap;
-            va_start(ap, fmt);
-            fprintf(stderr, "[print_merged_layouts] ");
-            vfprintf(stderr, fmt, ap);
-            fprintf(stderr, "\n");
-            va_end(ap);
-        };
 
         for (auto &layout : layouts) {
             if (layout.empty()) continue;
@@ -1384,7 +1423,7 @@ int run_assembly(const asm_config &cfg) {
     FILE *out = fopen(cfg.output.c_str(), "w");
 
     // assembler::print_merged_layouts(out, layouts, dbg.dbg);
-    assembler::merge_layouts_ultra(out, layouts, recig, dbg.dbg);
+    as.merge_layouts_ultra(out, layouts, recig, dbg);
     // assembler::print_merged_layouts_weave_majority_orientation(out, recig,
     // std::move(layouts), dbg.dbg);
     //  Print remaining unmerged nodes (their sequences weren't cleared)

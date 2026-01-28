@@ -801,7 +801,7 @@ struct GraphCleaning {
         // int tid=0;
         gtl::vector<std::thread> threads;
         std::mutex del_mutex;
-        for (int i = 0; i < to_simplify.size(); ++i) {
+        for (size_t i = 0; i < to_simplify.size(); ++i) {
             threads.emplace_back(
                 [&](int i) {
                     gtl::flat_hash_map<u64, u64> to_delete;

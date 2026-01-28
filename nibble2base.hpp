@@ -3,6 +3,7 @@
 // #include <sys/_types/_u_char.h>
 #include <cassert>
 #include <cstdint>
+#include <gtl/vector.hpp>
 
 #include "htslib/hts.h"
 
@@ -499,6 +500,9 @@ T reverse_complement_kmer(T kmer, int K) {
     kmer = kmer >> shift_count;
     return kmer;
 }
+
+
+
 // 64-bit packed variant: 32 bases per word, 2 bits per base.
 struct CrumbledSubSeq64 {
     size_t len : 59;
@@ -583,6 +587,47 @@ struct CrumbledSubSeq64 {
         : len(other.len), skip_first_n(other.skip_first_n), data(other.data) {
         other.data = nullptr;
     }
+
+    CrumbledSubSeq64 (const gtl::vector<CrumbledSubSeq64> &subseqs,
+                            size_t from, size_t to) : len{to-from}, data{new uint64_t[storage_size(to-from+32)]}{
+        size_t sub_len = (from < to) ? (to - from) : 0;
+        if (sub_len == 0 || subseqs.empty()) {
+            return;
+        }
+
+        size_t cumulative = 0;
+        size_t dest_pos = 0;
+
+        for (size_t i = 0; i < subseqs.size() && dest_pos < sub_len; ++i) {
+            const auto &frag = subseqs[i];
+            size_t frag_start = cumulative;
+            size_t frag_end = cumulative + frag.len;
+
+            // Compute the overlap of [frag_start, frag_end) with [from, to)
+            size_t overlap_start = std::max(frag_start, from);
+            size_t overlap_end = std::min(frag_end, to);
+
+            if (overlap_start < overlap_end) {
+                // Offset within this fragment
+                size_t local_from = overlap_start - frag_start;
+                size_t copy_len = overlap_end - overlap_start;
+
+                // Copy bases from frag to result
+                for (size_t b = 0; b < copy_len; ++b) {
+                    size_t src_bit = (frag.skip_first_n + local_from + b) * 2;
+                    uint64_t code =
+                        (frag.data[src_bit >> 6] >> (src_bit & 63)) & 0x3;
+                    size_t dst_bit = dest_pos * 2;
+                    data[dst_bit >> 6] |= code << (dst_bit & 63);
+                    ++dest_pos;
+                }
+                origin_node = frag.origin_node;
+            }
+            cumulative += frag.len;
+        }
+    };
+
+
     CrumbledSubSeq64(const CrumbledSubSeq64 &other) = delete;
     CrumbledSubSeq64 &operator=(const CrumbledSubSeq64 &other) = delete;
     ~CrumbledSubSeq64() { delete[] data; }
