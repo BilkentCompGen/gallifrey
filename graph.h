@@ -9,11 +9,34 @@
 #include <gtl/vector.hpp>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "asm.h"
 #include "bloomfilter.h"
 #include "config.h"
 #include "lcmer.h"
+
+template <class map, class F>
+static void for_each_map(const map &mp, const F &fCallback, int threads) {
+    std::vector<std::thread> workers;
+    for (int tid = 0; tid < threads; ++tid) {
+        workers.emplace_back(
+            [&](const map &mp, int tid) {
+                for (size_t i = tid; i < mp.subcnt(); i += threads) {
+                    mp.with_submap(i, [&](const map::EmbeddedSet &set) {
+                        for (const auto &p : set) {
+                            fCallback(tid, p);
+                        }
+                    });
+                }
+            },
+            std::cref(mp), tid);
+    }
+    for (auto &worker : workers) {
+        worker.join();
+    }
+}
+
 template <std::integral int_type>
 consteval int_type nextpowerof2(int_type v) {
     v--;
@@ -40,7 +63,7 @@ struct dbg_index {
               seq{},
               prev{prev} {}
 
-        unsigned core_count : 31;
+        unsigned core_count : 31l;
         unsigned visited : 1;
         unsigned forward_edge_count;
 
@@ -91,13 +114,13 @@ struct dbg_index {
     lcmer_index_t lci;
     gtl::flat_hash_set<u64> active_set;
 
-
     // merge_info_map_t merge_map;
     bloom_interface<bloom_ext::BlockedLockedBloomFilter<0, std::mutex>> bf;
 
     dbg_index(double false_positive_rate, uint64_t projected_count,
               uint64_t seed)
         : bf{false_positive_rate, projected_count, seed} {}
+
     // dbg_index(const dbg_index &other)
     lci_type get(const lcmer<LCMER_L> &l) const {
         auto it = lci.find(l);
@@ -557,10 +580,11 @@ struct GraphCleaning {
     using lci_type = dbg_index::lci_type;
     using dbg_map_t = dbg_index::dbg_map_t;
     using lcmer_index_t = dbg_index::lcmer_index_t;
-    static auto attempt_simplify_one_path(
-        dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
-        gtl::flat_hash_map<u64, u64> &redirect_deleted, u64 id,
-        auto starting_from, auto &to_delete) -> bool {
+    using redir_map = gtl::parallel_flat_hash_map_d<u64, u64, 4, std::mutex>;
+    static auto attempt_simplify_one_path(dbg_map_t &dbg,
+                                          redir_map &redirect_deleted, u64 id,
+                                          auto starting_from, auto &to_delete)
+        -> bool {
         // Find a node we cannot simplify
         // Iterate backwards and merge until we cannot simplify
         // o->o->o->o->o->o -> o->o
@@ -577,16 +601,9 @@ struct GraphCleaning {
         while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
                prev_it->second.forward_edge_count == 1) {
             if (prev_it != dbg.end()) {
-                // for (auto it = current->second.seq.rbegin();
-                //      it != current->second.seq.rend(); ++it) {
-                //     merged.push_back(*it)
-                // }
                 cc_sum += current->second.core_count;
                 merged.push_back(current);
-                // current->second.seq.clear();
 
-                // dbg.erase(current->first);  // MARK
-                // to_delete.push_back(current->first);
                 simplified = true;
             } else {  // Prev is erased
             }
@@ -607,25 +624,72 @@ struct GraphCleaning {
             // for (auto &seq : (*it)->second.seq)
             gtl::vector<SequenceContainerType> &seqs = (*it)->second.seq;
             for (auto sit = seqs.begin(); sit != seqs.end(); ++sit) {
-
                 to_delete.emplace(sit->origin_node, current->first);
 
                 current->second.seq.emplace_back(std::move(*sit));
-
             }
             seqs.clear();
 
             to_delete.emplace((*it)->first, current->first);
         }
 
-        // while (starting_from != current) {  // Redirect
-        //     u64 next_item = starting_from->second.prev[0];
-        //     starting_from->second.prev.resize(2);
-        //     starting_from->second.prev[0] = current->first;
-        //     starting_from->second.prev[1] = current->second.seq.size();
-        //     starting_from->second.seq.clear();
-        //     starting_from = dbg.find(next_item);
-        // }
+        return simplified;
+    };
+
+    static auto attempt_simplify_one_path_lockless(dbg_map_t &dbg,
+                                                   redir_map &redirect_deleted,
+                                                   u64 id, auto starting_from,
+                                                   auto &to_delete) -> bool {
+        // Find a node we cannot simplify
+        // Iterate backwards and merge until we cannot simplify
+        // o->o->o->o->o->o -> o->o
+        gtl::LockableBaseImpl<gtl::NullMutex>::DoNothing no_lock;
+
+        auto current = starting_from;
+        if (current == dbg.end()) {
+            return false;
+        }
+        unsigned first_fec = current->second.forward_edge_count;
+        bool simplified = false;
+        auto prev_hash = dbg.hash(current->second.prev[0]);
+        auto prev_it = dbg.find(current->second.prev[0], prev_hash, no_lock);
+        gtl::vector<dbg_map_t::iterator> merged;
+        unsigned cc_sum = 0;
+        while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
+               prev_it->second.forward_edge_count == 1) {
+            if (prev_it != dbg.end()) {
+                cc_sum += current->second.core_count;
+                merged.push_back(current);
+
+                simplified = true;
+            } else {  // Prev is erased
+            }
+            current = prev_it;
+            if (prev_it->second.prev.size() > 0) {
+                prev_hash = dbg.hash(current->second.prev[0]);
+                prev_it = dbg.find(current->second.prev[0], prev_hash, no_lock);
+            } else {
+                break;
+            }
+        }
+        if (current->first != id) {
+            redirect_deleted[id] = current->first;
+        }
+
+        current->second.forward_edge_count = first_fec;
+        current->second.core_count += cc_sum;
+        for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
+            // for (auto &seq : (*it)->second.seq)
+            gtl::vector<SequenceContainerType> &seqs = (*it)->second.seq;
+            for (auto sit = seqs.begin(); sit != seqs.end(); ++sit) {
+                to_delete.emplace(sit->origin_node, current->first);
+
+                current->second.seq.emplace_back(std::move(*sit));
+            }
+            seqs.clear();
+
+            to_delete.emplace((*it)->first, current->first);
+        }
 
         return simplified;
     };
@@ -666,9 +730,133 @@ struct GraphCleaning {
     //         }
     //     }
     // }
-    static void simplify_simple_paths(
+
+    static auto simplify_simple_parallel_mark(dbg_index::dbg_map_t &dbg,
+                                              int threads) {
+        gtl::vector<gtl::vector<std::pair<u64, dbg_index::dbg_map_t::iterator>>>
+            to_simplify_from(threads);
+        gtl::LockableBaseImpl<gtl::NullMutex>::DoNothing no_lock;
+
+        for_each_map(
+            dbg,
+            [&to_simplify_from, &no_lock, &dbg](
+                int tid, const dbg_index::dbg_map_t::value_type &item) {
+                // printf("TTTT:%d\n", tid);
+                if (item.second.forward_edge_count != 1 &&
+                    item.second.prev.size() == 1) {
+                    auto ih = dbg.hash(item.first);
+                    auto iit = dbg.find(item.first, ih, no_lock);
+                    to_simplify_from[tid].emplace_back(item.first, iit);
+                } else if (item.second.prev.size() > 1) {
+                    for (auto &prev_id : item.second.prev) {
+                        auto prev_hash = dbg.hash(prev_id);
+
+                        auto prev_it = dbg.find(prev_id, prev_hash, no_lock);
+                        if (prev_it != dbg.end() &&
+                            prev_it->second.prev.size() == 1) {
+                            to_simplify_from[tid].emplace_back(prev_id,
+                                                               prev_it);
+                        }
+                    }
+                }
+            },
+            threads);
+        // for (size_t i = 0; i < dbg.subcnt(); ++i) {
+        //     dbg.with_submap(
+        //         i, [&to_simplify_from, &no_lock,
+        //             &dbg](const dbg_index::dbg_map_t::EmbeddedSet &set) {
+        //             for (auto it = set.begin(); it != set.end(); ++it) {
+        //                 // for (const auto &p : set) {
+        //                 if (it->second.forward_edge_count != 1 &&
+        //                     it->second.prev.size() == 1) {
+        //                     auto ih = dbg.hash(it->first);
+        //                     auto iit = dbg.find(it->first, ih, no_lock);
+        //                     to_simplify_from.emplace_back(it->first, iit);
+        //                 } else if (it->second.prev.size() > 1) {
+        //                     for (auto &prev_id : it->second.prev) {
+        //                         auto prev_hash = dbg.hash(prev_id);
+
+        //                         auto prev_it =
+        //                             dbg.find(prev_id, prev_hash, no_lock);
+        //                         if (prev_it != dbg.end() &&
+        //                             prev_it->second.prev.size() == 1) {
+        //                             to_simplify_from.emplace_back(prev_id,
+        //                                                           prev_it);
+        //                         }
+        //                     }
+        //                 }
+        //             }
+        //         });
+        // }
+        return to_simplify_from;
+    }
+    static void simplify_simple_parallel_sweep(
         dbg_index::dbg_map_t &dbg, dbg_index::lcmer_index_t &lci,
-        gtl::flat_hash_map<u64, u64> &redirect_deleted, auto &active_set) {
+        const gtl::vector<
+            gtl::vector<std::pair<u64, dbg_index::dbg_map_t::iterator>>>
+            &to_simplify,
+        redir_map &redirect_deleted, auto &active_set) {
+        gtl::LockableBaseImpl<gtl::NullMutex>::DoNothing no_lock;
+
+        // int tid=0;
+        gtl::vector<std::thread> threads;
+        std::mutex del_mutex;
+        for (int i = 0; i < to_simplify.size(); ++i) {
+            threads.emplace_back(
+                [&](int i) {
+                    gtl::flat_hash_map<u64, u64> to_delete;
+                    // printf("tid: %d\n", tid++);
+                    for (const auto [node, it] : to_simplify[i]) {
+                        // printf("%llu\n", node);
+                        // auto hv = dbg.hash(node);
+                        // auto it = dbg.find(node, hv, no_lock);
+                        // attempt_simplify_one_path(dbg,lci, redirect_deleted,
+                        // it.first, auto starting_from, auto &to_delete);
+                        attempt_simplify_one_path_lockless(
+                            dbg, redirect_deleted, node, it, to_delete);
+                    }
+                    for (auto &node : lci) {
+                        auto it = to_delete.find(node.second.id);
+                        if (it != to_delete.end()) {
+                            if (it->second != 0) {
+                                node.second.id =
+                                    it->second;  // Redirect to new node
+                            }
+                        }
+                    }
+                    std::lock_guard lock(del_mutex);
+                    for (auto [del, to] : to_delete) {
+                        active_set.erase(del);
+                    }
+                },
+                i);
+        }
+
+        for (auto &thread : threads) {
+            thread.join();
+        }
+
+        for (auto &node : dbg) {
+            int self_idx = -1;
+            for (auto &p : node.second.prev) {
+                auto it = redirect_deleted.find(p);
+                if (it != redirect_deleted.end()) {
+                    p = it->second;
+                } else if (p == node.first) {  // Self edge // TODO: reconsider
+                                               // how this is done
+                    // node.second.forward_edge_count--;
+                    // self_idx = idx;
+                }
+            }
+            if (self_idx != -1) {
+                node.second.prev.erase(node.second.prev.begin() + self_idx);
+            }
+        }
+    }
+    static void simplify_simple_paths(dbg_index::dbg_map_t &dbg,
+                                      dbg_index::lcmer_index_t &lci,
+                                      redir_map &redirect_deleted,
+                                      auto &active_set) {
         // TODO Parallel idea
         // First run a parallel discovery step which does not modify the graph
         // and finds the pairs of nodes we want to simplify (from, to) and
@@ -689,15 +877,15 @@ struct GraphCleaning {
             // Simple paths
             if ((current->second.forward_edge_count != 1 &&
                  current->second.prev.size() == 1)) {
-                attempt_simplify_one_path(dbg, lci, redirect_deleted, node,
-                                          current, to_delete);
+                attempt_simplify_one_path_lockless(dbg, redirect_deleted, node,
+                                                   current, to_delete);
             } else if (current->second.prev.size() > 1) {
                 for (auto &prev_id : current->second.prev) {
                     auto prev_it = dbg.find(prev_id);
                     if (prev_it != dbg.end() &&
                         prev_it->second.prev.size() == 1) {
-                        attempt_simplify_one_path(dbg, lci, redirect_deleted,
-                                                  prev_id, prev_it, to_delete);
+                        attempt_simplify_one_path_lockless(
+                            dbg, redirect_deleted, prev_id, prev_it, to_delete);
                     }
                 }
             }
@@ -705,9 +893,9 @@ struct GraphCleaning {
 
         for (auto &node : lci) {
             auto it = to_delete.find(node.second.id);
-            if(it != to_delete.end()){
-                if(it->second != 0){
-                    node.second.id = it->second; // Redirect to new node
+            if (it != to_delete.end()) {
+                if (it->second != 0) {
+                    node.second.id = it->second;  // Redirect to new node
                 }
             }
         }
@@ -860,7 +1048,8 @@ struct GraphCleaning {
             }
         }
     }
-    static void cut_low_support_edges(dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
+    static void cut_low_support_edges(dbg_map_t &dbg,
+                                      [[maybe_unused]] lcmer_index_t &lci,
                                       auto &active_set) {
         // Death by thousand cuts
         for (auto &node : active_set) {
@@ -877,7 +1066,8 @@ struct GraphCleaning {
             }
         }
     }
-    static void open_simple_loops(dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
+    static void open_simple_loops(dbg_map_t &dbg,
+                                  [[maybe_unused]] lcmer_index_t &lci,
                                   auto &active_set) {
         for (auto &node : active_set) {
             auto current = dbg.find(node);
@@ -894,8 +1084,8 @@ struct GraphCleaning {
                             *pp = std::numeric_limits<u64>::max();
                             if (current->second.core_count >=
                                 2 * prev_it->second
-                                        .core_count) {  // TODO: this is not
-                                                        // right.
+                                        .core_count) {  // TODO: this is
+                                                        // not right.
                                 // Need to duplicate the
                                 // sequence
                                 auto &tomerge = current->second.seq;
@@ -964,10 +1154,11 @@ struct GraphCleaning {
     //         simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted);
     //     }
     // }
-    static void run(dbg_index &dbgi, const asm_config &acfg) {
+    static void run(dbg_index &dbgi, const asm_config &acfg,
+                    bool once = false) {
         auto cfg = acfg.graph_cleaning;
         INIT_TIMERS(GraphCleaning);
-        gtl::flat_hash_map<u64, u64> redirect_deleted;
+        redir_map redirect_deleted;
         decltype(dbgi.active_set) &active_set = dbgi.active_set;
         active_set.reserve(dbgi.dbg.size() + 1);
         for (const auto &node : dbgi.dbg) {
@@ -978,11 +1169,15 @@ struct GraphCleaning {
         // IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
         //                    "DFS Simplification");
         if (cfg.iterations > -1) {
-            simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted,
-                                  active_set);
+            auto to_simplify =
+                simplify_simple_parallel_mark(dbgi.dbg, acfg.threads.work);
+            simplify_simple_parallel_sweep(dbgi.dbg, dbgi.lci, to_simplify,
+                                           redirect_deleted, active_set);
+            // simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted,
+            //                       active_set);
             IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                "Initial Simplification");
-            for (int i = 1; i < cfg.iterations; ++i) {
+            for (int i = 1; i < (once ? 2 : cfg.iterations); ++i) {
                 fix_edges(dbgi.dbg, dbgi.lci, active_set);
                 cut_tips(dbgi.dbg, dbgi.lci, 3, cfg.max_tip_length, active_set);
                 // TODO FIX pop_bubbles sequence problem fix

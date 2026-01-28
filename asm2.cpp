@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -18,12 +19,12 @@
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <iostream>
+#include <limits>
+#include <queue>
 #include <ranges>
 #include <string>
 #include <tuple>
 #include <utility>
-#include <queue>
-
 
 #include "asm.h"
 #include "bgzf.h"
@@ -154,21 +155,22 @@ struct assembler {
         ll.push_back(0);
         return ll;
     }
-    static gtl::vector<std::tuple<u64, u64, u64>> find_lcmer_ranges(
+    static gtl::vector<std::tuple<u64, u64, u64, u64, u64>> find_lcmer_ranges(
         const lcp_read &lr, const dbg_index &dbgi) {
         lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
-        gtl::vector<std::tuple<u64, u64, u64>> llr;
+        gtl::vector<std::tuple<u64, u64, u64, u64, u64>> llr;
 
         dbg_index::lci_type lval = dbgi.get(l);
-        llr.emplace_back(lval.id, 0, 0);
+        llr.emplace_back(lval.id, 0, 0, lval.id, lval.id);
         for (size_t i = 2; i < lr.cores.size() - LCMER_L - 1; ++i) {
             uint32_t in_core = lr.cores[i + LCMER_L];
             l.update_lcmer(in_core);
             lval = dbgi.get(l);
             if (lval.id == std::get<0>(llr.back())) {  // Extend the previous
                 std::get<2>(llr.back()) = i;
+                std::get<4>(llr.back()) = lval.id;
             } else if (lval.id != 0) {
-                llr.emplace_back(lval.id, i, i);
+                llr.emplace_back(lval.id, i, i, lval.id, lval.id);
             }
         }
         return llr;
@@ -207,6 +209,13 @@ struct assembler {
     static void process_cores_for_basespace(
         const lcp_read &lr, dbg_index &dbgi, [[maybe_unused]] int thread_id,
         [[maybe_unused]] uint64_t &lcmer_index) {
+        // Keep the DBG node sequences in BASE space (actual substrings), but do
+        // NOT convert overlap/layout coordinates to base space during
+        // layouting/merging.
+        //
+        // Layouting will be done in core-index space. Only at the final
+        // emission step will we scale core-space layout positions into base
+        // offsets.
         lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
 
         uint64_t val = dbgi.get(l).id;
@@ -360,7 +369,9 @@ struct assembler {
         dqt recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
         std::atomic<bool> done{false};
 
-        dbg_index dbgi{bloom.false_positive_rate, bloom.projected_count, seed};
+        dbg_index *dbg_pt = new dbg_index{bloom.false_positive_rate,
+                                          bloom.projected_count, seed};
+        dbg_index &dbgi = *dbg_pt;
 
         gtl::vector<std::thread> workers;
 
@@ -393,7 +404,7 @@ struct assembler {
             all_sum += all_read_counts[i];
         }
         fprintf(stderr, "%d processed\n%d total reads\n", valid_sum, all_sum);
-        return dbgi;
+        return dbg_pt;
     }
 
     auto convert2basespace(dbg_index &dbgi) -> int {
@@ -430,26 +441,6 @@ struct assembler {
 
         fprintf(stderr, "%d processed\n%d total reads\n", valid_sum, all_sum);
         return 0;
-    }
-    template <class map, class F>
-    static void for_each_map(const map &mp, const F &fCallback, int threads) {
-        std::vector<std::thread> workers;
-        for (int tid = 0; tid < threads; ++tid) {
-            workers.emplace_back(
-                [&](const map &mp, int tid) {
-                    for (size_t i = tid; i < mp.subcnt(); i += threads) {
-                        mp.with_submap(i, [&](const map::EmbeddedSet &set) {
-                            for (const auto &p : set) {
-                                fCallback(p);
-                            }
-                        });
-                    }
-                },
-                std::cref(mp), tid);
-        }
-        for (auto &worker : workers) {
-            worker.join();
-        }
     }
 
     size_t count_seqv_len(const gtl::vector<SequenceContainerType> &seqv) {
@@ -503,9 +494,25 @@ struct assembler {
     }
     struct rev_match {
         u64 node;
-        u64 from;
-        u64 to;
-        u64 size;
+        u64 from;  // target start in bases (ts)
+        u64 to;    // target end in bases (te)
+        u64 size;  // target length in bases (tlen)
+        u64 qs;    // query start in bases
+        u64 qe;    // query end in bases
+        u64 qlen;  // query length in bases (steps)
+
+        // Matching LCMER indices.
+        //
+        // Convention:
+        // - *_query_* refer to the QUERY/SOURCE node (the map key / "from" node)
+        // - *_target_* refer to the TARGET node (rev_match::node)
+        //
+        // These indices are later used to "switch" between SequenceContainer
+        // streams at overlap boundaries without base-offset arithmetic.
+        u64 first_matching_lcmer_query;
+        u64 last_matching_lcmer_query;
+        u64 first_matching_lcmer_target;
+        u64 last_matching_lcmer_target;
     };
 
     auto btg_connected_components(gtl::btree_multimap<u64, rev_match> &recig) {
@@ -548,8 +555,8 @@ struct assembler {
         for (auto it = range_c.first; it != range_c.second; ++it) {
             if (it->second.node == neighbor) {
                 qs = it->second.from;
-                qe = it->second.to + LCMER_L;
-                ql = it->second.size + LCMER_L;
+                qe = it->second.to;
+                ql = it->second.size;
                 break;
             }
         }
@@ -558,8 +565,8 @@ struct assembler {
         for (auto it = range_t.first; it != range_t.second; ++it) {
             if (it->second.node == current) {
                 ts = it->second.from;
-                te = it->second.to + LCMER_L;
-                tl = it->second.size + LCMER_L;
+                te = it->second.to;
+                tl = it->second.size;
                 break;
             }
         }
@@ -573,34 +580,208 @@ struct assembler {
         return std::make_tuple(qs, ts);
     }
 
-    auto find_comp_layout(
-        gtl::vector<u64> &component,
-        const gtl::flat_hash_map<u64, gtl::vector<std::tuple<u64, int>>>
-            delta_edges) {
-        gtl::flat_hash_map<u64, int> layout;
+    auto connected_comp_plus_layout(
+        const gtl::btree_multimap<u64, rev_match> &recig) {
+        // Layout entries are now (start, end, orient) where start/end are
+        // inclusive. We infer per-node length from incident edges (qlen for
+        // outgoing, size for incoming).
+        gtl::vector<gtl::flat_hash_map<u64, std::tuple<int, int, bool>>>
+            layouts;
+        std::queue<std::pair<u64, rev_match>> q;
+        gtl::flat_hash_set<u64> visited;
 
-        std::queue<u64> q;
-        u64 root = component.front();
-        q.push(root);
-        layout[root] = 0;
+        auto infer_len_for_node = [&](u64 id) -> int {
+            // Prefer outgoing query length (qlen).
+            auto out_range = recig.equal_range(id);
+            if (out_range.first != out_range.second) {
+                const auto &rm = out_range.first->second;
+                if (rm.qlen > 0) return static_cast<int>(rm.qlen);
+            }
+            // Fallback: any incoming edge's target length (size).
+            for (const auto &kv : recig) {
+                if (kv.second.node != id) continue;
+                const auto &rm = kv.second;
+                if (rm.size > 0) return static_cast<int>(rm.size);
+            }
+            return 0;
+        };
 
-        while (!q.empty()) {
-            u64 val = q.front();
-            q.pop();
-            for (auto [neighbor, delta] : delta_edges.at(val)) {
-                if (layout.find(neighbor) == layout.end()) {
-                    layout[neighbor] = layout[val] + delta;
-                    q.push(neighbor);
+        auto to_end_inclusive = [&](int start, int len) -> int {
+            if (len <= 0) return start;
+            if (start > std::numeric_limits<int>::max() - (len - 1)) {
+                return std::numeric_limits<int>::max();
+            }
+            if (start < std::numeric_limits<int>::min() - (len - 1)) {
+                return std::numeric_limits<int>::min();
+            }
+            return start + (len - 1);
+        };
+
+        for (const auto &nit : recig) {
+            if (visited.contains(nit.first)) {
+                continue;
+            }
+            layouts.emplace_back();
+            const int root_start = 0;
+            const int root_len = infer_len_for_node(nit.first);
+            const int root_end = to_end_inclusive(root_start, root_len);
+            layouts.back().emplace(nit.first,
+                                   std::make_tuple(root_start, root_end, true));
+            visited.emplace(nit.first);
+
+            auto start_range = recig.equal_range(nit.first);
+            for (auto it = start_range.first; it != start_range.second; ++it) {
+                q.push(*it);
+            }
+
+            while (!q.empty()) {
+                std::pair<u64, rev_match> node = q.front();
+                q.pop();
+
+                u64 src = node.first;
+                u64 tgt = node.second.node;
+
+                if (visited.contains(tgt)) {
+                    continue;
+                }
+                visited.emplace(tgt);
+
+                auto [spos, epos, s_orient] = layouts.back().at(src);
+                (void)epos;
+                bool target_orient = !s_orient;
+
+                // Coordinates are on reverse complement, convert based on
+                // layout orientation
+                long long qs, ts;
+                if (s_orient) {
+                    // Source is forward in layout: convert rev_comp coords to
+                    // forward
+                    qs = node.second.qlen - node.second.qe;
+                } else {
+                    // Source is reverse in layout: rev_comp coords are correct
+                    qs = node.second.qs;
+                }
+                if (target_orient) {
+                    // Target is forward in layout: convert rev_comp coords to
+                    // forward
+                    ts = node.second.size - node.second.to;
+                } else {
+                    // Target is reverse in layout: rev_comp coords are correct
+                    ts = node.second.from;
+                }
+
+                int delta = static_cast<int>(qs - ts);
+                int target_start = spos + delta;
+
+                const int target_len = infer_len_for_node(tgt);
+                const int target_end =
+                    to_end_inclusive(target_start, target_len);
+
+                layouts.back().emplace(
+                    tgt,
+                    std::make_tuple(target_start, target_end, target_orient));
+
+                auto range = recig.equal_range(tgt);
+                for (auto it = range.first; it != range.second; ++it) {
+                    if (!visited.contains(it->second.node)) {
+                        q.push(*it);
+                    }
                 }
             }
         }
-
-        std::sort(component.begin(), component.end(),
-                  [&layout](u64 a, u64 b) { return layout[a] < layout[b]; });
-        assert(layout.size() == component.size());
-        return layout;
+        return layouts;
     }
-    void fold_dbg_graph(dbg_index &dbgi) {
+    auto add_lcmers(const gtl::vector<SequenceContainerType> &subseqs,
+                    auto &node, dbg_index &dbgi, u64 &idx, int tid,
+                    bool reverse = false) {
+        lps str = {0, 0, 0, 0};
+        lcp_read lr;
+        // dbgi.dbg.for_each([&](auto &node) {
+        if (node.second.redirected()) {
+            return;
+        }
+        // good_n.fetch_add(1);
+        lr.clear();
+
+        // Extract a subsequence [from, to) from the concatenated rev_seqs
+        // Returns a single CrumbledSubSeq64 containing the extracted range
+        auto get_sub_seq = [&subseqs](size_t from, size_t to) {
+            size_t sub_len = (from < to) ? (to - from) : 0;
+            CrumbledSubSeq64 result{sub_len, 0};
+
+            if (sub_len == 0 || subseqs.empty()) {
+                return result;
+            }
+
+            size_t cumulative = 0;
+            size_t dest_pos = 0;
+
+            for (size_t i = 0; i < subseqs.size() && dest_pos < sub_len; ++i) {
+                const auto &frag = subseqs[i];
+                size_t frag_start = cumulative;
+                size_t frag_end = cumulative + frag.len;
+
+                // Compute the overlap of [frag_start, frag_end) with [from, to)
+                size_t overlap_start = std::max(frag_start, from);
+                size_t overlap_end = std::min(frag_end, to);
+
+                if (overlap_start < overlap_end) {
+                    // Offset within this fragment
+                    size_t local_from = overlap_start - frag_start;
+                    size_t copy_len = overlap_end - overlap_start;
+
+                    // Copy bases from frag to result
+                    for (size_t b = 0; b < copy_len; ++b) {
+                        size_t src_bit =
+                            (frag.skip_first_n + local_from + b) * 2;
+                        uint64_t code =
+                            (frag.data[src_bit >> 6] >> (src_bit & 63)) & 0x3;
+                        size_t dst_bit = dest_pos * 2;
+                        result.data[dst_bit >> 6] |= code << (dst_bit & 63);
+                        ++dest_pos;
+                    }
+                    result.origin_node = frag.origin_node;
+                }
+                cumulative += frag.len;
+            }
+            return result;
+        };
+
+        init_lps_crumbled(&str, subseqs, syncmer_functor);
+        lps_deepen(&str, lcp_level);
+
+        for (int i = 0; i < str.size; ++i) {
+            lr.cores.emplace_back(str.cores[i].label);
+            lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
+        }
+        if (lr.cores.size() < LCMER_L + 1) {
+            // good_n.fetch_sub(1);
+            free_lps(&str);
+            return;
+        }
+        gtl::vector<u64> ll = {0};
+        lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
+        ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
+        for (size_t i = 2; i < lr.cores.size() - LCMER_L - 1; ++i) {
+            uint32_t in_core = lr.cores[i + LCMER_L];
+            l.update_lcmer(in_core);
+            ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
+        }
+        ll.push_back(0);
+
+        for (size_t i = 1; i < ll.size() - 1; ++i) {
+            if (insert_lcmer_helper(ll, i, dbgi)) {
+                dbgi.dbg.modify_if(
+                    ll[i], [&lr, i, &get_sub_seq](
+                               dbg_index::dbg_map_t::value_type &val) {
+                        val.second.seq.emplace_back(
+                            get_sub_seq(lr.pos[i + LCMER_L - 1].second,
+                                        lr.pos[i + LCMER_L].second));
+                    });
+            }
+        }
+    }
+    auto fold_dbg_graph(dbg_index &dbgi) {
         fprintf(stderr, "dbg_size: %zu\n", dbgi.dbg.size());
         fprintf(stderr, "lci_size: %zu\n", dbgi.lci.size());
 
@@ -612,7 +793,7 @@ struct assembler {
             matched;
         for_each_map(
             dbgi.dbg,
-            [&](const auto &node) {
+            [&](int tid, const auto &node) {
                 all_n.fetch_add(1);
                 if (dbgi.active_set.find(node.first) == dbgi.active_set.end()) {
                     bad.fetch_add(1);
@@ -628,7 +809,6 @@ struct assembler {
                 }
                 // good_n.fetch_add(1);
                 lr.clear();
-
                 gtl::vector<SequenceContainerType> rev_seqs;
                 for (auto it = node.second.seq.rbegin();
                      it != node.second.seq.rend(); ++it) {
@@ -647,28 +827,39 @@ struct assembler {
                     free_lps(&str);
                     return;
                 }
+                // Keep everything in CORE-INDEX space for layouting.
+                // `find_lcmer_ranges()` already returns [from_core,to_core] in
+                // core indices (inclusive), which is the correct coordinate
+                // system for connected_comp_plus_layout().
                 auto found_ranges = find_lcmer_ranges(lr, dbgi);
-                for (auto [id, from, to] : found_ranges) {
+                for (auto [id, from_core, to_core, from_lcmer, to_lcmer] :
+                     found_ranges) {
                     if (id != 0) {
                         hits.fetch_add(1);
-                        matched[node.first].emplace_back(id, from, to,
-                                                         rev_seqs.size());
-                        // printf("%llu to %llu\t%llu-%llu seqs: %zu %% %lf\n",
-                        //        node.first, id, from, to, lr.cores.size(),
-                        //        (double)(to - from + 1) /
-                        //            (lr.cores.size() - LCMER_L));
+
+                        // Store match intervals in CORE indices (inclusive).
+                        // IMPORTANT: rev_match fields are u64 and we keep them
+                        // semantically as core-space indices here. Base-space
+                        // scaling happens at emission time.
+                        //
+                        // We also store "length" fields in core-space to keep
+                        // conversions consistent. Core-space length is number
+                        // of steps between endpoints: (cores.size() - 1).
+                        const u64 core_len_steps =
+                            (lr.cores.size() > 0)
+                                ? static_cast<u64>(lr.cores.size() - 1)
+                                : 0;
+
+                        matched[node.first].emplace_back(
+                            id, static_cast<u64>(from_core),
+                            static_cast<u64>(to_core), core_len_steps,
+                            from_lcmer, to_lcmer);
                     }
                 }
                 free_lps(&str);
             },
             threads.work);
 
-        // for (const auto &[k, v] : dbgi.dbg) {
-        //     if (!v.redirected()) {
-        //         printf("+\t%llu\t%zu\t%zu\t%u\n", k, v.seq.size(),
-        //                v.prev.size(), v.forward_edge_count);
-        //     }
-        // }
         gtl::btree_multimap<u64, rev_match> reciprocal;
         for (const auto &[k, v] : matched) {
             for (const auto &match : v) {
@@ -680,7 +871,34 @@ struct assembler {
                         it->second.begin(), it->second.end(),
                         [k](const auto &val) { return val.node == k; });
                     if (ff != it->second.end()) {  // and has the reverse match
-                        reciprocal.emplace(k, match);
+                        // Store both query and target coordinates in CORE-INDEX
+                        // space. match.from/to are core indices on k's rev_comp
+                        // (query) ff->from/to are core indices on match.node's
+                        // rev_comp (target)
+                        //
+                        // NOTE: rev_match uses generic u64 fields; here we
+                        // interpret them as core-space units. Base-space
+                        // scaling will be applied only when emitting merged
+                        // sequences / reporting.
+                        rev_match full_match;
+                        full_match.node = match.node;
+                        full_match.from =
+                            ff->from;            // ts (target start) in cores
+                        full_match.to = ff->to;  // te (target end) in cores
+                        full_match.size = ff->size;  // tlen in cores (steps)
+                        full_match.qs =
+                            match.from;            // qs (query start) in cores
+                        full_match.qe = match.to;  // qe (query end) in cores
+                        full_match.qlen = match.size;  // qlen in cores (steps)
+                        full_match.first_matching_lcmer_query =
+                            match.first_matching_lcmer_query;
+                        full_match.last_matching_lcmer_query =
+                            match.last_matching_lcmer_query;
+                        full_match.first_matching_lcmer_target =
+                            ff->first_matching_lcmer_query;
+                        full_match.last_matching_lcmer_target =
+                            ff->last_matching_lcmer_query;
+                        reciprocal.emplace(k, full_match);
 
                         // printf("%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n", k,
                         //        match.node, match.from, match.to,
@@ -689,9 +907,9 @@ struct assembler {
                         //     "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%llu\t%"
                         //     "llu\t%llu\t%llu\t%llu\t%d\n",
                         //     k, match.size + LCMER_L, match.from,
-                        //     match.to + LCMER_L, match.node, ff->size + LCMER_L,
-                        //     ff->from, ff->to + LCMER_L, ff->to - ff->from,
-                        //     ff->to - ff->from, 250);
+                        //     match.to + LCMER_L, match.node, ff->size +
+                        //     LCMER_L, ff->from, ff->to + LCMER_L, ff->to -
+                        //     ff->from, ff->to - ff->from, 250);
                     } else {  // Handle after reciprocals are good
                         // printf(
                         //     "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%d\t%d\t%d\t%"
@@ -707,60 +925,382 @@ struct assembler {
         }
         fprintf(stderr, "all:%d\ngood: %d nodes\nhits: %d\n", all_n.load(),
                 all_n.load() - bad.load(), hits.load());
-        // Find connected components
-
-        auto components = btg_connected_components(reciprocal);
+        auto layouts = connected_comp_plus_layout(reciprocal);
+#if 1
         int cc = 0;
+        for (auto &l : layouts) {
+            fprintf(stdout, "# Layout %d:\n", cc++);
+            for (auto &[k, v] : l) {
+                auto it = dbgi.dbg.find(k);
+                if (it != dbgi.dbg.end()) {
+                    size_t seq_len = 0;
+                    for (const auto &s : it->second.seq) {
+                        seq_len += s.len;
+                    }
+                    auto [start_core, end_core, orient] = v;
+                    (void)end_core;
+                    fprintf(stdout, "C%llu\t%d\t%lld\t%c\n", k, start_core,
+                            start_core + (int64_t)seq_len,
+                            (orient ? '+' : '-'));
+                } else {
+                    auto [start_core, end_core, orient] = v;
+                    (void)end_core;
+                    (void)orient;
+                    fprintf(stdout, "C%llu\t%d\t(not found)\n", k, start_core);
+                }
+            }
+        }
+#endif
+        return std::make_pair(reciprocal, layouts);
+    }
 
-        // for (auto &component : components) {
-        //     // fprintf(stderr, "Component %d:\n", cc);
+    struct LayoutEntry {
+        u64 id;
+        int start;
+        int end;
+        dbg_index::dbg_map_t::iterator dbg_it;
+        bool orient;
+    };
 
-        //     // Greedy bipartite partitioning
-        //     gtl::flat_hash_map<u64, int>
-        //         group;  // Map to store the group of each node (0 or 1)
-        //     std::queue<u64> q;
-        //     // gtl::vector<std::tuple<u64, u64, int>> delta_edges;
-        //     gtl::flat_hash_map<u64, gtl::vector<std::tuple<u64, int>>>
-        //         delta_edges;
-        //     // Start with the first node in the component
-        //     u64 first = component.front();
-        //     group[first] = 1;
-        //     q.push(first);
+    static gtl::vector<u64> shortest_path_unweighted_bfs(
+        const gtl::btree_multimap<u64, rev_match> &recig, u64 source,
+        u64 target) {
+        if (source == target) return gtl::vector<u64>{source};
 
-        //     while (!q.empty()) {
-        //         u64 current = q.front();
-        //         q.pop();
-        //         // Assign neighbors to the opposite group
-        //         auto range = reciprocal.equal_range(current);
-        //         for (auto it = range.first; it != range.second; ++it) {
-        //             u64 neighbor = it->second.node;
+        std::queue<u64> q;
+        gtl::flat_hash_set<u64> visited;
+        gtl::flat_hash_map<u64, u64> parent;
 
-        //             if (group.find(neighbor) == group.end()) {
-        //                 group[neighbor] = - group[current];
-        //                 auto [qs, ts] = get_start_positions(
-        //                     current, neighbor, reciprocal, group[current]);
+        q.push(source);
+        visited.insert(source);
 
-        //                 delta_edges[current].emplace_back(neighbor, qs - ts);
-        //                 delta_edges[neighbor].emplace_back(current, ts - qs);
-        //                 q.push(neighbor);
-        //             }
-        //         }
-        //     }
-        //     auto layout = find_comp_layout(component, delta_edges);
-        //     // fprintf(stderr, "Layout: %zu \t Component: %zu\n", layout.size(),
-        //     //         component.size());
-        //     // // for(const auto [k,v] : layout){
-        //     // //     fprintf(stderr, "C%llu\t%d\t%s\n", k, v, group[k]?"+":"-");
-        //     // // }
-        //     // fprintf(stderr, "Group 0:\n");
-        //     // for (const auto &[node, grp] : group) {
-        //     //     fprintf(stderr, "C%llu\t%d\t%ld\t%s\n", node, layout[node],
-        //     //             layout[node] + dbgi.dbg.at(node).seq.size(),
-        //     //             grp==1? "+" : "-");
-        //     // }
+        bool found = false;
+        while (!q.empty() && !found) {
+            u64 current = q.front();
+            q.pop();
 
-        //     cc++;
-        // }
+            auto range = recig.equal_range(current);
+            for (auto it = range.first; it != range.second; ++it) {
+                u64 neighbor = it->second.node;
+                if (visited.find(neighbor) != visited.end()) continue;
+
+                visited.insert(neighbor);
+                parent[neighbor] = current;
+
+                if (neighbor == target) {
+                    found = true;
+                    break;
+                }
+
+                q.push(neighbor);
+            }
+        }
+
+        if (!found) return {};
+
+        gtl::vector<u64> path;
+        for (u64 v = target;; v = parent[v]) {
+            path.push_back(v);
+            if (v == source) break;
+        }
+        std::reverse(path.begin(), path.end());
+        return path;
+    }
+    // static auto layout_shortest_path(
+    //     const gtl::btree_multimap<u64, rev_match> &reciprocal,
+    //     gtl::vector<LayoutEntry> &entries){ std::sort(entries.begin(),
+    //     entries.end(),
+    //               [](const auto &a, const auto &b) { return a.start <
+    //               b.start; });
+    //     u64 source = entries.front().id;
+    //     u64 target = entries.back().id;
+    //     auto find_shortest_path = [&reciprocal](u64 source, u64 target) {
+    //         // Unweighted shortest path (fewest edges) via BFS.
+    //         // Track parents to avoid copying full paths for every queued
+    //         node. std::queue<u64> q; gtl::flat_hash_set<u64> visited;
+    //         gtl::flat_hash_map<u64, u64> parent;
+
+    //         q.push(source);
+    //         visited.insert(source);
+
+    //         bool found = false;
+    //         while (!q.empty() && !found) {
+    //             u64 current = q.front();
+    //             q.pop();
+
+    //             if (current == target) {
+    //                 found = true;
+    //                 break;
+    //             }
+
+    //             auto range = reciprocal.equal_range(current);
+    //             for (auto it = range.first; it != range.second; ++it) {
+    //                 u64 neighbor = it->second.node;
+    //                 if (visited.find(neighbor) != visited.end()) continue;
+
+    //                 visited.insert(neighbor);
+    //                 parent[neighbor] = current;
+
+    //                 if (neighbor == target) {
+    //                     found = true;
+    //                     break;
+    //                 }
+
+    //                 q.push(neighbor);
+    //             }
+    //         }
+
+    //         if (!found) return gtl::vector<u64>{};
+
+    //         gtl::vector<u64> path;
+    //         for (u64 v = target;; v = parent[v]) {
+    //             path.push_back(v);
+    //             if (v == source) break;
+    //         }
+    //         std::reverse(path.begin(), path.end());
+    //         return path;
+    //     };
+    //     return 0;
+    // }
+
+    static void merge_layouts_ultra(
+        FILE *out,
+        const gtl::vector<gtl::flat_hash_map<u64, std::tuple<int, int, bool>>>
+            &layouts,
+        const gtl::btree_multimap<u64, rev_match> &reciprocal,
+        dbg_index::dbg_map_t &dbg) {
+
+        auto identify_component_endpoints = [](const auto &layout) {
+            u64 leftmost = 0;
+            u64 rightmost = 0;
+            int min_start = INT_MAX;
+            int max_start = INT_MIN;
+            int leftmost_span = INT_MIN;
+            int rightmost_span = INT_MIN;
+
+            for (const auto &[node_id, start_end_orient] : layout) {
+                auto [start_core, end_core, orient] = start_end_orient;
+                (void)orient;
+
+                const int s = end_core - start_core;
+
+                if (start_core < min_start ||
+                    (start_core == min_start && s > leftmost_span)) {
+                    min_start = start_core;
+                    leftmost = node_id;
+                    leftmost_span = s;
+                }
+
+                if (start_core > max_start ||
+                    (start_core == max_start && s > rightmost_span)) {
+                    max_start = start_core;
+                    rightmost = node_id;
+                    rightmost_span = s;
+                }
+            }
+            return std::make_pair(leftmost, rightmost);
+        };
+        for (const auto &layout : layouts) {
+            // Find leftmost start and rightmost end on the layout.
+            gtl::vector<gtl::vector<SequenceContainerType>>
+                merged_seqs;  // per entry we get hte sequences. Even forward
+
+            auto [source, target] = identify_component_endpoints(layout);
+            auto path = shortest_path_unweighted_bfs(reciprocal, source, target);
+            bool plus = true;
+            source = path[0];
+            for(size_t i = 1; i < path.size(); ++i){
+                if(plus){
+
+                }else{
+
+                }
+
+                plus = !plus;
+            }
+            // Build a path where we start from the leftmost node and go to
+            // rightmost, we switch only at the rightmost matching core to the
+            // next.
+        }
+    }
+
+    static void print_merged_layouts(
+        FILE *out,
+        gtl::vector<gtl::flat_hash_map<u64, std::tuple<int, int, bool>>>
+            layouts,
+        dbg_index::dbg_map_t &dbg) {
+        charsi buf;
+        u64 contig_id = 0;
+
+        // Diagnostics: `pos` in `layouts` is produced by layouting reciprocal
+        // matches which are typically in "core-space" / index-space, while
+        // `seq_len` below is in bases. If these units are mixed, overlap
+        // trimming can delete/duplicate large sequence, potentially leading to
+        // misassemblies. We don't change behavior here, but we warn.
+        auto warnf = [](const char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt);
+            fprintf(stderr, "[print_merged_layouts] ");
+            vfprintf(stderr, fmt, ap);
+            fprintf(stderr, "\n");
+            va_end(ap);
+        };
+
+        for (auto &layout : layouts) {
+            if (layout.empty()) continue;
+
+            struct LayoutEntry {
+                int start;
+                int end;
+                u64 node_id;
+                bool orient;
+                dbg_index::dbg_map_t::iterator dbg_it;
+            };
+            gtl::vector<LayoutEntry> entries;
+            entries.reserve(layout.size());
+
+            // In core-space mode:
+            // - `pos` is in core units (layout space)
+            // - sequence lengths are in bases
+            //
+            // We keep start/end in core-space here and only convert core->base
+            // when actually skipping bases during concatenation (at output
+            // time).
+            for (auto &[node_id, start_end_orient] : layout) {
+                auto [pos_core, end_core, orient] = start_end_orient;
+                auto it = dbg.find(node_id);
+                if (it == dbg.end() || it->second.seq.empty()) continue;
+
+                entries.push_back({pos_core, end_core, node_id, orient, it});
+            }
+
+            if (entries.empty()) continue;
+
+            std::sort(
+                entries.begin(), entries.end(),
+                [](const auto &a, const auto &b) { return a.start < b.start; });
+
+            // Compute a core->base scaling factor for this component, used only
+            // at emission time. We estimate: bases_per_core_step ≈
+            // (total_bases_across_entries / core_span_across_entries). This
+            // avoids mixing units during layouting/ordering.
+            double core_to_base_scale = 0.0;
+            {
+                int min_start = INT_MAX;
+                int max_start = INT_MIN;
+                size_t total_bases = 0;
+                for (const auto &e : entries) {
+                    min_start = std::min(min_start, e.start);
+                    max_start = std::max(max_start, e.start);
+                    // base length of this node
+                    size_t seq_len = 0;
+                    for (const auto &s : e.dbg_it->second.seq) {
+                        seq_len += s.len;
+                    }
+                    total_bases += seq_len;
+                }
+                const int core_span =
+                    (max_start >= min_start) ? (max_start - min_start) : 0;
+                if (core_span > 0 && total_bases > 0) {
+                    core_to_base_scale = static_cast<double>(total_bases) /
+                                         static_cast<double>(core_span);
+                }
+            }
+
+            gtl::vector<LayoutEntry> non_contained;
+            non_contained.reserve(entries.size());
+            int max_end = INT_MIN;
+            for (auto &entry : entries) {
+                if (entry.end <= max_end) {
+                    entry.dbg_it->second.seq.clear();
+                    entry.dbg_it->second.prev.clear();
+                    continue;
+                }
+                non_contained.push_back(std::move(entry));
+                max_end = std::max(max_end, non_contained.back().end);
+            }
+
+            if (non_contained.empty()) continue;
+
+            fprintf(out, "S\tM%" PRIu64 "\t", contig_id);
+
+            size_t total_len = 0;
+            int current_end = non_contained[0].start;
+
+            gtl::vector<u64> prev_edges = non_contained[0].dbg_it->second.prev;
+
+            for (size_t i = 0; i < non_contained.size(); ++i) {
+                auto &curr = non_contained[i];
+
+                // Overlap is computed in CORE units.
+                int overlap_cores = current_end - curr.start;
+                if (overlap_cores < 0) overlap_cores = 0;
+
+                // Convert core overlap into an approximate base skip at
+                // emission time. We use a per-component scaling based on total
+                // base length / total core span. This keeps all layout
+                // reasoning in core space until the final emission.
+                size_t bases_to_skip = 0;
+                if (core_to_base_scale > 0.0) {
+                    const double est =
+                        static_cast<double>(overlap_cores) * core_to_base_scale;
+                    if (est > 0.0) bases_to_skip = static_cast<size_t>(est);
+                }
+
+                gtl::vector<SequenceContainerType> curr_seqs;
+                if (curr.orient) {
+                    for (auto &s : curr.dbg_it->second.seq) {
+                        curr_seqs.emplace_back(std::move(s));
+                    }
+                } else {
+                    for (auto it = curr.dbg_it->second.seq.rbegin();
+                         it != curr.dbg_it->second.seq.rend(); ++it) {
+                        curr_seqs.emplace_back(it->reverse_complement());
+                    }
+                }
+
+                curr.dbg_it->second.seq.clear();
+                curr.dbg_it->second.prev.clear();
+
+                size_t skipped = 0;
+                for (auto &s : curr_seqs) {
+                    if (skipped >= bases_to_skip) {
+                        buf.require(s.len + 32);
+                        const char *buf_at =
+                            s.convert_to_ascii((char *)buf.data);
+                        fprintf(out, "%s", buf_at);
+                        total_len += s.len;
+                    } else if (skipped + s.len > bases_to_skip) {
+                        // Partial skip: print only the suffix beyond
+                        // bases_to_skip. NOTE: The previous code printed the
+                        // entire segment, duplicating overlaps and inflating
+                        // assemblies. This fix assumes ASCII encoding with 1
+                        // char/base.
+                        const size_t local_skip = bases_to_skip - skipped;
+                        buf.require(s.len + 32);
+                        const char *buf_at =
+                            s.convert_to_ascii((char *)buf.data);
+                        fprintf(out, "%s", buf_at + local_skip);
+                        total_len += (s.len - local_skip);
+                    }
+                    skipped += s.len;
+                }
+
+                current_end = std::max(current_end, curr.end);
+            }
+
+            fprintf(out, "\tLN:i:%zu\n", total_len);
+
+            // Print incoming edges from first contig
+            for (u64 prev_id : prev_edges) {
+                if (dbg.contains(prev_id)) {
+                    fprintf(out, "L\tC%" PRIu64 "\t+\tM%" PRIu64 "\t+\t0M\n",
+                            prev_id, contig_id);
+                }
+            }
+
+            contig_id++;
+        }
     }
 };
 
@@ -802,8 +1342,8 @@ int run_assembly(const asm_config &cfg) {
     // }
 
     assembler as(cfg);
-    dbg_index dbg = as.construct_dbg();
-
+    dbg_index *dbgp = as.construct_dbg();
+    dbg_index &dbg = *dbgp;
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "DBG construction");
 
     dbg.count_forward_edges();
@@ -822,11 +1362,17 @@ int run_assembly(const asm_config &cfg) {
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph cleaning");
 
-    as.fold_dbg_graph(dbg);
+    auto [recig, layouts] = as.fold_dbg_graph(dbg);
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Fold graph");
+
+    // GraphCleaning::run(dbg, cfg, );
 
     FILE *out = fopen(cfg.output.c_str(), "w");
 
+    assembler::print_merged_layouts(out, std::move(layouts), dbg.dbg);
+    // assembler::print_merged_layouts_weave_majority_orientation(out, recig,
+    // std::move(layouts), dbg.dbg);
+    //  Print remaining unmerged nodes (their sequences weren't cleared)
     print_dbg_seqs(out, dbg);
     fclose(out);
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "DBG printing");

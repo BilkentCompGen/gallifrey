@@ -573,7 +573,7 @@ inline void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len,
 }
 
 inline void init_lps_crumbled(lps *lps_ptr,
-                              gtl::vector<SequenceContainerType> &sseqs,
+                              const gtl::vector<SequenceContainerType> &sseqs,
                               const auto &syncmer_functor) {
     size_t len = 0;
 

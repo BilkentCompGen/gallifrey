@@ -45,7 +45,7 @@ include_directories(${HTS_INCLUDE_DIRS})
 link_directories(${HTS_LIBRARY_DIRS})
 add_definitions(${HTS_CFLAGS_OTHER})
 
-set(SOURCE_FILES lasm.cpp asm2.cpp stats.cpp lcmer.cpp sthist.cpp map.cpp)
+set(SOURCE_FILES lasm.cpp asm2.cpp stats.cpp lcmer.cpp sthist.cpp map.cpp layout/layout.cpp)
 include_directories(./ext)
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
@@ -87,9 +87,19 @@ FetchContent_MakeAvailable(libbloom)
 # Link libraries
 target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue pthread deflate z)
 
+# Unit tests (doctest)
+add_executable(test_connected_comp_plus_layout unit_tests/test_connected_comp_plus_layout.cpp layout/layout.cpp)
+target_include_directories(test_connected_comp_plus_layout PRIVATE ./ext)
+target_link_libraries(test_connected_comp_plus_layout PRIVATE gtl)
+add_test(NAME unit_connected_comp_plus_layout COMMAND test_connected_comp_plus_layout)
+
+# Debugging / inspection tool: print fragments, recig edges, and resulting component layouts
+add_executable(layout_debug tools/layout_debug.cpp layout/layout.cpp)
+target_include_directories(layout_debug PRIVATE ./ext)
+target_link_libraries(layout_debug PRIVATE gtl)
 
 # Tests and custom targets
-add_test(NAME test COMMAND lasm hifi test/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8)
+add_test(NAME test COMMAND lasm hifi ../tests/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8 --density 0.05)
 add_custom_target(rt COMMAND lasm hifi test/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8)
 add_dependencies(rt ${PROJECT_NAME})
 
