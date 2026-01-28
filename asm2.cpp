@@ -1100,6 +1100,15 @@ struct assembler {
             }
             return std::make_pair(leftmost, rightmost);
         };
+        auto find_rev = [&reciprocal] (u64 src, u64 step) {
+            auto range = reciprocal.equal_range(src);
+            for (auto it = range.first; it != range.second; ++it) {
+                if(it->second.node == step){
+                    return it;
+                }
+            }
+            return reciprocal.end();
+        };
         for (const auto &layout : layouts) {
             // Find leftmost start and rightmost end on the layout.
             gtl::vector<gtl::vector<SequenceContainerType>>
@@ -1110,13 +1119,18 @@ struct assembler {
             bool plus = true;
             source = path[0];
             for(size_t i = 1; i < path.size(); ++i){
-                if(plus){
-
-                }else{
-
-                }
+                u64 step = path[i];
+                auto revit = find_rev(source, step);
+                assert(revit != reciprocal.end());
+                const rev_match &rv = revit->second;
+                fprintf(
+                    out, "C%llu\t%llu\t%llu\t%llu\t%c\tC%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%d\n",
+                    source, rv.qlen + LCMER_L, rv.qs, rv.qe,
+                    (plus ? '+' : '-'), step, rv.size + LCMER_L, rv.from,
+                    rv.to, rv.to - rv.from, rv.to - rv.from, 250);
 
                 plus = !plus;
+                source = step;
             }
             // Build a path where we start from the leftmost node and go to
             // rightmost, we switch only at the rightmost matching core to the
@@ -1369,11 +1383,12 @@ int run_assembly(const asm_config &cfg) {
 
     FILE *out = fopen(cfg.output.c_str(), "w");
 
-    assembler::print_merged_layouts(out, std::move(layouts), dbg.dbg);
+    // assembler::print_merged_layouts(out, layouts, dbg.dbg);
+    assembler::merge_layouts_ultra(out, layouts, recig, dbg.dbg);
     // assembler::print_merged_layouts_weave_majority_orientation(out, recig,
     // std::move(layouts), dbg.dbg);
     //  Print remaining unmerged nodes (their sequences weren't cleared)
-    print_dbg_seqs(out, dbg);
+    // print_dbg_seqs(out, dbg);
     fclose(out);
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "DBG printing");
 

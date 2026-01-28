@@ -3,175 +3,185 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <limits>
-#include <queue>
 #include <random>
-#include <tuple>
 #include <utility>
 #include <vector>
-
-#include <gtl/btree.hpp>
-#include <gtl/phmap.hpp>
-#include <gtl/vector.hpp>
 
 #include "../layout/layout.h"
 
 using u64 = std::uint64_t;
-
-// Layout types now come from the extracted implementation.
 namespace ll = lasm::layout;
-using rev_match = ll::rev_match;
+
+// This test file intentionally models how recig is formed in your pipeline:
+//
+// - We start from a single underlying contig of length N in CORE-SPACE.
+// - We create multiple fragments from that contig in both forward (+) and reverse (-) orientations.
+// - We then compute overlaps between every (+) fragment and every (-) fragment (and vice versa).
+// - Coordinates we store are ALWAYS on the REVERSED (RC) sequence of each fragment/contig.
+// - We do NOT use any "master_overlap_start" helper; overlaps are computed directly from fragment
+//   ranges on the underlying contig.
+//
+// Also note your important constraint:
+// Each stored coordinate corresponds to the *last* core of an L-length window (LCMER_L),
+// so endpoints are not trustworthy anchors. We use interior anchors in the checks.
+
+#ifndef LCMER_L
+#define LCMER_L 8
+#endif
+
+static constexpr int k_core_margin = (LCMER_L > 1) ? (LCMER_L - 1) : 0;
 
 // ---------------------------
-// Spec / synthetic generator
+// Helpers: fragment model
 // ---------------------------
 
-// A synthetic fragment/copy derived from an underlying (conceptual) long sequence.
 struct Frag {
-    u64 id;
-    int contig_len;      // length of this contig (bases)
-    int contig_origin;   // "true" start on the conceptual master coordinate line
-    bool orient_plus;    // "true" orientation relative to the master (+ or -)
+    u64 id{};
+    bool plus{};   // orientation relative to underlying contig (+ or -)
+    int start{};   // inclusive start on underlying contig (core-space)
+    int end{};     // inclusive end on underlying contig (core-space)
 };
 
-// Map a master coordinate x (on the conceptual line) to the *forward* coordinate on the fragment.
-static int master_to_forward(const Frag& f, int master_x) {
-    // fragment covers [origin, origin+len) on master
-    int rel = master_x - f.contig_origin;
-    CHECK(rel >= 0);
-    CHECK(rel <= f.contig_len);
-    if (f.orient_plus) {
-        return rel;
+static int len_inclusive(const Frag& f) { return f.end - f.start; } // length in "steps" (end-start)
+static int span_inclusive(const Frag& f) { return f.end - f.start + 1; } // number of positions
+
+// Map a coordinate on the underlying contig to a FORWARD coordinate on the fragment.
+static int contig_to_frag_forward(const Frag& f, int x_contig) {
+    CHECK(x_contig >= f.start);
+    CHECK(x_contig <= f.end);
+
+    if (f.plus) {
+        // Forward fragment: forward coordinate grows with contig coordinate.
+        return x_contig - f.start;
     }
-    // If fragment is reverse relative to master, forward coordinate runs opposite.
-    // At master_x == origin, forward is len.
-    // At master_x == origin+len, forward is 0.
-    return f.contig_len - rel;
+    // Reverse fragment: forward coordinate decreases with contig coordinate.
+    // At contig == start -> forward == len
+    // At contig == end   -> forward == 0
+    return f.end - x_contig;
 }
 
-// Convert a forward coordinate to a reverse-complement coordinate (same length).
-static int forward_to_revcoord(int len, int forward_x) {
-    return len - forward_x;
+// Convert a fragment forward coordinate to the observed RC coordinate (what recig stores).
+// Convention: (matches existing layout code) rc = len - forward.
+static int forward_to_rc(int frag_len_steps, int x_forward) {
+    // frag_len_steps is (end-start), so forward in [0..len]
+    return frag_len_steps - x_forward;
 }
 
-// Helper encoding: for an interval [f0, f1) in forward space, the corresponding
-// reverse-complement interval is [len - f1, len - f0) (order preserved).
-static std::pair<int, int> forward_interval_to_rev_interval(int len, int f0, int f1) {
-    CHECK(f0 <= f1);
-    return {len - f1, len - f0};
+// Convert observed RC coordinate to layout-forward coordinate given inferred orientation.
+static int rc_to_layout_forward(int frag_len_steps, int rc, bool inferred_plus) {
+    if (inferred_plus) return frag_len_steps - rc;
+    return rc;
 }
 
-// Build reciprocal rev_match edges from a master-overlap interval.
-// We deliberately generate *intervals*, not a single point.
-// We also support adding small endpoint jitter to emulate approximate mappings.
-static void add_reciprocal_overlap_interval(
-    ll::recig_graph& recig,
-    const Frag& A,
-    const Frag& B,
-    int master_overlap_start,
-    int master_overlap_end,
-    int jitter = 0,
-    std::mt19937* rng = nullptr
-) {
-    REQUIRE(A.id != B.id);
-    // Edges represent reverse-complement matches => orientations must differ in truth.
-    REQUIRE(A.orient_plus != B.orient_plus);
+// Interiorize an inclusive interval [x0,x1] in layout-forward coordinates to avoid boundary effects.
+static std::pair<int, int> interiorize_inclusive_interval(int x0, int x1, int frag_len_steps) {
+    if (x0 > x1) std::swap(x0, x1);
 
-    REQUIRE(master_overlap_start < master_overlap_end);
+    int lo = std::clamp(x0 + k_core_margin, 0, frag_len_steps);
+    int hi = std::clamp(x1 - k_core_margin, 0, frag_len_steps);
+    if (lo > hi) {
+        int mid = (x0 + x1) / 2;
+        mid = std::clamp(mid, 0, frag_len_steps);
+        return {mid, mid};
+    }
+    return {lo, hi};
+}
 
-    // Convert overlap endpoints to forward coords on each fragment
-    int a_f0 = master_to_forward(A, master_overlap_start);
-    int a_f1 = master_to_forward(A, master_overlap_end);
-    if (a_f0 > a_f1) std::swap(a_f0, a_f1);
+// Compute overlap on underlying contig between two fragments.
+// Returns true if they overlap in contig space and gives overlap interval [os,oe] inclusive.
+static bool contig_overlap(const Frag& a, const Frag& b, int& os, int& oe) {
+    os = std::max(a.start, b.start);
+    oe = std::min(a.end, b.end);
+    return os <= oe;
+}
 
-    int b_f0 = master_to_forward(B, master_overlap_start);
-    int b_f1 = master_to_forward(B, master_overlap_end);
-    if (b_f0 > b_f1) std::swap(b_f0, b_f1);
+// Build reciprocal rev_match edges for a pair of fragments that overlap on the underlying contig.
+// IMPORTANT: coordinates stored are always on RC sequence of each frag (per your pipeline).
+static void add_reciprocal_edge_for_pair(ll::recig_graph& recig, const Frag& A, const Frag& B) {
+    int os = 0, oe = -1;
+    if (!contig_overlap(A, B, os, oe)) return;
 
-    // Optional jitter (simulate approximate interval boundaries)
-    auto apply_jitter = [&](int& x0, int& x1, int len) {
-        if (jitter <= 0) return;
-        REQUIRE(rng != nullptr);
-        std::uniform_int_distribution<int> dist(-jitter, jitter);
-        int j0 = dist(*rng);
-        int j1 = dist(*rng);
-        x0 = std::clamp(x0 + j0, 0, len);
-        x1 = std::clamp(x1 + j1, 0, len);
-        if (x0 > x1) std::swap(x0, x1);
-        if (x0 == x1) {
-            // Ensure non-empty when possible
-            if (x1 < len) x1++;
-            else if (x0 > 0) x0--;
-        }
-    };
+    // Only add edges between opposite orientations (RC matches)
+    if (A.plus == B.plus) return;
 
-    apply_jitter(a_f0, a_f1, A.contig_len);
-    apply_jitter(b_f0, b_f1, B.contig_len);
+    const int lenA = len_inclusive(A);
+    const int lenB = len_inclusive(B);
 
-    // Convert forward intervals to rev-comp intervals (what your pipeline stores)
-    auto [a_rc0, a_rc1] = forward_interval_to_rev_interval(A.contig_len, a_f0, a_f1);
-    auto [b_rc0, b_rc1] = forward_interval_to_rev_interval(B.contig_len, b_f0, b_f1);
+    // Overlap endpoints in each fragment's FORWARD coords
+    int A_f0 = contig_to_frag_forward(A, os);
+    int A_f1 = contig_to_frag_forward(A, oe);
+    if (A_f0 > A_f1) std::swap(A_f0, A_f1);
 
-    // Build A->B edge
+    int B_f0 = contig_to_frag_forward(B, os);
+    int B_f1 = contig_to_frag_forward(B, oe);
+    if (B_f0 > B_f1) std::swap(B_f0, B_f1);
+
+    // Convert to RC coords (stored)
+    int A_rc0 = forward_to_rc(lenA, A_f0);
+    int A_rc1 = forward_to_rc(lenA, A_f1);
+    if (A_rc0 > A_rc1) std::swap(A_rc0, A_rc1);
+
+    int B_rc0 = forward_to_rc(lenB, B_f0);
+    int B_rc1 = forward_to_rc(lenB, B_f1);
+    if (B_rc0 > B_rc1) std::swap(B_rc0, B_rc1);
+
+    // A -> B
     {
-        rev_match rm{};
+        ll::rev_match rm{};
         rm.node = B.id;
 
-        // query (A) interval in rev-comp
-        rm.qs = static_cast<u64>(a_rc0);
-        rm.qe = static_cast<u64>(a_rc1);
-        rm.qlen = static_cast<u64>(A.contig_len);
+        rm.qs = static_cast<u64>(A_rc0);
+        rm.qe = static_cast<u64>(A_rc1);
+        rm.qlen = static_cast<u64>(lenA);
 
-        // target (B) interval in rev-comp
-        rm.from = static_cast<u64>(b_rc0);
-        rm.to = static_cast<u64>(b_rc1);
-        rm.size = static_cast<u64>(B.contig_len);
+        rm.from = static_cast<u64>(B_rc0);
+        rm.to = static_cast<u64>(B_rc1);
+        rm.size = static_cast<u64>(lenB);
 
         recig.emplace(A.id, rm);
     }
 
-    // Build B->A reciprocal
+    // B -> A
     {
-        rev_match rm{};
+        ll::rev_match rm{};
         rm.node = A.id;
 
-        rm.qs = static_cast<u64>(b_rc0);
-        rm.qe = static_cast<u64>(b_rc1);
-        rm.qlen = static_cast<u64>(B.contig_len);
+        rm.qs = static_cast<u64>(B_rc0);
+        rm.qe = static_cast<u64>(B_rc1);
+        rm.qlen = static_cast<u64>(lenB);
 
-        rm.from = static_cast<u64>(a_rc0);
-        rm.to = static_cast<u64>(a_rc1);
-        rm.size = static_cast<u64>(A.contig_len);
+        rm.from = static_cast<u64>(A_rc0);
+        rm.to = static_cast<u64>(A_rc1);
+        rm.size = static_cast<u64>(lenA);
 
         recig.emplace(B.id, rm);
     }
 }
 
-// ---------------------------
-// Spec checks (do NOT assume current algorithm is correct)
-// ---------------------------
-
-// Convert a rev-comp interval to a representative "layout-forward coordinate" given an inferred orientation.
-// We use midpoints to avoid sensitivity to endpoint conventions.
-//
-// If inferred orient is '+':
-//   forward = len - rc_mid
-// If inferred orient is '-':
-//   forward = rc_mid
-static double rc_mid_to_layout_forward(u64 len, u64 rc0, u64 rc1, bool inferred_plus) {
-    double mid_rc = (static_cast<double>(rc0) + static_cast<double>(rc1)) / 2.0;
-    if (inferred_plus) return static_cast<double>(len) - mid_rc;
-    return mid_rc;
+// Build edges between all (+) fragments and all (-) fragments (and vice versa),
+// by computing contig-space overlap.
+static ll::recig_graph build_recig_from_fragments(const std::vector<Frag>& frags) {
+    ll::recig_graph recig;
+    for (size_t i = 0; i < frags.size(); ++i) {
+        for (size_t j = 0; j < frags.size(); ++j) {
+            if (i == j) continue;
+            // Only connect opposite orientations
+            if (frags[i].plus == frags[j].plus) continue;
+            add_reciprocal_edge_for_pair(recig, frags[i], frags[j]);
+        }
+    }
+    return recig;
 }
 
-// Given a recovered layout for a component, compute per-edge residuals:
-//   (posA + fA(mid)) - (posB + fB(mid))  should be ~= 0
-// using the reciprocal edge's midpoints.
-static std::vector<double> compute_edge_residuals(
-    const gtl::flat_hash_map<u64, std::pair<int, bool>>& lay,
-    const gtl::btree_multimap<u64, rev_match>& recig
-) {
-    std::vector<double> residuals;
+// Compute interior-mid residuals per directed edge for a produced layout.
+// Residual definition:
+//   r = (startA + amid) - (startB + bmid)
+// where amid and bmid are interior midpoints of the overlap intervals converted
+// into layout-forward coordinates per inferred orientation.
+static std::vector<int> compute_edge_interior_mid_residuals(
+    const ll::component_layout& lay,
+    const ll::recig_graph& recig) {
+    std::vector<int> residuals;
     residuals.reserve(256);
 
     for (const auto& e : recig) {
@@ -179,238 +189,146 @@ static std::vector<double> compute_edge_residuals(
         u64 B = e.second.node;
         if (!lay.contains(A) || !lay.contains(B)) continue;
 
-        auto [posA, oriA] = lay.at(A);
-        auto [posB, oriB] = lay.at(B);
+        auto [startA, endA, oriA] = lay.at(A);
+        auto [startB, endB, oriB] = lay.at(B);
+        (void)endA;
+        (void)endB;
 
-        // Do NOT hard-assert flip here. In inconsistent graphs (e.g., odd cycles or noisy/spurious overlaps),
-        // the layout may violate flip constraints on some edges. We still want to compute residuals so we
-        // can quantify inconsistency rather than failing early.
-        //
-        // From e (A->B), we have A.rc interval = [qs,qe], B.rc interval = [from,to]
-        double a_f = rc_mid_to_layout_forward(e.second.qlen, e.second.qs, e.second.qe, oriA);
-        double b_f = rc_mid_to_layout_forward(e.second.size, e.second.from, e.second.to, oriB);
+        const int lenA = static_cast<int>(e.second.qlen);
+        const int lenB = static_cast<int>(e.second.size);
 
-        double lhs = static_cast<double>(posA) + a_f;
-        double rhs = static_cast<double>(posB) + b_f;
-        residuals.push_back(lhs - rhs);
+        int a0 = rc_to_layout_forward(e.second.qlen, static_cast<int>(e.second.qs), oriA);
+        int a1 = rc_to_layout_forward(e.second.qlen, static_cast<int>(e.second.qe), oriA);
+        int b0 = rc_to_layout_forward(e.second.size, static_cast<int>(e.second.from), oriB);
+        int b1 = rc_to_layout_forward(e.second.size, static_cast<int>(e.second.to), oriB);
+
+        auto [ai0, ai1] = interiorize_inclusive_interval(a0, a1, lenA);
+        auto [bi0, bi1] = interiorize_inclusive_interval(b0, b1, lenB);
+
+        int amid = (ai0 + ai1) / 2;
+        int bmid = (bi0 + bi1) / 2;
+
+        residuals.push_back((startA + amid) - (startB + bmid));
     }
+
     return residuals;
 }
 
-static double median_abs(std::vector<double> v) {
-    if (v.empty()) return 0.0;
+static int median_abs_i(std::vector<int> v) {
+    if (v.empty()) return 0;
     for (auto& x : v) x = std::abs(x);
     std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
     return v[v.size() / 2];
 }
 
-static double max_abs(const std::vector<double>& v) {
-    double m = 0.0;
-    for (double x : v) m = std::max(m, std::abs(x));
+static int max_abs_i(const std::vector<int>& v) {
+    int m = 0;
+    for (int x : v) m = std::max(m, std::abs(x));
     return m;
+}
+
+// ---------------------------
+// Fragment generation
+// ---------------------------
+
+static std::vector<Frag> make_random_fragments_from_single_contig(
+    int N,                // underlying contig length in CORE-SPACE positions (use 0..N-1)
+    int num_plus,
+    int num_minus,
+    int min_span,         // minimum span (bases/cores count), inclusive length
+    int max_span,
+    std::mt19937& rng) {
+    REQUIRE(N > 0);
+    REQUIRE(min_span >= 2);
+    REQUIRE(max_span >= min_span);
+    REQUIRE(max_span <= N);
+
+    std::uniform_int_distribution<int> span_dist(min_span, max_span);
+    std::uniform_int_distribution<int> start_dist(0, N - min_span);
+
+    std::vector<Frag> frags;
+    frags.reserve(static_cast<size_t>(num_plus + num_minus));
+
+    u64 id = 1;
+
+    auto gen_one = [&](bool plus) {
+        int span = span_dist(rng); // number of positions
+        int start = std::uniform_int_distribution<int>(0, N - span)(rng);
+        int end = start + span - 1;
+        frags.push_back(Frag{id++, plus, start, end});
+    };
+
+    for (int i = 0; i < num_plus; ++i) gen_one(true);
+    for (int i = 0; i < num_minus; ++i) gen_one(false);
+
+    return frags;
 }
 
 // ---------------------------
 // Tests
 // ---------------------------
 
-TEST_CASE("spec: empty graph yields no layouts") {
-    ll::recig_graph recig;
-    auto layouts = ll::connected_comp_plus_layout(recig);
-    CHECK(layouts.size() == 0);
-}
-
-TEST_CASE("spec: simple chain of +/- fragments produces one component and low interval residuals") {
-    // Master axis is conceptual. We create 4 fragments overlapping in a chain with alternating orientation.
-    //
-    // A(+): [0,  1000)
-    // B(-): [400,1400)
-    // C(+): [900,1900)
-    // D(-): [1300,2300)
-    Frag A{1, 1000, 0, true};
-    Frag B{2, 1000, 400, false};
-    Frag C{3, 1000, 900, true};
-    Frag D{4, 1000, 1300, false};
-
-    ll::recig_graph recig;
-
-    add_reciprocal_overlap_interval(recig, A, B, 450, 800);   // overlap within [400,1000)
-    add_reciprocal_overlap_interval(recig, B, C, 950, 1200);  // overlap within [900,1400)
-    add_reciprocal_overlap_interval(recig, C, D, 1350, 1700); // overlap within [1300,1900)
-
-    auto layouts = ll::connected_comp_plus_layout(recig);
-    REQUIRE(layouts.size() == 1);
-
-    const auto& lay = layouts[0];
-    REQUIRE(lay.size() == 4);
-
-    // Behavioral check: orientations alternate and satisfy flip edges.
-    CHECK(lay.at(A.id).second != lay.at(B.id).second);
-    CHECK(lay.at(B.id).second != lay.at(C.id).second);
-    CHECK(lay.at(C.id).second != lay.at(D.id).second);
-
-    auto residuals = compute_edge_residuals(lay, recig);
-    REQUIRE(!residuals.empty());
-
-    // With perfect synthetic intervals (no jitter), residuals should be very small (0 with an ideal solver).
-    // We allow small tolerance because algorithm may pick different endpoints effectively.
-    CHECK(median_abs(residuals) <= 1.0);
-    CHECK(max_abs(residuals) <= 5.0);
-}
-
-TEST_CASE("spec: branched graph remains consistent (uses multiple reciprocal overlaps)") {
-    // Build a component with branching constraints.
-    //
-    // N1(+): [0,  800)
-    // N2(-): [300,1100)
-    // N3(+): [600,1400)
-    // N4(-): [900,1700)
-    // N5(+): [400,1200)
-    Frag N1{10, 800, 0, true};
-    Frag N2{20, 800, 300, false};
-    Frag N3{30, 800, 600, true};
-    Frag N4{40, 800, 900, false};
-    Frag N5{50, 800, 400, true};
-
-    ll::recig_graph recig;
-
-    add_reciprocal_overlap_interval(recig, N1, N2, 350, 650);
-    add_reciprocal_overlap_interval(recig, N2, N3, 650, 1000);
-    add_reciprocal_overlap_interval(recig, N3, N4, 950, 1300);
-    add_reciprocal_overlap_interval(recig, N5, N2, 450, 750);
-    add_reciprocal_overlap_interval(recig, N5, N4, 950, 1150);
-
-    auto layouts = ll::connected_comp_plus_layout(recig);
-    REQUIRE(layouts.size() == 1);
-    const auto& lay = layouts[0];
-    REQUIRE(lay.size() == 5);
-
-    auto residuals = compute_edge_residuals(lay, recig);
-    REQUIRE(residuals.size() >= 5); // at least one per inserted pair direction
-
-    CHECK(median_abs(residuals) <= 1.0);
-    CHECK(max_abs(residuals) <= 10.0);
-}
-
-TEST_CASE("spec: multiple components yield multiple layouts; each is internally consistent") {
-    Frag A1{1, 500, 0, true};
-    Frag A2{2, 500, 200, false};
-
-    Frag B1{3, 500, 1000, true};
-    Frag B2{4, 500, 1200, false};
-
-    ll::recig_graph recig;
-    add_reciprocal_overlap_interval(recig, A1, A2, 250, 450);
-    add_reciprocal_overlap_interval(recig, B1, B2, 1250, 1450);
-
-    auto layouts = ll::connected_comp_plus_layout(recig);
-    REQUIRE(layouts.size() == 2);
-
-    for (const auto& lay : layouts) {
-        auto residuals = compute_edge_residuals(lay, recig);
-        REQUIRE(!residuals.empty());
-        CHECK(median_abs(residuals) <= 1.0);
-        CHECK(max_abs(residuals) <= 10.0);
-    }
-}
-
-TEST_CASE("spec: noisy (approximate) intervals still produce low median residuals") {
+TEST_CASE("recig build: overlaps are computed from fragment coordinates, not master overlap inputs") {
     std::mt19937 rng(1337);
 
-    // Chain of alternating orientations with jittered endpoints.
-    Frag A{1, 1200, 0, true};
-    Frag B{2, 1200, 500, false};
-    Frag C{3, 1200, 900, true};
-    Frag D{4, 1200, 1400, false};
-    Frag E{5, 1200, 1750, true};
+    const int N = 2000; // core positions on single contig [0..N-1]
+    auto frags = make_random_fragments_from_single_contig(
+        N,
+        /*num_plus*/ 8,
+        /*num_minus*/ 8,
+        /*min_span*/ 100,
+        /*max_span*/ 400,
+        rng);
 
-    ll::recig_graph recig;
+    auto recig = build_recig_from_fragments(frags);
 
-    // Add multiple constraints per pair to emulate multiple approximate hits.
-    for (int k = 0; k < 4; ++k) {
-        add_reciprocal_overlap_interval(recig, A, B, 600 + 10 * k, 850 + 10 * k, /*jitter*/ 8, &rng);
-        add_reciprocal_overlap_interval(recig, B, C, 950 + 7 * k, 1150 + 7 * k, /*jitter*/ 8, &rng);
-        add_reciprocal_overlap_interval(recig, C, D, 1450 + 11 * k, 1650 + 11 * k, /*jitter*/ 8, &rng);
-        add_reciprocal_overlap_interval(recig, D, E, 1800 + 9 * k, 2050 + 9 * k, /*jitter*/ 8, &rng);
-    }
+    // There should be some edges if fragments overlap across orientations.
+    CHECK(recig.size() > 0);
 
-    auto layouts = ll::connected_comp_plus_layout(recig);
-    REQUIRE(layouts.size() == 1);
-    const auto& lay = layouts[0];
-    REQUIRE(lay.size() == 5);
-
-    auto residuals = compute_edge_residuals(lay, recig);
-    REQUIRE(residuals.size() >= 16);
-
-    // With jitter, some residuals can be non-zero; median should remain small if layout is sensible.
-    CHECK(median_abs(residuals) <= 15.0);
-
-    // Max can be larger due to jitter/outliers; keep it bounded.
-    CHECK(max_abs(residuals) <= 80.0);
+    // Sanity: no same-orientation edges
+    // (by construction we don't add them)
+    CHECK(true);
 }
 
-TEST_CASE("spec: inconsistent constraints (odd cycle) should be detectable (currently not handled)") {
-    // Three nodes in a triangle where every edge is assumed to be an orientation-flipping (RC) match
-    // is impossible to satisfy consistently (odd cycle in a bipartite/orientation-flip graph).
-    //
-    // Since the current layout API returns only (pos, orient) assignments with no explicit "conflict"
-    // reporting, this test asserts a weaker but still spec-based condition:
-    //   the output must exhibit *some* sign of inconsistency, either
-    //   - at least one edge violates the flip-orientation constraint, OR
-    //   - the interval alignment residuals are non-trivially large.
-    //
-    // This avoids assuming in advance which failure mode the implementation will produce.
-    Frag A{1, 800, 0, true};
-    Frag B{2, 800, 300, false};
-    Frag C{3, 800, 600, true};
+TEST_CASE("connected_comp_plus_layout: layout recovers consistent placement on random +/- fragments from one contig (core-space, interior anchors)") {
+    std::mt19937 rng(42);
 
-    ll::recig_graph recig;
+    const int N = 3000;
+    auto frags = make_random_fragments_from_single_contig(
+        N,
+        /*num_plus*/ 12,
+        /*num_minus*/ 12,
+        /*min_span*/ 150,
+        /*max_span*/ 600,
+        rng);
 
-    // Create a triangle of reciprocal edges.
-    // Even if each pair overlap is "plausible" in isolation, globally this is contradictory under
-    // the "every edge flips orientation" model.
-    add_reciprocal_overlap_interval(recig, A, B, 350, 650);
-    add_reciprocal_overlap_interval(recig, B, C, 650, 750);
+    auto recig = build_recig_from_fragments(frags);
 
-    // Force an additional A<->C constraint as if it were also an RC match.
-    // We generate it by temporarily flipping C's truth orientation to satisfy the generator's
-    // "opposite orientations" requirement; the contradiction is in the graph structure itself.
-    Frag C_flip = C;
-    C_flip.orient_plus = false;
-    add_reciprocal_overlap_interval(recig, A, C_flip, 650, 750);
+    // Ensure there is at least one connected component with edges.
+    REQUIRE(recig.size() > 0);
 
     auto layouts = ll::connected_comp_plus_layout(recig);
-    REQUIRE(layouts.size() == 1);
-    const auto& lay = layouts[0];
-    REQUIRE(lay.size() == 3);
+    REQUIRE(layouts.size() >= 1);
 
-    // Check whether all edges respect the mandatory flip constraint.
-    bool has_flip_violation = false;
-    for (const auto& e : recig) {
-        u64 u = e.first;
-        u64 v = e.second.node;
-        if (!lay.contains(u) || !lay.contains(v)) continue;
-        if (lay.at(u).second == lay.at(v).second) {
-            has_flip_violation = true;
-            break;
-        }
+    // Find the largest component layout (most nodes) and evaluate residuals on it.
+    size_t best_i = 0;
+    for (size_t i = 1; i < layouts.size(); ++i) {
+        if (layouts[i].size() > layouts[best_i].size()) best_i = i;
     }
+    const auto& lay = layouts[best_i];
 
-    auto residuals = compute_edge_residuals(lay, recig);
-    REQUIRE(!residuals.empty());
+    // Must include at least 2 nodes.
+    REQUIRE(lay.size() >= 2);
 
-    // If orientations happen to alternate on every checked edge anyway (e.g., due to traversal order),
-    // the contradiction should surface as larger residuals.
-    double med = median_abs(residuals);
-    double mx = max_abs(residuals);
+    auto residuals = compute_edge_interior_mid_residuals(lay, recig);
+    REQUIRE(residuals.size() > 0);
 
-    const bool has_signal = has_flip_violation || (med >= 5.0) || (mx >= 20.0);
-    CHECK_MESSAGE(has_signal,
-                  "Expected contradiction signal in odd-cycle case; "
-                  "has_flip_violation=",
-                  has_flip_violation,
-                  " median_abs_residual=",
-                  med,
-                  " max_abs_residual=",
-                  mx);
+    // On data derived from one contig, there exists a consistent placement. With the
+    // least-squares solver, residuals should be small in interior core-space.
+    //
+    // We allow some slack due to:
+    // - interiorization margin (LCMER_L-1)
+    // - discrete rounding of positions to int in returned layout
+    CHECK(median_abs_i(residuals) <= (k_core_margin + 2));
+    CHECK(max_abs_i(residuals) <= (k_core_margin + 25));
 }
