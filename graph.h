@@ -49,8 +49,11 @@ consteval int_type nextpowerof2(int_type v) {
 
 using u64 = uint64_t;
 using u32 = uint32_t;
-
-struct dbg_index {
+using DefaultBF =
+    bloom_interface<bloom_ext::BlockedLockedBloomFilter<0, std::mutex>>;
+template <class BFT = DefaultBF>
+struct dbg_index_base {
+    using BloomFilterType = BFT;
     static constexpr u64 lcindex_increment =
         nextpowerof2((u64)MAXIMUM_WORK_THREADS);
     using mutex_type = std::mutex;
@@ -115,10 +118,10 @@ struct dbg_index {
     gtl::flat_hash_set<u64> active_set;
 
     // merge_info_map_t merge_map;
-    bloom_interface<bloom_ext::BlockedLockedBloomFilter<0, std::mutex>> bf;
+    BloomFilterType bf;
 
-    dbg_index(double false_positive_rate, uint64_t projected_count,
-              uint64_t seed)
+    dbg_index_base(double false_positive_rate, uint64_t projected_count,
+                   uint64_t seed)
         : bf{false_positive_rate, projected_count, seed} {}
 
     // dbg_index(const dbg_index &other)
@@ -565,7 +568,60 @@ struct dbg_index {
         }
         return vv.first->second.id;
     }
+    gtl::vector<u64> shortest_path_bfs(u64 source,
+                                           u64 target) const {
+        if (source == target) return gtl::vector<u64>{source};
+        if (source == 0 || target == 0) return {};
+
+
+        std::queue<u64> q;
+        gtl::flat_hash_map<u64, u64> parent;
+        gtl::flat_hash_map<u64, uint8_t> visited;
+
+        visited[source] = 1;
+        q.push(source);
+
+        while (!q.empty()) {
+            const u64 cur = q.front();
+            q.pop();
+
+
+            auto it = dbg.find(cur);
+            if(it == dbg.end()){
+                continue;
+            }
+            for (u64 nb : it->second.prev) {
+                if (visited.find(nb) != visited.end()) continue;
+                auto neit = dbg.find(nb);
+                if (neit == dbg.end()) continue;
+
+                visited.emplace(nb, 1);
+                parent.emplace(nb, cur);
+
+                if (nb == target) {
+                    gtl::vector<u64> path;
+                    u64 v = target;
+                    path.push_back(v);
+                    while (v != source) {
+                        auto pit = parent.find(v);
+                        if (pit == parent.end()) return {};
+                        v = pit->second;
+                        path.push_back(v);
+                    }
+                    std::reverse(path.begin(), path.end());
+                    return path;
+                }
+
+                q.push(nb);
+            }
+        }
+        return {};
+    }
+
 };
+
+using dbg_index = dbg_index_base<DefaultBF>;
+using dbg_index_light = dbg_index_base<MockBF>;
 
 struct FlatDBG {
     struct Node {
@@ -806,7 +862,7 @@ struct GraphCleaning {
                 [&](int i) {
                     gtl::flat_hash_map<u64, u64> to_delete;
                     // printf("tid: %d\n", tid++);
-                    for (const auto [node, it] : to_simplify[i]) {
+                    for (const auto &[node, it] : to_simplify[i]) {
                         // printf("%llu\n", node);
                         // auto hv = dbg.hash(node);
                         // auto it = dbg.find(node, hv, no_lock);
@@ -825,7 +881,7 @@ struct GraphCleaning {
                         }
                     }
                     std::lock_guard lock(del_mutex);
-                    for (auto [del, to] : to_delete) {
+                    for (const auto &[del, to] : to_delete) {
                         active_set.erase(del);
                     }
                 },

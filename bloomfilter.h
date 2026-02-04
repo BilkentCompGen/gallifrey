@@ -37,6 +37,7 @@ using std::hardware_destructive_interference_size;
 constexpr std::size_t hardware_constructive_interference_size = 64;
 constexpr std::size_t hardware_destructive_interference_size = 64;
 #endif
+
 struct BasicBloomFilter {
     BasicBloomFilter(int n, float eps) : n(n), epsilon(eps) {
         m = ComputeNumBits();
@@ -145,7 +146,7 @@ struct BlockedBloomFilter {
     int k;
     std::vector<block_type> bv;
 };
-template <int LOCKS_PER_2PN_BLOCKS = 0,class mutex_type = std::mutex,
+template <int LOCKS_PER_2PN_BLOCKS = 0, class mutex_type = std::mutex,
           int BLOCK_BYTES = hardware_constructive_interference_size>
 struct BlockedLockedBloomFilter {
     static constexpr int block_bytes = BLOCK_BYTES;
@@ -179,7 +180,8 @@ struct BlockedLockedBloomFilter {
     std::pair<uint8_t *, uint32_t> GetBlock(uint32_t h1, uint32_t) {
         uint32_t block_idx = h1 % num_blocks;
         uint32_t byte_idx = block_idx * block_bytes;
-        return {(uint8_t *)bv.data() + byte_idx, block_idx>>LOCKS_PER_2PN_BLOCKS};
+        return {(uint8_t *)bv.data() + byte_idx,
+                block_idx >> LOCKS_PER_2PN_BLOCKS};
     }
 
     void Insert(uint32_t h1, uint32_t h2) {
@@ -290,6 +292,21 @@ struct null_mutex {
     nullptr_t native_handle() { return nullptr; }
 };
 
+struct MockBF {
+    double false_positive_rate;
+    double projected_element_count;
+    unsigned int random_seed;
+
+    MockBF(double false_positive_rate,
+           unsigned long long projected_element_count,
+           unsigned long long random_seed)
+        : false_positive_rate(false_positive_rate),
+          projected_element_count(projected_element_count),
+          random_seed(random_seed) {}
+    bool contains(const auto &) const { return true; }
+    bool insert(const auto &) { return false; }
+};
+
 template <class BloomImplementation>
 struct bloom_interface {
     double false_positive_rate;
@@ -347,13 +364,14 @@ struct bloom_interface<BF> {
     //       random_seed{other.random_seed} {}
     // bool contains(const auto &element) const {
     //     // std::lock_guard<mutex> lock{m};
-    //     uint64_t h = komihash::komihash(&element, sizeof(element), random_seed);
+    //     uint64_t h = komihash::komihash(&element, sizeof(element),
+    //     random_seed);
 
     //     return implementation.Query(h >> 32, h & 0xFFFFFFFF);
     // }
     // void insert(const auto &element) {
-    //     uint64_t h = komihash::komihash(&element, sizeof(element), random_seed);
-    //     implementation.Insert(h >> 32, h & 0xFFFFFFFF);
+    //     uint64_t h = komihash::komihash(&element, sizeof(element),
+    //     random_seed); implementation.Insert(h >> 32, h & 0xFFFFFFFF);
     // }
     bool contains(const uint64_t &h) const {
         return implementation.Query(h >> 32, h & 0xFFFFFFFF);

@@ -136,7 +136,7 @@ struct lcmer {
     //     h1 ^= h1 >> 16;
     //     return h1;
     // }
-
+    static constexpr size_t size = N;
     std::array<uint32_t, N> data;
 
     lcmer() {}

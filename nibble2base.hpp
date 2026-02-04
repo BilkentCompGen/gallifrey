@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <gtl/vector.hpp>
 
+
 #include "htslib/hts.h"
 
 // typedef unsigned int u_int;
@@ -297,18 +298,14 @@ static const uint8_t decode4_tbl[16] = {
     /* C */ 0,
     /* D */ 0,
     /* E */ 0,
-    /* F */ 0
-};
+    /* F */ 0};
 
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
-inline void onehotto2bitDNA_neon( // TODO VERIFY TEST THIS
-    const uint8_t *__restrict data,
-    size_t len,
-    uint8_t *__restrict low,
-    uint8_t *__restrict high)
-{
+inline void onehotto2bitDNA_neon(  // TODO VERIFY TEST THIS
+    const uint8_t *__restrict data, size_t len, uint8_t *__restrict low,
+    uint8_t *__restrict high) {
     // Load decode table into a vector register
-    const uint8x16_t tbl  = vld1q_u8(decode4_tbl);
+    const uint8x16_t tbl = vld1q_u8(decode4_tbl);
     const uint8x16_t mask = vdupq_n_u8(0x0F);
 
     size_t i = 0;
@@ -327,27 +324,24 @@ inline void onehotto2bitDNA_neon( // TODO VERIFY TEST THIS
         uint8x16_t dhi = vqtbl1q_u8(tbl, hi);
 
         // Store results
-        vst1q_u8(low  + i, dlo);
+        vst1q_u8(low + i, dlo);
         vst1q_u8(high + i, dhi);
     }
 
     // Scalar tail
     for (; i < len; ++i) {
         uint8_t b = data[i];
-        low[i]  = decode4_tbl[b & 0x0F];
+        low[i] = decode4_tbl[b & 0x0F];
         high[i] = decode4_tbl[b >> 4];
     }
 }
 #endif
 
-inline void onehotto2bitDNA_vector(
-    const uint8_t *__restrict data,
-    size_t len,
-    uint8_t *__restrict low,
-    uint8_t *__restrict high)
-{
+inline void onehotto2bitDNA_vector(const uint8_t *__restrict data, size_t len,
+                                   uint8_t *__restrict low,
+                                   uint8_t *__restrict high) {
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
-    return onehotto2bitDNA_neon(data,  len,  low, high);
+    return onehotto2bitDNA_neon(data, len, low, high);
 #endif
 }
 // Uses naive conversions for now can be optimized later if necessary
@@ -501,11 +495,9 @@ T reverse_complement_kmer(T kmer, int K) {
     return kmer;
 }
 
-
-
 // 64-bit packed variant: 32 bases per word, 2 bits per base.
 struct CrumbledSubSeq64 {
-    size_t len : 59;
+    size_t len : 58;
     int skip_first_n : 6;  // offset within first word in bases (0-31)
     uint64_t *data;
     uint64_t origin_node;
@@ -549,11 +541,12 @@ struct CrumbledSubSeq64 {
         }
     }
 
-    CrumbledSubSeq64(const uint8_t *nibbles, size_t from, size_t to, uint64_t origin_node,
-                     from_nibbles) noexcept
+    CrumbledSubSeq64(const uint8_t *nibbles, size_t from, size_t to,
+                     uint64_t origin_node, from_nibbles) noexcept
         : len(to - from),
           skip_first_n(static_cast<uint8_t>(from & 31)),
-          data(nullptr), origin_node(origin_node){
+          data(nullptr),
+          origin_node(origin_node) {
         const size_t aligned_from = from & ~static_cast<size_t>(31);
         const size_t total_bases = (to - aligned_from);
         data = new uint64_t[storage_size(total_bases)]();
@@ -562,14 +555,16 @@ struct CrumbledSubSeq64 {
         });
     }
 
-    CrumbledSubSeq64(const uint8_t *nibbles, size_t from, size_t to, uint64_t origin_node) noexcept
+    CrumbledSubSeq64(const uint8_t *nibbles, size_t from, size_t to,
+                     uint64_t origin_node) noexcept
         : CrumbledSubSeq64(nibbles, from, to, origin_node, from_nibbles{}) {}
 
-    CrumbledSubSeq64(const char *bases, size_t from, size_t to, uint64_t origin_node,
-                     from_ascii) noexcept
+    CrumbledSubSeq64(const char *bases, size_t from, size_t to,
+                     uint64_t origin_node, from_ascii) noexcept
         : len(to - from),
           skip_first_n(static_cast<uint8_t>(from & 31)),
-          data(nullptr), origin_node(origin_node) {
+          data(nullptr),
+          origin_node(origin_node) {
         const size_t aligned_from = from & ~static_cast<size_t>(31);
         const size_t total_bases = (to - aligned_from);
         data = new uint64_t[storage_size(total_bases)]();
@@ -588,8 +583,9 @@ struct CrumbledSubSeq64 {
         other.data = nullptr;
     }
 
-    CrumbledSubSeq64 (const gtl::vector<CrumbledSubSeq64> &subseqs,
-                            size_t from, size_t to) : len{to-from}, data{new uint64_t[storage_size(to-from+32)]}{
+    CrumbledSubSeq64(const gtl::vector<CrumbledSubSeq64> &subseqs, size_t from,
+                     size_t to)
+        : len{to - from}, data{new uint64_t[storage_size(to - from + 32)]} {
         size_t sub_len = (from < to) ? (to - from) : 0;
         if (sub_len == 0 || subseqs.empty()) {
             return;
@@ -626,8 +622,18 @@ struct CrumbledSubSeq64 {
             cumulative += frag.len;
         }
     };
-
-
+    CrumbledSubSeq64(size_t len, int skip_first_n, uint64_t *data,
+                     uint64_t origin_node) noexcept
+        : len{len},
+          skip_first_n{skip_first_n},
+          data(data),
+          origin_node(origin_node) {}
+    // static CrumbledSubSeq64 copy(const CrumbledSubSeq64 &other) { //Buggy fix this first
+    //     decltype(other.data) data = new uint64_t[storage_size(other.len + 32)];
+    //     memcpy(data, other.data, storage_size(other.len));
+    //     return CrumbledSubSeq64(other.len, other.skip_first_n, data,
+    //                             other.origin_node);
+    // }
     CrumbledSubSeq64(const CrumbledSubSeq64 &other) = delete;
     CrumbledSubSeq64 &operator=(const CrumbledSubSeq64 &other) = delete;
     ~CrumbledSubSeq64() { delete[] data; }
