@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <queue>
 
 #include "asm.h"
 #include "bloomfilter.h"
