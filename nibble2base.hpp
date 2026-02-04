@@ -278,6 +278,9 @@
 //     }
 // };
 
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__))
+
+
 #include <arm_neon.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -300,7 +303,7 @@ static const uint8_t decode4_tbl[16] = {
     /* E */ 0,
     /* F */ 0};
 
-#if (defined(__ARM_NEON) || defined(__ARM_NEON__))
+
 inline void onehotto2bitDNA_neon(  // TODO VERIFY TEST THIS
     const uint8_t *__restrict data, size_t len, uint8_t *__restrict low,
     uint8_t *__restrict high) {

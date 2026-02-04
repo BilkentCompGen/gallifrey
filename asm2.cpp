@@ -7,6 +7,7 @@
 #include <htslib/thread_pool.h>
 #include <stdio.h>
 
+#include <stack>
 #include <algorithm>
 #include <chrono>
 #include <cstdarg>
@@ -381,15 +382,7 @@ struct assembler {
         return true;
     }
 
-    template <class T>
-    struct __attribute__((
-        aligned(std::hardware_constructive_interference_size))) aligned_int {
-        using int_type = T;
-        int_type val;
-        aligned_int() : val{0} {}
-        aligned_int(int_type val) : val{val} {}
-        operator T() { return val; }
-    };
+
     auto construct_dbg() {
         dqt data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
         dqt recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
@@ -1544,7 +1537,7 @@ struct assembler {
             int max_start = INT_MIN;
             int leftmost_span = INT_MIN;
             int rightmost_span = INT_MIN;
-
+	    bool start_orient_forward = true;
             for (const auto &[node_id, start_end_orient] : layout) {
                 auto [start_core, end_core, orient] = start_end_orient;
                 (void)orient;
@@ -1555,6 +1548,7 @@ struct assembler {
                     (start_core == min_start && s > leftmost_span)) {
                     min_start = start_core;
                     leftmost = node_id;
+		    start_orient_forward =orient;
                     leftmost_span = s;
                 }
 
@@ -1565,7 +1559,7 @@ struct assembler {
                     rightmost_span = s;
                 }
             }
-            return std::make_pair(leftmost, rightmost);
+            return std::make_tuple(leftmost, rightmost, start_orient_forward);
         };
         auto &dbg = dbgi.dbg;
         u64 layout_no = 0;
@@ -1632,7 +1626,7 @@ struct assembler {
                     merged_seqs;  // per entry we get hte sequences. Even
                                   // forward
 
-                auto [source, target] = identify_component_endpoints(layout);
+                auto [source, target, oriori] = identify_component_endpoints(layout);
                 auto path =
                     shortest_path_unweighted_bfs(reciprocal, source, target);
                 assert(path.size() > 0);
@@ -1655,8 +1649,9 @@ struct assembler {
                     assert(left_dbg_it != dbg.end());
                     prev_anchor = find_anchors_and_extend_the_ctg_builder(
                         base, left_dbg_it->second.seq, right_dbg_it->second.seq,
-                        prev_anchor, i % 2 == 0);
-                    fprintf(stderr, "Extending: %llu\n", layout_no);
+                        prev_anchor, oriori);
+		    oriori = !oriori;
+                    fprintf(stderr, "Extending: %llu with %llu\n", layout_no, path[i]);
                     // auto l_lr = build_lr_cores(left_dbg_it->second.seq,
                     //                            syncmer_functor, lcp_level);
                     // auto r_lr = build_lr_cores(dbg.find(right)->second.seq,
@@ -1815,16 +1810,16 @@ struct assembler {
                     fprintf(out, "%s", chs.data);
                 }
                 fprintf(out, "\n");
-                // for (u64 node : path) {
-                //     auto it = dbg.find(node);
-                //     fprintf(out, ">M%llu L%llu\n", node, layout_no);
-                //     for (const SequenceContainerType &s : it->second.seq) {
-                //         chs.require(s.len);
-                //         s.convert_to_ascii((char *)chs.data);
-                //         fprintf(out, "%s", chs.data);
-                //     }
-                //     fprintf(out, "\n");
-                // }
+		for (u64 node : path) {
+			auto it = dbg.find(node);
+			fprintf(out, ">Z%llu L%llu\n", node, layout_no);
+			for (const SequenceContainerType &s : it->second.seq) {
+				chs.require(s.len);
+				s.convert_to_ascii((char *)chs.data);
+				fprintf(out, "%s", chs.data);
+			}
+			fprintf(out, "\n");
+		}
             }
             ++layout_no;
         }
