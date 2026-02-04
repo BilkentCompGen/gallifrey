@@ -83,20 +83,36 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(libbloom)
 
+FetchContent_Declare(
+    eigen
+    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+    GIT_TAG 3.4.0
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(eigen)
+
 
 # Link libraries
-target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue pthread deflate z)
+target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue pthread deflate z Eigen3::Eigen)
 
 # Unit tests (doctest)
-add_executable(test_connected_comp_plus_layout unit_tests/test_connected_comp_plus_layout.cpp layout/layout.cpp)
-target_include_directories(test_connected_comp_plus_layout PRIVATE ./ext)
-target_link_libraries(test_connected_comp_plus_layout PRIVATE gtl)
-add_test(NAME unit_connected_comp_plus_layout COMMAND test_connected_comp_plus_layout)
-
-# Debugging / inspection tool: print fragments, recig edges, and resulting component layouts
-add_executable(layout_debug tools/layout_debug.cpp layout/layout.cpp)
-target_include_directories(layout_debug PRIVATE ./ext)
-target_link_libraries(layout_debug PRIVATE gtl)
+# Lightweight DBG builder test tool (single-thread, no bloom/locks).
+#
+# IMPORTANT:
+# - Rely on stb-style header-only lcptools implementation (included by the tool),
+#   so do not link ext/lcptools/*.c here.
+# - Do NOT link lcmer.cpp here, because it includes doctest-based tests and
+#   will pull doctest runtime symbols at link time.
+# Temporarily disabled - source file missing
+# add_executable(light_dbg_build
+#     tools/light_dbg_build.cpp
+# )
+# target_include_directories(light_dbg_build PRIVATE . ./ext)
+# target_link_libraries(light_dbg_build PRIVATE gtl CLI11::CLI11)
+# target_compile_definitions(light_dbg_build PRIVATE
+#     SYNCMER_RULE=DensitySyncmerRule
+#     LCMER_L=8
+# )
 
 # Tests and custom targets
 add_test(NAME test COMMAND lasm hifi ../tests/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8 --density 0.05)

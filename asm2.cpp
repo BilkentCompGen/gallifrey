@@ -26,6 +26,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <Eigen/Dense>
 
 #include "asm.h"
 #include "bgzf.h"
@@ -725,6 +726,196 @@ struct assembler {
         return layouts;
     }
 
+    /// Least-squares layout computation (based on order_prototype.py order_lstsq).
+    /// Instead of BFS traversal, this method considers ALL edges simultaneously
+    /// and finds globally optimal positions that minimize squared error.
+    auto connected_comp_plus_layout_lstsq(
+        const gtl::btree_multimap<u64, rev_match> &recig) {
+        gtl::vector<gtl::flat_hash_map<u64, std::tuple<int, int, bool>>>
+            layouts;
+        gtl::flat_hash_set<u64> visited;
+
+        auto infer_len_for_node = [&](u64 id) -> int {
+            // Prefer outgoing query length (qlen).
+            auto out_range = recig.equal_range(id);
+            if (out_range.first != out_range.second) {
+                const auto &rm = out_range.first->second;
+                if (rm.qry.size > 0) return static_cast<int>(rm.qry.size);
+            }
+            // Fallback: any incoming edge's target length (size).
+            for (const auto &kv : recig) {
+                if (kv.second.node != id) continue;
+                const auto &rm = kv.second;
+                if (rm.tgt.size > 0) return static_cast<int>(rm.tgt.size);
+            }
+            return 0;
+        };
+
+        auto to_end_inclusive = [&](int start, int len) -> int {
+            if (len <= 0) return start;
+            if (start > std::numeric_limits<int>::max() - (len - 1)) {
+                return std::numeric_limits<int>::max();
+            }
+            if (start < std::numeric_limits<int>::min() + (len - 1)) {
+                return std::numeric_limits<int>::min();
+            }
+            return start + (len - 1);
+        };
+
+        // First, find all connected components using DFS
+        for (const auto &nit : recig) {
+            if (visited.contains(nit.first)) {
+                continue;
+            }
+
+            // Collect all nodes in this connected component
+            gtl::vector<u64> component;
+            gtl::flat_hash_set<u64> comp_visited;
+            std::stack<u64> stack;
+            stack.push(nit.first);
+
+            while (!stack.empty()) {
+                u64 node = stack.top();
+                stack.pop();
+                if (comp_visited.contains(node)) {
+                    continue;
+                }
+                comp_visited.emplace(node);
+                visited.emplace(node);
+                component.push_back(node);
+
+                // Add neighbors (outgoing edges)
+                auto range = recig.equal_range(node);
+                for (auto it = range.first; it != range.second; ++it) {
+                    if (!comp_visited.contains(it->second.node)) {
+                        stack.push(it->second.node);
+                    }
+                }
+            }
+
+            if (component.empty()) {
+                continue;
+            }
+
+            // Build index mapping: node_id -> index
+            gtl::flat_hash_map<u64, size_t> idx;
+            for (size_t i = 0; i < component.size(); ++i) {
+                idx[component[i]] = i;
+            }
+            size_t n = component.size();
+
+            // Collect edges with deltas and track orientation
+            // edges: (src, tgt, delta, src_orient, tgt_orient)
+            // We need to track orientation as we traverse
+            struct edge_info {
+                u64 src;
+                u64 tgt;
+                int delta;
+                bool src_orient;
+                bool tgt_orient;
+            };
+            gtl::vector<edge_info> edges;
+
+            // Use BFS to determine orientations for all nodes
+            gtl::flat_hash_map<u64, bool> orientations;
+            std::queue<u64> orient_queue;
+            orient_queue.push(component[0]);
+            orientations[component[0]] = true;  // First node is forward
+
+            while (!orient_queue.empty()) {
+                u64 src = orient_queue.front();
+                orient_queue.pop();
+                bool s_orient = orientations[src];
+
+                auto range = recig.equal_range(src);
+                for (auto it = range.first; it != range.second; ++it) {
+                    u64 tgt = it->second.node;
+                    if (!idx.contains(tgt)) continue;  // Not in this component
+
+                    bool tgt_orient;
+                    if (orientations.contains(tgt)) {
+                        tgt_orient = orientations[tgt];
+                    } else {
+                        tgt_orient = !s_orient;  // Alternate orientation
+                        orientations[tgt] = tgt_orient;
+                        orient_queue.push(tgt);
+                    }
+
+                    // Compute delta based on orientations
+                    long long qs, ts;
+                    if (s_orient) {
+                        qs = it->second.qry.size - it->second.qry.to;
+                    } else {
+                        qs = it->second.qry.from;
+                    }
+                    if (tgt_orient) {
+                        ts = it->second.tgt.size - it->second.tgt.to;
+                    } else {
+                        ts = it->second.tgt.from;
+                    }
+
+                    int delta = static_cast<int>(qs - ts);
+                    edges.push_back({src, tgt, delta, s_orient, tgt_orient});
+                }
+            }
+
+            // Build Laplacian matrix L and vector b
+            // L is the graph Laplacian: for each edge (q, t, d):
+            //   L[i,i] += 1, L[j,j] += 1, L[i,j] -= 1, L[j,i] -= 1
+            //   b[j] += d, b[i] -= d
+            Eigen::MatrixXd L = Eigen::MatrixXd::Zero(n, n);
+            Eigen::VectorXd b = Eigen::VectorXd::Zero(n);
+
+            for (const auto &e : edges) {
+                size_t i = idx[e.src];
+                size_t j = idx[e.tgt];
+                L(i, i) += 1.0;
+                L(j, j) += 1.0;
+                L(i, j) -= 1.0;
+                L(j, i) -= 1.0;
+                b(j) += e.delta;
+                b(i) -= e.delta;
+            }
+
+            // Pin the first node at position 0
+            L.row(0).setZero();
+            L(0, 0) = 1.0;
+            b(0) = 0.0;
+
+            // Solve L * x = b
+            Eigen::VectorXd x_vec = L.colPivHouseholderQr().solve(b);
+
+            // Extract positions
+            gtl::flat_hash_map<u64, double> x_positions;
+            for (size_t i = 0; i < n; ++i) {
+                x_positions[component[i]] = x_vec(i);
+            }
+
+            // Sort component by computed positions
+            std::sort(component.begin(), component.end(),
+                      [&x_positions](u64 a, u64 b) {
+                          return x_positions[a] < x_positions[b];
+                      });
+
+            // Build the layout map
+            layouts.emplace_back();
+            double min_pos = x_positions[component[0]];
+
+            for (u64 node_id : component) {
+                double pos = x_positions[node_id] - min_pos;
+                int start = static_cast<int>(std::round(pos));
+                int len = infer_len_for_node(node_id);
+                int end = to_end_inclusive(start, len);
+                bool orient = orientations.contains(node_id)
+                                  ? orientations[node_id]
+                                  : true;
+                layouts.back().emplace(node_id,
+                                       std::make_tuple(start, end, orient));
+            }
+        }
+        return layouts;
+    }
+
     auto add_lcmers(const gtl::vector<SequenceContainerType> &subseqs,
                     auto &node, dbg_index &dbgi, u64 &idx, int tid) {
         lps str = {0, 0, 0, 0};
@@ -1201,7 +1392,8 @@ struct assembler {
         }
         fprintf(stderr, "all:%d\ngood: %d nodes\nhits: %d\n", all_n.load(),
                 all_n.load() - bad.load(), hits.load());
-        auto layouts = connected_comp_plus_layout(reciprocal);
+        // auto layouts = connected_comp_plus_layout(reciprocal);
+        auto layouts = connected_comp_plus_layout_lstsq(reciprocal);
 #if 1
         int cc = 0;
         for (auto &l : layouts) {
