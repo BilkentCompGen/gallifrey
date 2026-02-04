@@ -1626,7 +1626,7 @@ struct assembler {
                 // can try to recover some edge sequence later.
                 single_node_print(layout);
             } else {
-                printf("LLLL: %llu\n", layout_no);
+                // printf("LLLL: %llu\n", layout_no);
                 // Find leftmost start and rightmost end on the layout.
                 gtl::vector<gtl::vector<SequenceContainerType>>
                     merged_seqs;  // per entry we get hte sequences. Even
@@ -1656,7 +1656,7 @@ struct assembler {
                     prev_anchor = find_anchors_and_extend_the_ctg_builder(
                         base, left_dbg_it->second.seq, right_dbg_it->second.seq,
                         prev_anchor, i % 2 == 0);
-                    fprintf(stderr, "Extending: %llu\n", layout_no);
+                    // fprintf(stderr, "Extending: %llu\n", layout_no);
                     // auto l_lr = build_lr_cores(left_dbg_it->second.seq,
                     //                            syncmer_functor, lcp_level);
                     // auto r_lr = build_lr_cores(dbg.find(right)->second.seq,
