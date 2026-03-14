@@ -99,7 +99,7 @@ struct asm_config {
     } threads;
     size_t seed = 1453;
     bool rle = true;
-    bool parallel_file_reading = false;
+    bool parallel_file_reading = true;
     syncmer_params syncmer;
     bool print_precleanup_graph = false;
     bool print_prelayout_graph = false;
