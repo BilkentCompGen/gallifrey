@@ -82,8 +82,6 @@ Graph cleaning:
 
 - `--iterations`: number of graph-cleaning passes
 - `--max-tip-length`: maximum tip length in cores
-- `--min-bubble-depth-difference-ratio`: bubble depth ratio threshold
-- `--min-bubble-length-difference`: bubble length difference threshold
 - `--open-simple-loops`: enable simple loop opening
 
 Output and debugging:
