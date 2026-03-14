@@ -45,7 +45,7 @@ include_directories(${HTS_INCLUDE_DIRS})
 link_directories(${HTS_LIBRARY_DIRS})
 add_definitions(${HTS_CFLAGS_OTHER})
 
-set(SOURCE_FILES lasm.cpp asm2.cpp stats.cpp lcmer.cpp sthist.cpp map.cpp layout/layout.cpp)
+set(SOURCE_FILES lasm.cpp asm2.cpp lcmer.cpp map.cpp dump_cores.cpp)
 include_directories(./ext)
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
@@ -83,17 +83,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(libbloom)
 
-FetchContent_Declare(
-    eigen
-    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
-    GIT_TAG 3.4.0
-    GIT_SHALLOW TRUE
-)
-FetchContent_MakeAvailable(eigen)
-
-
 # Link libraries
-target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue pthread deflate z Eigen3::Eigen)
+target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11
+                      concurrentqueue pthread deflate z
+                      $<$<PLATFORM_ID:Linux>:rt>)
 
 # Unit tests (doctest)
 # Lightweight DBG builder test tool (single-thread, no bloom/locks).
@@ -111,13 +104,12 @@ target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurre
 # target_link_libraries(light_dbg_build PRIVATE gtl CLI11::CLI11)
 # target_compile_definitions(light_dbg_build PRIVATE
 #     SYNCMER_RULE=DensitySyncmerRule
-#     LCMER_L=8
 # )
 
 # Tests and custom targets
 add_test(NAME test COMMAND lasm hifi ../tests/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8 --density 0.05)
-add_custom_target(rt COMMAND lasm hifi test/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8)
-add_dependencies(rt ${PROJECT_NAME})
+add_custom_target(rtest COMMAND lasm hifi test/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8)
+add_dependencies(rtest ${PROJECT_NAME})
 
 # Debug targets
 add_custom_target(debug
@@ -129,9 +121,10 @@ add_custom_target(debug
 
 # Compile definitions
 target_compile_definitions(${PROJECT_NAME} PUBLIC
+    __STDC_FORMAT_MACROS=1
     SYNCMER_RULE=DensitySyncmerRule
-    LCMER_L=8
 )
+
 
 
 # Debug-specific definitions

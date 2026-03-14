@@ -1,16 +1,26 @@
 #ifndef _GRAPH_H_
 #define _GRAPH_H_
 
+#include "gtl/btree.hpp"
 #define PREV_WITH_VEC
 #define HT_SHARD_BC 8
 
+#include <blockingconcurrentqueue.h>
+
+#include <atomic>
+#include <cassert>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <gtl/phmap.hpp>
 #include <gtl/vector.hpp>
+#include <limits>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
-#include <queue>
+#include <vector>
+#include <cinttypes>
 
 #include "asm.h"
 #include "bloomfilter.h"
@@ -48,7 +58,9 @@ consteval int_type nextpowerof2(int_type v) {
     return v;
 }
 
+
 using u64 = uint64_t;
+using i64 = int64_t;
 using u32 = uint32_t;
 using DefaultBF =
     bloom_interface<bloom_ext::BlockedLockedBloomFilter<0, std::mutex>>;
@@ -59,38 +71,46 @@ struct dbg_index_base {
         nextpowerof2((u64)MAXIMUM_WORK_THREADS);
     using mutex_type = std::mutex;
     struct bidbg_val {
-        bidbg_val(unsigned core_count)
-            : core_count(core_count), forward_edge_count(0), seq{}, prev{} {}
-        bidbg_val(unsigned core_count, u64 prev)
-            : core_count(core_count),
-              forward_edge_count(0),
-              seq{},
-              prev{prev} {}
+        struct counts_t {
+            unsigned core_count;
+            unsigned forward_edge_count;
+        };
 
-        unsigned core_count : 31l;
-        unsigned visited : 1;
-        unsigned forward_edge_count;
+        bidbg_val(unsigned core_count)
+            : redirected_flag(false), counts{core_count, 0}, seq{}, prev{} {}
+        bidbg_val(unsigned core_count, u64 prev)
+            : redirected_flag(false), counts{core_count, 0}, seq{}, prev{prev} {}
+
+        bool redirected_flag;
+        union {
+            counts_t counts;
+            u64 redirect_to;
+        };
 
         gtl::vector<SequenceContainerType> seq;
 
-        constexpr bool redirected() const { return seq.empty(); }
-#ifdef PREV_WITH_SET
-        gtl::flat_hash_set<u64> prev;
-        void emplace_prev(u64 val) { prev.emplace(val); }
-#else
-#ifdef PREV_WITH_VEC
+        bool redirected() const {
+            return redirected_flag || (prev.size() == 1 && prev[0] == 0);
+        }
+        void mark_redirected(u64 to) {
+            redirected_flag = true;
+            redirect_to = to;
+            gtl::vector<SequenceContainerType>().swap(seq);
+            gtl::vector<u64>().swap(prev);
+            prev.push_back(0);  // 0 is an illegal node id; marks redirected.
+        }
 
         gtl::vector<u64> prev;
         void emplace_prev(u64 val) {
+            if (val == 0) return;
             auto it = std::find(prev.begin(), prev.end(), val);
             if (it == prev.end()) {
                 prev.push_back(val);
             }
         }
-#endif
-#endif
+
         constexpr double avg_core_count() const {
-            return (double)core_count / seq.size();
+            return (double)counts.core_count / seq.size();
         }
     };
     using dbg_map_t = gtl::parallel_flat_hash_map<
@@ -108,15 +128,9 @@ struct dbg_index_base {
         // lci_type(u64 _id, u64 _pos) : id(_id), pos(_pos) {}
         // lci_type(u64 _id) : id(_id), pos(-1) {}
     };
-    using lcmer_index_t = gtl::parallel_flat_hash_map<
-        lcmer<LCMER_L>, lci_type, std::hash<lcmer<LCMER_L>>,
-        gtl::priv::hash_default_eq<lcmer<LCMER_L>>,
-        std::allocator<std::pair<const lcmer<LCMER_L>, lci_type>>, HT_SHARD_BC,
-        mutex_type>;
 
     dbg_map_t dbg;
-    lcmer_index_t lci;
-    gtl::flat_hash_set<u64> active_set;
+    gtl::btree_set<u64> active_set;
 
     // merge_info_map_t merge_map;
     BloomFilterType bf;
@@ -126,14 +140,29 @@ struct dbg_index_base {
         : bf{false_positive_rate, projected_count, seed} {}
 
     // dbg_index(const dbg_index &other)
-    lci_type get(const lcmer<LCMER_L> &l) const {
-        auto it = lci.find(l);
-        return it == lci.end() ? lci_type::empty() : it->second;
-        // if (lci.contains(l)) {
-        //     return lci.at(l);
-        // }
-        // // lci.if_contains(l,[&ret](const lcmer_index_t::value_type &v){ ret
-        // = v.second;}); return 0;
+    static constexpr u64 lcmer_id(const LCmer &l) { return l.value(); }
+
+    lci_type get(const LCmer &l) const {
+        u64 id = lcmer_id(l);
+        gtl::LockableBaseImpl<gtl::NullMutex>::DoNothing no_lock;
+        auto &dbg_nc = const_cast<dbg_map_t &>(dbg);
+        auto h = dbg_nc.hash(id);
+        auto it = dbg_nc.find(id, h, no_lock);
+        if (it == dbg_nc.end()) {
+            return lci_type::empty();
+        }
+        for (int hop = 0;
+             hop < 128 && it != dbg_nc.end() && it->second.redirected();
+             ++hop) {
+            const u64 next = it->second.redirect_to;
+            if (next == 0 || next == id) {
+                return lci_type::empty();
+            }
+            id = next;
+            h = dbg_nc.hash(id);
+            it = dbg_nc.find(id, h, no_lock);
+        }
+        return it == dbg_nc.end() ? lci_type::empty() : lci_type{id};
     }
     void count_forward_edges() {
         for (auto &node : dbg) {
@@ -142,7 +171,7 @@ struct dbg_index_base {
                 if (it == dbg.end()) {
                     continue;
                 }
-                it->second.forward_edge_count++;
+                it->second.counts.forward_edge_count++;
             }
         }
     }
@@ -158,20 +187,20 @@ struct dbg_index_base {
     //         if (current == dbg.end()) {
     //             return false;
     //         }
-    //         unsigned first_fec = current->second.forward_edge_count;
+    //         unsigned first_fec = current->second.counts.forward_edge_count;
     //         bool simplified = false;
     //         auto prev_it = dbg.find(current->second.prev[0]);
     //         gtl::vector<bidbg_val *> merged;
     //         unsigned cc_sum = 0;
     //         while (prev_it != dbg.end() && current->second.prev.size() == 1
     //         &&
-    //                prev_it->second.forward_edge_count == 1) {
+    //                prev_it->second.counts.forward_edge_count == 1) {
     //             if (prev_it != dbg.end()) {
     //                 // for (auto it = current->second.seq.begin();
     //                 //      it != current->second.seq.end(); ++it) {
     //                 merged.emplace_back(&current->second);
     //                 // }
-    //                 cc_sum += current->second.core_count;
+    //                 cc_sum += current->second.counts.core_count;
     //                 // dbg.erase(current->first);
     //                 simplified = true;
     //             } else {  // Prev is erased
@@ -187,8 +216,8 @@ struct dbg_index_base {
     //             redirect_deleted[id] = current->first;
     //         }
 
-    //         current->second.forward_edge_count = first_fec;
-    //         current->second.core_count += cc_sum;
+    //         current->second.counts.forward_edge_count = first_fec;
+    //         current->second.counts.core_count += cc_sum;
     //         for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
     //             for (auto &&node : (*it)->seq) {
     //                 current->second.seq.emplace_back(std::move(node));
@@ -214,7 +243,7 @@ struct dbg_index_base {
     //                 // dn.second.id = lci_type::max_id;
     //             }
     //             // Simple paths
-    //             if ((current->second.forward_edge_count != 1 &&
+    //             if ((current->second.counts.forward_edge_count != 1 &&
     //                  current->second.prev.size() == 1)) {
     //                 try_simplify_simple_path(dn.second.id, current);
     //             } else if (current->second.prev.size() > 1) {
@@ -246,7 +275,7 @@ struct dbg_index_base {
     //                 if (it != redirect_deleted.end()) {
     //                     p = it->second;
     //                 } else if (p == node.first) {  // Self edge
-    //                     node.second.forward_edge_count--;
+    //                     node.second.counts.forward_edge_count--;
     //                     self_idx = idx;
     //                 }
     //                 ++idx;
@@ -266,14 +295,15 @@ struct dbg_index_base {
     //             }
     //             if (current->second.avg_core_count() < min_core_depth) {
     //                 // Forlorn
-    //                 if (current->second.forward_edge_count == 0 &&
+    //                 if (current->second.counts.forward_edge_count == 0 &&
     //                     current->second.prev.size() == 0) {
     //                     dbg.erase(current);
-    //                 } else if (current->second.forward_edge_count == 0 &&
+    //                 } else if (current->second.counts.forward_edge_count == 0
+    //                 &&
     //                            current->second.prev.size() == 1) {
     //                     auto prev_it = dbg.find(current->second.prev[0]);
     //                     if (prev_it != dbg.end()) {
-    //                         prev_it->second.forward_edge_count--;
+    //                         prev_it->second.counts.forward_edge_count--;
     //                     }
     //                     dbg.erase(current);
     //                 }
@@ -288,9 +318,9 @@ struct dbg_index_base {
     //                         if (prev_it->second.avg_core_count() <
     //                                 min_core_depth &&
     //                             prev_it->second.prev.size() == 0 &&
-    //                             prev_it->second.forward_edge_count == 1) {
-    //                             dbg.erase(prev_it);
-    //                             pid = std::numeric_limits<u64>::max();
+    //                             prev_it->second.counts.forward_edge_count ==
+    //                             1) { dbg.erase(prev_it); pid =
+    //                             std::numeric_limits<u64>::max();
     //                         }
     //                     }
     //                 }
@@ -311,9 +341,9 @@ struct dbg_index_base {
     //                             && current->second.seq.size() >
     //                                 2 * max_tip_length &&
     //                             prev_it->second.prev.size() == 0 &&
-    //                             prev_it->second.forward_edge_count == 1) {
-    //                             dbg.erase(prev_it);
-    //                             pid = std::numeric_limits<u64>::max();
+    //                             prev_it->second.counts.forward_edge_count ==
+    //                             1) { dbg.erase(prev_it); pid =
+    //                             std::numeric_limits<u64>::max();
     //                         }
     //                     }
     //                 }
@@ -430,7 +460,7 @@ struct dbg_index_base {
     //                                     current->second.prev.begin()));
     //                                 auto nn = dbg.find(p1->second.prev[0]);
     //                                 if (nn != dbg.end()) {
-    //                                     nn->second.forward_edge_count--;
+    //                                     nn->second.counts.forward_edge_count--;
     //                                 }
     //                             } else if (p1->second.avg_core_count() /
     //                                            p2->second.avg_core_count() <
@@ -444,7 +474,7 @@ struct dbg_index_base {
 
     //                                 auto nn = dbg.find(p2->second.prev[0]);
     //                                 if (nn != dbg.end()) {
-    //                                     nn->second.forward_edge_count--;
+    //                                     nn->second.counts.forward_edge_count--;
     //                                 }
     //                             }
     //                         }
@@ -460,10 +490,10 @@ struct dbg_index_base {
     //             }
     //             if (current->second.avg_core_count() < 2 &&
     //                 current->second.prev.size() == 1 &&
-    //                 current->second.forward_edge_count == 1) {
+    //                 current->second.counts.forward_edge_count == 1) {
     //                 auto prev_it = dbg.find(current->second.prev[0]);
     //                 if (prev_it != dbg.end())
-    //                     prev_it->second.forward_edge_count--;
+    //                     prev_it->second.counts.forward_edge_count--;
     //                 dbg.erase(current);
     //             }
     //         }
@@ -474,7 +504,7 @@ struct dbg_index_base {
     //             if (current == dbg.end()) {
     //                 continue;
     //             }
-    //             if (current->second.forward_edge_count == 1 &&
+    //             if (current->second.counts.forward_edge_count == 1 &&
     //                 current->second.prev.size() == 1) {
     //                 auto prev_it = dbg.find(current->second.prev[0]);
     //                 if (prev_it != dbg.end()) {
@@ -483,10 +513,10 @@ struct dbg_index_base {
     //                          ++pp) {
     //                         if (*pp == dn.second.id) {  // Loop here
     //                             *pp = std::numeric_limits<u64>::max();
-    //                             if (current->second.core_count >=
+    //                             if (current->second.counts.core_count >=
     //                                 2 * prev_it->second
-    //                                         .core_count) {  // TODO: this is
-    //                                         not
+    //                                         .counts.core_count) {  // TODO:
+    //                                         this is not
     //                                                         // right.
     //                                 // Need to duplicate the
     //                                 // sequence
@@ -498,7 +528,7 @@ struct dbg_index_base {
     //                                 }
     //                             }
 
-    //                             prev_it->second.forward_edge_count--;
+    //                             prev_it->second.counts.forward_edge_count--;
     //                             dbg.erase(current);
     //                         }
     //                     }
@@ -548,32 +578,24 @@ struct dbg_index_base {
     //     //     }
     //     // }
     // }
-    u64 emplace_nobloomfilter(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
-        auto vv = lci.try_emplace(l, idx | tid);
-        if (vv.second) {  // Means new item on the table
-            idx += lcindex_increment;
-            // threadcount.
-        }
-        return vv.first->second.id;
+    u64 emplace_nobloomfilter(const LCmer &l, u64 &idx, int tid) {
+        (void)idx;
+        (void)tid;
+        return lcmer_id(l);
     }
-    u64 emplace(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
-        auto new_hash = lci.hash(l);
+    u64 emplace(const LCmer &l, u64 &idx, int tid) {
+        (void)idx;
+        (void)tid;
+        const auto new_hash = std::hash<LCmer>{}(l);
         if (!bf.contains(new_hash)) {
             bf.insert(new_hash);
             return 0;
         }
-        auto vv = lci.try_emplace_with_hash(new_hash, l, idx | tid);
-        if (vv.second) {  // Means new item on the table
-            idx += lcindex_increment;
-            // threadcount.
-        }
-        return vv.first->second.id;
+        return lcmer_id(l);
     }
-    gtl::vector<u64> shortest_path_bfs(u64 source,
-                                           u64 target) const {
+    gtl::vector<u64> shortest_path_bfs(u64 source, u64 target) const {
         if (source == target) return gtl::vector<u64>{source};
         if (source == 0 || target == 0) return {};
-
 
         std::queue<u64> q;
         gtl::flat_hash_map<u64, u64> parent;
@@ -586,9 +608,8 @@ struct dbg_index_base {
             const u64 cur = q.front();
             q.pop();
 
-
             auto it = dbg.find(cur);
-            if(it == dbg.end()){
+            if (it == dbg.end()) {
                 continue;
             }
             for (u64 nb : it->second.prev) {
@@ -618,7 +639,6 @@ struct dbg_index_base {
         }
         return {};
     }
-
 };
 
 using dbg_index = dbg_index_base<DefaultBF>;
@@ -636,8 +656,204 @@ struct GraphCleaning {
     using bidbg_val = dbg_index::bidbg_val;
     using lci_type = dbg_index::lci_type;
     using dbg_map_t = dbg_index::dbg_map_t;
-    using lcmer_index_t = dbg_index::lcmer_index_t;
     using redir_map = gtl::parallel_flat_hash_map_d<u64, u64, 4, std::mutex>;
+    struct avg_core_count_stats {
+        double baseline = 0.0;
+    };
+    static double median_of_sorted(const gtl::vector<double> &vals) {
+        if (vals.empty()) return 0.0;
+        const size_t mid = vals.size() / 2;
+        if (vals.size() % 2 == 1) return vals[mid];
+        return (vals[mid - 1] + vals[mid]) / 2.0;
+    }
+
+    static avg_core_count_stats collect_active_avg_core_count_stats(
+        const dbg_map_t &dbg, const gtl::btree_set<u64> &active_set) {
+        avg_core_count_stats stats;
+        constexpr size_t kMinDepthSample = 16;
+        struct depth_len_sample {
+            double depth;
+            size_t len_proxy;
+            bool topology_stable;
+        };
+        gtl::vector<depth_len_sample> samples;
+        samples.reserve(active_set.size());
+        gtl::vector<size_t> lengths;
+        lengths.reserve(active_set.size());
+
+        for (u64 node : active_set) {
+            auto it = dbg.find(node);
+            if (it == dbg.end() || it->second.redirected()) continue;
+            if (it->second.seq.empty()) continue;
+            const double d = it->second.avg_core_count();
+            if (d <= 0.0) continue;
+
+            const size_t len_proxy = it->second.seq.size();
+            const bool topology_stable =
+                (it->second.prev.size() <= 1 &&
+                 it->second.counts.forward_edge_count <= 1);
+            samples.push_back({d, len_proxy, topology_stable});
+            lengths.push_back(len_proxy);
+        }
+        if (samples.empty()) return stats;
+
+        std::sort(lengths.begin(), lengths.end());
+        const size_t len_q75 = lengths[(lengths.size() - 1) * 3 / 4];
+
+        auto collect_depths = [&](auto pred) {
+            gtl::vector<double> out;
+            out.reserve(samples.size());
+            for (const auto &s : samples) {
+                if (pred(s)) out.push_back(s.depth);
+            }
+            return out;
+        };
+
+        gtl::vector<double> depths = collect_depths([&](const auto &s) {
+            return s.topology_stable && s.len_proxy >= len_q75;
+        });
+        if (depths.size() < kMinDepthSample) {
+            depths = collect_depths(
+                [&](const auto &s) { return s.len_proxy >= len_q75; });
+        }
+        if (depths.size() < kMinDepthSample) {
+            depths = collect_depths([](const auto &) { return true; });
+        }
+
+        std::sort(depths.begin(), depths.end());
+        const auto qidx = [n = depths.size()](double q) -> size_t {
+            const size_t idx =
+                static_cast<size_t>(q * static_cast<double>(n - 1));
+            return std::min(idx, n - 1);
+        };
+        const double raw_q1 = depths[qidx(0.25)];
+        const double raw_q3 = depths[qidx(0.75)];
+        const double iqr = raw_q3 - raw_q1;
+        const double lower = raw_q1 - 1.5 * iqr;
+        const double upper = raw_q3 + 1.5 * iqr;
+
+        gtl::vector<double> filtered;
+        filtered.reserve(depths.size());
+        for (double d : depths) {
+            if (d >= lower && d <= upper) filtered.push_back(d);
+        }
+        const auto &pool = filtered.empty() ? depths : filtered;
+        stats.baseline = median_of_sorted(pool);
+        return stats;
+    }
+    static void dump_initial_clean_contig_stats(
+        const dbg_map_t &dbg, const gtl::btree_set<u64> &active_set,
+        const std::string &out_tsv_path) {
+        FILE *out = std::fopen(out_tsv_path.c_str(), "w");
+        if (out == nullptr) {
+            std::fprintf(stderr,
+                         "WARN: failed to write initial clean contig stats to "
+                         "%s\n",
+                         out_tsv_path.c_str());
+            return;
+        }
+        std::fprintf(out, "contig_id\tcontig_len_proxy\tavg_core_count\n");
+        for (u64 node_id : active_set) {
+            auto it = dbg.find(node_id);
+            if (it == dbg.end()) continue;
+            const auto &node = it->second;
+            if (node.redirected() || node.seq.empty()) continue;
+            const size_t len_proxy = node.seq.size();
+            const double avg_cc = node.avg_core_count();
+            std::fprintf(out, "%" PRIu64 "\t%zu\t%.6f\n", node_id, len_proxy,
+                         avg_cc);
+        }
+        std::fclose(out);
+    }
+
+    struct loop_copy_estimate {
+        double base_cn = 1.0;
+        int base_cn_rounded = 1;
+        int other_cn_rounded = 1;
+        double global_ref_depth = 0.0;
+        double raw_loop_cn = 1.0;
+        double raw_curr_cn = 2.0;
+        int loop_cn_rounded = 1;
+        int curr_cn_rounded = 2;
+        int loop_turns = 1;
+        double turn_event_gain = 0.0;
+        double turn_event_threshold = 0.0;
+        int turn_forced_single = 0;
+        double score = std::numeric_limits<double>::infinity();
+    };
+
+    static loop_copy_estimate infer_loop_copy_numbers(
+        double other_in_depth, double loop_depth, double curr_depth,
+        const avg_core_count_stats &depth_stats) {
+        assert(depth_stats.baseline > 0.0);
+        constexpr int kMaxSearchTurns = 64;
+        constexpr int kMaxSearchBaseCn = 64;
+        constexpr double kBaseCnPriorWeight = 0.35;
+        constexpr double kTurnGainBaseThreshold = 0.25;
+
+        const double baseline = depth_stats.baseline;
+        const double other_base_cn = std::max(1.0, other_in_depth / baseline);
+
+        loop_copy_estimate est;
+        est.global_ref_depth = baseline;
+        est.base_cn = other_base_cn;
+        est.base_cn_rounded =
+            std::max(1, static_cast<int>(std::llround(est.base_cn)));
+        est.other_cn_rounded = est.base_cn_rounded;
+        est.raw_loop_cn = loop_depth / baseline;
+        est.raw_curr_cn = curr_depth / baseline;
+        est.loop_cn_rounded =
+            std::max(1, static_cast<int>(std::llround(est.raw_loop_cn)));
+        est.curr_cn_rounded =
+            std::max(1, static_cast<int>(std::llround(est.raw_curr_cn)));
+
+        double best_err = std::numeric_limits<double>::infinity();
+        int best_t = 1;
+        int best_b = est.base_cn_rounded;
+        double best_err_t1 = std::numeric_limits<double>::infinity();
+        int best_b_t1 = est.base_cn_rounded;
+        const auto fit_err = [&](int b, int t) {
+            const double exp_loop = static_cast<double>(t * b);
+            const double exp_curr = static_cast<double>((t + 1) * b);
+            return std::abs(est.raw_loop_cn - exp_loop) +
+                   std::abs(est.raw_curr_cn - exp_curr) +
+                   kBaseCnPriorWeight *
+                       std::abs(est.base_cn - static_cast<double>(b));
+        };
+        for (int b = 1; b <= kMaxSearchBaseCn; ++b) {
+            for (int t = 1; t <= kMaxSearchTurns; ++t) {
+                const double err = fit_err(b, t);
+                if (err < best_err ||
+                    (err == best_err &&
+                     (t < best_t || (t == best_t && b < best_b)))) {
+                    best_err = err;
+                    best_t = t;
+                    best_b = b;
+                }
+                if (t == 1 && err < best_err_t1) {
+                    best_err_t1 = err;
+                    best_b_t1 = b;
+                }
+            }
+        }
+        const double turn_gain = best_err_t1 - best_err;
+        const double turn_threshold =
+            kTurnGainBaseThreshold * static_cast<double>(est.other_cn_rounded);
+        if (best_t > 1 && turn_gain < turn_threshold) {
+            best_t = 1;
+            best_b = best_b_t1;
+            best_err = best_err_t1;
+            est.turn_forced_single = 1;
+        }
+
+        est.base_cn_rounded = best_b;
+        est.loop_turns = best_t;
+        est.turn_event_gain = turn_gain;
+        est.turn_event_threshold = turn_threshold;
+        est.score = best_err;
+        return est;
+    }
+
     static auto attempt_simplify_one_path(dbg_map_t &dbg,
                                           redir_map &redirect_deleted, u64 id,
                                           auto starting_from, auto &to_delete)
@@ -650,15 +866,15 @@ struct GraphCleaning {
         if (current == dbg.end()) {
             return false;
         }
-        unsigned first_fec = current->second.forward_edge_count;
+        unsigned first_fec = current->second.counts.forward_edge_count;
         bool simplified = false;
         auto prev_it = dbg.find(current->second.prev[0]);
         gtl::vector<dbg_map_t::iterator> merged;
         unsigned cc_sum = 0;
         while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
-               prev_it->second.forward_edge_count == 1) {
+               prev_it->second.counts.forward_edge_count == 1) {
             if (prev_it != dbg.end()) {
-                cc_sum += current->second.core_count;
+                cc_sum += current->second.counts.core_count;
                 merged.push_back(current);
 
                 simplified = true;
@@ -675,8 +891,8 @@ struct GraphCleaning {
             redirect_deleted[id] = current->first;
         }
 
-        current->second.forward_edge_count = first_fec;
-        current->second.core_count += cc_sum;
+        current->second.counts.forward_edge_count = first_fec;
+        current->second.counts.core_count += cc_sum;
         for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
             // for (auto &seq : (*it)->second.seq)
             gtl::vector<SequenceContainerType> &seqs = (*it)->second.seq;
@@ -686,6 +902,7 @@ struct GraphCleaning {
                 current->second.seq.emplace_back(std::move(*sit));
             }
             seqs.clear();
+            (*it)->second.mark_redirected(current->first);
 
             to_delete.emplace((*it)->first, current->first);
         }
@@ -706,16 +923,16 @@ struct GraphCleaning {
         if (current == dbg.end()) {
             return false;
         }
-        unsigned first_fec = current->second.forward_edge_count;
+        unsigned first_fec = current->second.counts.forward_edge_count;
         bool simplified = false;
         auto prev_hash = dbg.hash(current->second.prev[0]);
         auto prev_it = dbg.find(current->second.prev[0], prev_hash, no_lock);
         gtl::vector<dbg_map_t::iterator> merged;
         unsigned cc_sum = 0;
         while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
-               prev_it->second.forward_edge_count == 1) {
+               prev_it->second.counts.forward_edge_count == 1) {
             if (prev_it != dbg.end()) {
-                cc_sum += current->second.core_count;
+                cc_sum += current->second.counts.core_count;
                 merged.push_back(current);
 
                 simplified = true;
@@ -733,8 +950,8 @@ struct GraphCleaning {
             redirect_deleted[id] = current->first;
         }
 
-        current->second.forward_edge_count = first_fec;
-        current->second.core_count += cc_sum;
+        current->second.counts.forward_edge_count = first_fec;
+        current->second.counts.core_count += cc_sum;
         for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
             // for (auto &seq : (*it)->second.seq)
             gtl::vector<SequenceContainerType> &seqs = (*it)->second.seq;
@@ -744,6 +961,7 @@ struct GraphCleaning {
                 current->second.seq.emplace_back(std::move(*sit));
             }
             seqs.clear();
+            (*it)->second.mark_redirected(current->first);
 
             to_delete.emplace((*it)->first, current->first);
         }
@@ -799,7 +1017,7 @@ struct GraphCleaning {
             [&to_simplify_from, &no_lock, &dbg](
                 int tid, const dbg_index::dbg_map_t::value_type &item) {
                 // printf("TTTT:%d\n", tid);
-                if (item.second.forward_edge_count != 1 &&
+                if (item.second.counts.forward_edge_count != 1 &&
                     item.second.prev.size() == 1) {
                     auto ih = dbg.hash(item.first);
                     auto iit = dbg.find(item.first, ih, no_lock);
@@ -824,7 +1042,7 @@ struct GraphCleaning {
         //             &dbg](const dbg_index::dbg_map_t::EmbeddedSet &set) {
         //             for (auto it = set.begin(); it != set.end(); ++it) {
         //                 // for (const auto &p : set) {
-        //                 if (it->second.forward_edge_count != 1 &&
+        //                 if (it->second.counts.forward_edge_count != 1 &&
         //                     it->second.prev.size() == 1) {
         //                     auto ih = dbg.hash(it->first);
         //                     auto iit = dbg.find(it->first, ih, no_lock);
@@ -848,7 +1066,7 @@ struct GraphCleaning {
         return to_simplify_from;
     }
     static void simplify_simple_parallel_sweep(
-        dbg_index::dbg_map_t &dbg, dbg_index::lcmer_index_t &lci,
+        dbg_index::dbg_map_t &dbg,
         const gtl::vector<
             gtl::vector<std::pair<u64, dbg_index::dbg_map_t::iterator>>>
             &to_simplify,
@@ -872,15 +1090,6 @@ struct GraphCleaning {
                         attempt_simplify_one_path_lockless(
                             dbg, redirect_deleted, node, it, to_delete);
                     }
-                    for (auto &node : lci) {
-                        auto it = to_delete.find(node.second.id);
-                        if (it != to_delete.end()) {
-                            if (it->second != 0) {
-                                node.second.id =
-                                    it->second;  // Redirect to new node
-                            }
-                        }
-                    }
                     std::lock_guard lock(del_mutex);
                     for (const auto &[del, to] : to_delete) {
                         active_set.erase(del);
@@ -901,7 +1110,7 @@ struct GraphCleaning {
                     p = it->second;
                 } else if (p == node.first) {  // Self edge // TODO: reconsider
                                                // how this is done
-                    // node.second.forward_edge_count--;
+                    // node.second.counts.forward_edge_count--;
                     // self_idx = idx;
                 }
             }
@@ -911,7 +1120,6 @@ struct GraphCleaning {
         }
     }
     static void simplify_simple_paths(dbg_index::dbg_map_t &dbg,
-                                      dbg_index::lcmer_index_t &lci,
                                       redir_map &redirect_deleted,
                                       auto &active_set) {
         // TODO Parallel idea
@@ -932,11 +1140,13 @@ struct GraphCleaning {
             }
 
             // Simple paths
-            if ((current->second.forward_edge_count != 1 &&
+            if ((current->second.counts.forward_edge_count != 1 &&
                  current->second.prev.size() == 1)) {
                 attempt_simplify_one_path_lockless(dbg, redirect_deleted, node,
                                                    current, to_delete);
             } else if (current->second.prev.size() > 1) {
+                std::sort(current->second.prev.begin(),
+                          current->second.prev.end());
                 for (auto &prev_id : current->second.prev) {
                     auto prev_it = dbg.find(prev_id);
                     if (prev_it != dbg.end() &&
@@ -944,15 +1154,6 @@ struct GraphCleaning {
                         attempt_simplify_one_path_lockless(
                             dbg, redirect_deleted, prev_id, prev_it, to_delete);
                     }
-                }
-            }
-        }
-
-        for (auto &node : lci) {
-            auto it = to_delete.find(node.second.id);
-            if (it != to_delete.end()) {
-                if (it->second != 0) {
-                    node.second.id = it->second;  // Redirect to new node
                 }
             }
         }
@@ -968,7 +1169,7 @@ struct GraphCleaning {
                     p = it->second;
                 } else if (p == node.first) {  // Self edge // TODO: reconsider
                                                // how this is done
-                    // node.second.forward_edge_count--;
+                    // node.second.counts.forward_edge_count--;
                     // self_idx = idx;
                 }
             }
@@ -977,9 +1178,91 @@ struct GraphCleaning {
             }
         }
     }
-    static void cut_tips(dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
-                         int min_core_depth, size_t max_tip_length,
-                         auto &active_set) {
+    // static void cut_tips(dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
+    //                      int min_core_depth, size_t max_tip_length,
+    //                      auto &active_set) {
+    //     for (u64 node : active_set) {
+    //         auto current = dbg.find(node);
+    //         if (current == dbg.end() || current->second.redirected()) {
+    //             continue;
+    //         }
+    //         if (current->second.avg_core_count() < min_core_depth) {
+    //             // Remove forlorn low coverage nodes
+    //             if (current->second.counts.forward_edge_count == 0 &&
+    //                 current->second.prev.size() == 0) {
+    //                 dbg.erase(current);
+    //             } else if (current->second.counts.forward_edge_count == 0 &&
+    //                        current->second.prev.size() == 1) {
+    //                 // auto prev_it = dbg.find(current->second.prev[0]);
+    //                 // if (prev_it != dbg.end() ||
+    //                 prev_it->second.redirected())
+    //                 // {
+    //                 //     prev_it->second.counts.forward_edge_count--;
+    //                 // }
+    //                 // dbg.erase(current);  // MARK
+    //             }
+    //         } else {
+    //             for (u64 &pid : current->second.prev) {
+    //                 auto prev_it = dbg.find(pid);
+    //                 if (prev_it != dbg.end() || prev_it->second.redirected())
+    //                 {
+    //                     if (prev_it->second.avg_core_count() < min_core_depth
+    //                     &&
+    //                         prev_it->second.prev.size() == 0 &&
+    //                         prev_it->second.counts.forward_edge_count == 1) {
+    //                         dbg.erase(prev_it);  // MARK
+    //                         pid = std::numeric_limits<u64>::max();
+    //                     }
+    //                 }
+    //             }
+    //             auto &pvec = current->second.prev;
+    //             pvec.erase(
+    //                 std::remove_if(pvec.begin(), pvec.end(),
+    //                                [](u64 val) {
+    //                                    return val ==
+    //                                           std::numeric_limits<u64>::max();
+    //                                }),
+    //                 pvec.end());
+    //             for (u64 &pid : current->second.prev) {
+    //                 auto prev_it = dbg.find(pid);
+    //                 if (prev_it != dbg.end() || prev_it->second.redirected())
+    //                 {
+    //                     if (prev_it->second.avg_core_count()
+    //                             current->second.avg_core_count() &&
+    //                         prev_it->second.seq.size() < max_tip_length &&
+    //                         current->second.seq.size() > 2 * max_tip_length
+    //                         && prev_it->second.prev.size() == 0 &&
+    //                         prev_it->second.counts.forward_edge_count == 1) {
+    //                         dbg.erase(prev_it);  // MARK
+    //                         pid = std::numeric_limits<u64>::max();
+    //                     }
+    //                 }
+    //             }
+    //             pvec.erase(
+    //                 std::remove_if(pvec.begin(), pvec.end(),
+    //                                [](u64 val) {
+    //                                    return val ==
+    //                                           std::numeric_limits<u64>::max();
+    //                                }),
+    //                 pvec.end());
+    //         }
+    //     }
+    // }
+
+    static void cut_tips(dbg_map_t &dbg, int min_core_depth,
+                         size_t max_tip_length, auto &active_set) {
+        const auto prune_prev = [&dbg](auto current) {
+            auto &pvec = current->second.prev;
+            pvec.erase(std::remove_if(pvec.begin(), pvec.end(),
+                                      [&dbg](u64 pid) {
+                                          auto it = dbg.find(pid);
+                                          return it == dbg.end() ||
+                                                 it->second.redirected();
+                                      }),
+                       pvec.end());
+            std::sort(pvec.begin(), pvec.end());
+        };
+
         // for (auto &dn : lci) {
         for (u64 node : active_set) {
             auto current = dbg.find(node);
@@ -991,14 +1274,14 @@ struct GraphCleaning {
             }
             if (current->second.avg_core_count() < min_core_depth) {
                 // Forlorn
-                if (current->second.forward_edge_count == 0 &&
+                if (current->second.counts.forward_edge_count == 0 &&
                     current->second.prev.size() == 0) {
                     dbg.erase(current);  // MARK
-                } else if (current->second.forward_edge_count == 0 &&
+                } else if (current->second.counts.forward_edge_count == 0 &&
                            current->second.prev.size() == 1) {
                     auto prev_it = dbg.find(current->second.prev[0]);
-                    if (prev_it != dbg.end() || prev_it->second.redirected()) {
-                        prev_it->second.forward_edge_count--;
+                    if (prev_it != dbg.end() && !prev_it->second.redirected()) {
+                        prev_it->second.counts.forward_edge_count--;
                     }
                     dbg.erase(current);  // MARK
                 }
@@ -1007,54 +1290,55 @@ struct GraphCleaning {
                 //     dbg.erase(current);
                 // }
             } else {
-                for (u64 &pid : current->second.prev) {
+                gtl::vector<u64> prev_ids(current->second.prev.begin(),
+                                          current->second.prev.end());
+                std::sort(prev_ids.begin(), prev_ids.end());
+                for (u64 pid : prev_ids) {
                     auto prev_it = dbg.find(pid);
-                    if (prev_it != dbg.end() || prev_it->second.redirected()) {
+                    if (prev_it != dbg.end() && !prev_it->second.redirected()) {
                         if (prev_it->second.avg_core_count() < min_core_depth &&
                             prev_it->second.prev.size() == 0 &&
-                            prev_it->second.forward_edge_count == 1) {
+                            prev_it->second.counts.forward_edge_count == 1) {
                             dbg.erase(prev_it);  // MARK
-                            pid = std::numeric_limits<u64>::max();
                         }
                     }
                 }
-                auto &pvec = current->second.prev;
-                pvec.erase(
-                    std::remove_if(pvec.begin(), pvec.end(),
-                                   [](u64 val) {
-                                       return val ==
-                                              std::numeric_limits<u64>::max();
-                                   }),
-                    pvec.end());
-                for (u64 &pid : current->second.prev) {
+
+                current = dbg.find(node);
+                if (current == dbg.end() || current->second.redirected()) {
+                    continue;
+                }
+                prune_prev(current);
+
+                prev_ids.assign(current->second.prev.begin(),
+                                current->second.prev.end());
+                for (u64 pid : prev_ids) {
                     auto prev_it = dbg.find(pid);
-                    if (prev_it != dbg.end() || prev_it->second.redirected()) {
+                    if (prev_it != dbg.end() && !prev_it->second.redirected()) {
                         if (prev_it->second.avg_core_count() <
                                 current->second.avg_core_count() &&
                             prev_it->second.seq.size() < max_tip_length &&
                             current->second.seq.size() > 2 * max_tip_length &&
                             prev_it->second.prev.size() == 0 &&
-                            prev_it->second.forward_edge_count == 1) {
+                            prev_it->second.counts.forward_edge_count == 1) {
                             dbg.erase(prev_it);  // MARK
-                            pid = std::numeric_limits<u64>::max();
                         }
                     }
                 }
-                pvec.erase(
-                    std::remove_if(pvec.begin(), pvec.end(),
-                                   [](u64 val) {
-                                       return val ==
-                                              std::numeric_limits<u64>::max();
-                                   }),
-                    pvec.end());
+
+                current = dbg.find(node);
+                if (current == dbg.end() || current->second.redirected()) {
+                    continue;
+                }
+                prune_prev(current);
             }
         }
     }
 
     // Bubble depth delta calculation
     ///
-    static void pop_bubbles(dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
-                            double bubble_depth_epsilon, auto &active_set) {
+    static void pop_bubbles(dbg_map_t &dbg, double bubble_depth_epsilon,
+                            auto &active_set) {
         for (u64 node : active_set) {
             auto current = dbg.find(node);
             if (current == dbg.end() || current->second.redirected()) {
@@ -1081,7 +1365,7 @@ struct GraphCleaning {
                                 auto nn = dbg.find(p1->second.prev[0]);
                                 if (nn != dbg.end() &&
                                     !nn->second.redirected()) {
-                                    nn->second.forward_edge_count--;
+                                    nn->second.counts.forward_edge_count--;
                                 }
                             } else if (p1->second.avg_core_count() /
                                            p2->second.avg_core_count() <
@@ -1096,7 +1380,7 @@ struct GraphCleaning {
                                 auto nn = dbg.find(p2->second.prev[0]);
                                 if (nn != dbg.end() &&
                                     !nn->second.redirected()) {
-                                    nn->second.forward_edge_count--;
+                                    nn->second.counts.forward_edge_count--;
                                 }
                             }
                         }
@@ -1105,9 +1389,7 @@ struct GraphCleaning {
             }
         }
     }
-    static void cut_low_support_edges(dbg_map_t &dbg,
-                                      [[maybe_unused]] lcmer_index_t &lci,
-                                      auto &active_set) {
+    static void cut_low_support_edges(dbg_map_t &dbg, auto &active_set) {
         // Death by thousand cuts
         for (auto &node : active_set) {
             auto current = dbg.find(node);
@@ -1116,52 +1398,138 @@ struct GraphCleaning {
             }
             if (current->second.avg_core_count() < 2 &&
                 current->second.prev.size() == 1 &&
-                current->second.forward_edge_count == 1) {
+                current->second.counts.forward_edge_count == 1) {
                 auto prev_it = dbg.find(current->second.prev[0]);
-                if (prev_it != dbg.end()) prev_it->second.forward_edge_count--;
+                if (prev_it != dbg.end())
+                    prev_it->second.counts.forward_edge_count--;
                 dbg.erase(current);
             }
         }
     }
-    static void open_simple_loops(dbg_map_t &dbg,
-                                  [[maybe_unused]] lcmer_index_t &lci,
-                                  auto &active_set) {
+    static void open_simple_loopsv2(dbg_map_t &dbg,
+                                    gtl::btree_set<u64> &active_set,
+                                    const avg_core_count_stats &depth_stats) {
+        gtl::vector<u64> to_rm;
         for (auto &node : active_set) {
             auto current = dbg.find(node);
             if (current == dbg.end() || current->second.redirected()) {
                 continue;
             }
-            if (current->second.forward_edge_count == 1 &&
-                current->second.prev.size() == 1) {
-                auto prev_it = dbg.find(current->second.prev[0]);
-                if (prev_it != dbg.end() && !prev_it->second.redirected()) {
-                    auto &prepre = prev_it->second.prev;
-                    for (auto pp = prepre.begin(); pp != prepre.end(); ++pp) {
-                        if (*pp == node) {  // Loop here
-                            *pp = std::numeric_limits<u64>::max();
-                            if (current->second.core_count >=
-                                2 * prev_it->second
-                                        .core_count) {  // TODO: this is
-                                                        // not right.
-                                // Need to duplicate the
-                                // sequence
-                                auto &tomerge = current->second.seq;
-                                for (auto it = tomerge.begin();
-                                     it != tomerge.end(); ++it) {
-                                    prev_it->second.seq.emplace_back(
-                                        std::move(*it));
-                                }
+            if (current->second.counts.forward_edge_count == 2 &&
+                current->second.prev.size() == 2) {
+                // 2 in 2 out
+                //
+                //      o----->[-Cur-]----->o
+                //             |     ^
+                //             v     |
+                //             [-Pre-]
+                //
+                // for (auto &pnode : current->second.prev) {
+                int merged_node_index_in_prev = [&]() -> int {
+                    for (size_t i = 0; i < current->second.prev.size(); ++i) {
+                        auto pnode = current->second.prev[i];
+                        const auto &pit = dbg.find(pnode);
+                        if (pit == dbg.end() || pit->second.redirected()) {
+                            continue;
+                        }
+                        if (pit->second.counts.forward_edge_count != 1 ||
+                            pit->second.prev.size() != 1) {  // Prev is simple
+                            continue;
+                        }
+                        if (pit->second.prev[0] == node) {  // Loop confirmed.
+                            // Try to find other Since we confirmed 2 node
+                            // exist, we can flip it for other
+                            auto other_prev = current->second.prev[1 - i];
+                            double curr_depth =
+                                current->second.avg_core_count();
+                            double pr_depth = pit->second.avg_core_count();
+                            assert(depth_stats.baseline > 0.0);
+                            double other_depth = depth_stats.baseline;
+                            if (auto other_it = dbg.find(other_prev);
+                                other_it != dbg.end() &&
+                                !other_it->second.redirected()) {
+                                const double d =
+                                    other_it->second.avg_core_count();
+                                if (d > 0.0) other_depth = d;
                             }
+                            // Lets combine the sequences here.
+                            SequenceContainerType cur_seq{
+                                current->second.seq.begin(),
+                                current->second.seq.end()};
+                            SequenceContainerType pre_seq{
+                                pit->second.seq.begin(), pit->second.seq.end()};
 
-                            prev_it->second.forward_edge_count--;
-                            dbg.erase(current);
+                            const auto copy_est = infer_loop_copy_numbers(
+                                other_depth, pr_depth, curr_depth, depth_stats);
+                            const int extra_turns =
+                                std::max(0, copy_est.loop_turns - 1);
+                            // const double baseline = depth_stats.baseline;
+                            // const double curr_cn = curr_depth / baseline;
+                            // const double loop_cn = pr_depth / baseline;
+                            // const double other_in_cn = other_depth / baseline;
+                            // fprintf(
+                            //     stderr,
+                            //     "[open_simple_loopsv2] cur=%" PRIu64
+                            //     " loop=%" PRIu64 " "
+                            //     "other_in=%" PRIu64 " curr_d=%.3f loop_d=%.3f "
+                            //     "other_in_d=%.3f "
+                            //     "baseline=%.3f curr_cn=%.3f loop_cn=%.3f "
+                            //     "other_in_cn=%.3f "
+                            //     "global_ref_d=%.3f raw(loop/curr)=%.3f/%.3f "
+                            //     "rounded(loop/curr)=%d/%d "
+                            //     "other_cn_round=%d turn_gain/thr=%.3f/%.3f "
+                            //     "force_t1=%d "
+                            //     "base_cn(real/round)=%.3f/%d "
+                            //     "loop_turns=%d extra_turns=%d score=%.3f\n",
+                            //     static_cast<uint64_t>(node),
+                            //     static_cast<uint64_t>(pnode),
+                            //     static_cast<uint64_t>(other_prev), curr_depth,
+                            //     pr_depth, other_depth, baseline, curr_cn,
+                            //     loop_cn, other_in_cn, copy_est.global_ref_depth,
+                            //     copy_est.raw_loop_cn, copy_est.raw_curr_cn,
+                            //     copy_est.loop_cn_rounded,
+                            //     copy_est.curr_cn_rounded,
+                            //     copy_est.other_cn_rounded,
+                            //     copy_est.turn_event_gain,
+                            //     copy_est.turn_event_threshold,
+                            //     copy_est.turn_forced_single, copy_est.base_cn,
+                            //     copy_est.base_cn_rounded, copy_est.loop_turns,
+                            //     extra_turns, copy_est.score);
+
+                            for (int turn = 0; turn < extra_turns; ++turn) {
+                                current->second.seq.push_back(
+                                    SequenceContainerType::copy_of(pre_seq));
+                                current->second.seq.push_back(
+                                    SequenceContainerType::copy_of(cur_seq));
+                            }
+                            current->second.seq.push_back(std::move(pre_seq));
+                            current->second.seq.push_back(std::move(cur_seq));
+
+                            // Get rid of the looping node
+                            return i;
                         }
                     }
+                    return -1;
+                }();
+                if (merged_node_index_in_prev == -1) {
+                    continue;
                 }
+                to_rm.push_back(
+                    current->second.prev[merged_node_index_in_prev]);
+                // active_set.erase(current->second.prev[merged_node_index_in_prev]);
+                current->second.counts.forward_edge_count = 1;
+                if (merged_node_index_in_prev == 0) {
+                    current->second.prev[0] = current->second.prev[1];
+                }
+                current->second.prev.pop_back();
             }
         }
+        for (auto node : to_rm) {
+            active_set.erase(node);
+            dbg.erase(node);
+        }
     }
-    static void fix_edges(dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
+    static void fix_edges(dbg_map_t &dbg,
                           [[maybe_unused]] const auto &active_set) {
         // Fix edges
         for (auto &node : dbg) {
@@ -1205,7 +1573,6 @@ struct GraphCleaning {
     //         pop_bubbles(dbgi.dbg, dbgi.lci,
     //                     cfg.min_bubble_depth_difference_percentage);
     //         // cut_low_support_edges(dbgi.dbg, dbgi.lci);
-    //         open_simple_loops(dbgi.dbg, dbgi.lci);
     //         fix_edges(dbgi.dbg, dbgi.lci);
     //         redirect_deleted.clear();
     //         simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted);
@@ -1217,7 +1584,7 @@ struct GraphCleaning {
         INIT_TIMERS(GraphCleaning);
         redir_map redirect_deleted;
         decltype(dbgi.active_set) &active_set = dbgi.active_set;
-        active_set.reserve(dbgi.dbg.size() + 1);
+
         for (const auto &node : dbgi.dbg) {
             active_set.insert(node.first);
         }
@@ -1226,34 +1593,45 @@ struct GraphCleaning {
         // IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
         //                    "DFS Simplification");
         if (cfg.iterations > -1) {
-            auto to_simplify =
-                simplify_simple_parallel_mark(dbgi.dbg, acfg.threads.work);
-            simplify_simple_parallel_sweep(dbgi.dbg, dbgi.lci, to_simplify,
-                                           redirect_deleted, active_set);
+            if (acfg.threads.work > 1) {
+                auto to_simplify =
+                    simplify_simple_parallel_mark(dbgi.dbg, acfg.threads.work);
+                simplify_simple_parallel_sweep(dbgi.dbg, to_simplify,
+                                               redirect_deleted, active_set);
+            } else {
+                simplify_simple_paths(dbgi.dbg, redirect_deleted, active_set);
+            }
             // simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted,
             //                       active_set);
             IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                "Initial Simplification");
+            cut_low_support_edges(dbgi.dbg, active_set);
+            // dump_initial_clean_contig_stats(
+            //     dbgi.dbg, active_set,
+            //     acfg.output + ".initial_clean_contig_stats.tsv");
+            const auto initial_depth_stats =
+                collect_active_avg_core_count_stats(dbgi.dbg, active_set);
             for (int i = 1; i < (once ? 2 : cfg.iterations); ++i) {
-                fix_edges(dbgi.dbg, dbgi.lci, active_set);
-                cut_tips(dbgi.dbg, dbgi.lci, 3, cfg.max_tip_length, active_set);
+                fix_edges(dbgi.dbg, active_set);
+
+                cut_tips(dbgi.dbg, 3, cfg.max_tip_length, active_set);
                 // TODO FIX pop_bubbles sequence problem fix
                 // pop_bubbles(dbgi.dbg, dbgi.lci,
                 //             cfg.min_bubble_depth_difference_percentage,
                 //             active_set);
-                cut_low_support_edges(dbgi.dbg, dbgi.lci, active_set);
-                // open_simple_loops(dbgi.dbg, dbgi.lci, active_set);
-
+                if (cfg.enable_loop_opening) {
+                    open_simple_loopsv2(dbgi.dbg, active_set,
+                                        initial_depth_stats);
+                }
                 redirect_deleted.clear();
                 // erase_if(dbgi.lci, [](const auto &node) {  // MARK
                 //     return node.second.id == lci_type::max_id;
                 // });
-                simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted,
-                                      active_set);
+                simplify_simple_paths(dbgi.dbg, redirect_deleted, active_set);
                 IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                    "Iteration %d done.", i);
             }
-            fix_edges(dbgi.dbg, dbgi.lci, active_set);
+            fix_edges(dbgi.dbg, active_set);
         }
     }
 };
@@ -1261,7 +1639,7 @@ struct GraphCleaning {
 inline void print_raw_dbg(FILE *out, const dbg_index &dbgi) {
     for (const auto &[lval, edges] : dbgi.dbg) {
         fprintf(out, "S\tC%" PRIu64 "\t%s\tLN:i:%d\tRC:i:%d", lval, "*", 100,
-                edges.core_count);
+                edges.counts.core_count);
     }
 
     for (const auto &[lval, edges] : dbgi.dbg) {
@@ -1272,50 +1650,160 @@ inline void print_raw_dbg(FILE *out, const dbg_index &dbgi) {
     }
 }
 
-inline void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
-    charsi buf;
-    for (const auto &[lval, edges] : dbgi.dbg) {
-        // if (edges.redirected()) {
-        //     continue;
-        // }
-        if (edges.core_count == 0 && edges.prev.size() == 0) {
-            continue;
+__attribute__((format(printf, 2, 3))) static inline void vec_appendf(
+    std::vector<char> &v, const char *fmt, ...) {
+    va_list args, args_copy;
+    va_start(args, fmt);
+    va_copy(args_copy, args);
+    int n = vsnprintf(nullptr, 0, fmt, args);
+    va_end(args);
+    if (n > 0) {
+        size_t old = v.size();
+        v.resize(old + static_cast<size_t>(n) + 1);
+        vsnprintf(v.data() + old, static_cast<size_t>(n) + 1, fmt, args_copy);
+        v.pop_back();  // drop the null terminator
+    }
+    va_end(args_copy);
+}
+
+inline void print_dbg_seqs(FILE *out, const dbg_index &dbgi, int nthreads = 0) {
+    if (nthreads <= 0)
+        nthreads = std::max(1u, std::thread::hardware_concurrency()) - 1;
+    if (nthreads < 1) nthreads = 1;
+
+    // Work item: a pointer into the dbg map (stable while we only read).
+    struct WorkItem {
+        uint64_t lval;
+        const typename dbg_index::bidbg_val *edges;
+    };
+
+    using work_q = moodycamel::BlockingConcurrentQueue<WorkItem>;
+    work_q work_queue;
+    std::atomic<bool> work_done{false};
+    std::atomic<int> active_workers{nthreads};
+    // ── Worker thread pool ──────────────────────────────────────────
+    // Each worker dequeues nodes, converts sequences to ASCII, formats
+    // the full S-line + L-lines into a vector<char>, then enqueues it.
+    // Format one node (S-line + L-lines) into line_buf.
+    auto format_node = [&](std::vector<char> &line_buf, const WorkItem &item) {
+        const auto &edges = *item.edges;
+        const uint64_t lval = item.lval;
+        line_buf.clear();
+
+        // Pre-compute total sequence length.
+        size_t sofar = 0;
+        for (const auto &s : edges.seq) {
+            sofar += s.len;
         }
 
-        //        __builtin_debugtrap();
-        if (edges.seq.size() == 0) {
-            continue;
-            // fprintf(out,
-            //         "S\tC%" PRIu64
-            //         "\t%s\tLN:i:%d\tRC:i:%u\tBE:i:%zu\tFE:i:%u\n",
-            //         lval, "", 0, edges.core_count, edges.prev.size(),
-            //         edges.forward_edge_count);
-        } else {
-            //            int i = onehotto2bitDNA2(s, buffer);
-            fprintf(out, "S\tC%" PRIu64 "\t", lval);
-            size_t sofar = 0;
-            //            for (const SequenceContainerType &s : edges.seq) {
-            // reversed
-            for (auto it = edges.seq.begin(); it != edges.seq.end(); ++it) {
-                const SequenceContainerType &s = *it;
-                buf.require(s.len + 32);
-                const char *buf_at = s.convert_to_ascii((char *)buf.data);
+        // S-line header.
+        vec_appendf(line_buf, "S\tC%" PRIu64 "\t", lval);
 
-                fprintf(out, "%s", buf_at);
-                sofar += s.len;
+        // Convert all sequence chunks directly into line_buf.
+        {
+            size_t seq_start = line_buf.size();
+            line_buf.resize(seq_start + sofar + 1);  // +1 for trailing \0
+            size_t offset = 0;
+            for (const auto &s : edges.seq) {
+                s.convert_to_ascii(line_buf.data() + seq_start + offset);
+                offset += s.len;
             }
-            fprintf(out, "\tLN:i:%zu\tRC:i:%d\tCC:i:%u\tBE:i:%zu\tFE:i:%u\n",
-                    sofar, (int)(edges.avg_core_count() * sofar),
-                    edges.core_count, edges.prev.size(),
-                    edges.forward_edge_count);
+            line_buf.resize(seq_start + sofar);  // trim null terminator
         }
 
+        // S-line trailer.
+        vec_appendf(line_buf,
+                    "\tLN:i:%zu\tRC:i:%d\tCC:i:%u\tBE:i:%zu\tFE:i:%u\n", sofar,
+                    (int)(edges.avg_core_count() * sofar),
+                    edges.counts.core_count, edges.prev.size(),
+                    edges.counts.forward_edge_count);
+
+        // L-lines for incoming edges.
         for (uint64_t nl : edges.prev) {
             if (dbgi.dbg.contains(nl))
-                fprintf(out, "L\tC%" PRIu64 "\t+\tC%" PRIu64 "\t+\t%dM\n", nl,
-                        lval, 0);
+                vec_appendf(line_buf,
+                            "L\tC%" PRIu64 "\t+\tC%" PRIu64 "\t+\t%dM\n", nl,
+                            lval, 0);
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(nthreads);
+    for (int i = 0; i < nthreads; ++i) {
+        workers.emplace_back([&] {
+            WorkItem item;
+            std::vector<char> line_buf;
+            line_buf.reserve(1 << 16);
+
+            while (true) {
+                if (!work_queue.wait_dequeue_timed(item, WAIT_QUEUE_TIMEOUT)) {
+                    if (work_done.load()) break;
+                    continue;
+                }
+                format_node(line_buf, item);
+                fwrite(line_buf.data(), line_buf.size(), 1, out);
+            }
+
+            // Drain remaining work after done flag is set.
+            while (work_queue.try_dequeue(item)) {
+                const auto &edges = *item.edges;
+                const uint64_t lval = item.lval;
+                line_buf.clear();
+
+                size_t sofar = 0;
+                for (const auto &s : edges.seq) {
+                    sofar += s.len;
+                }
+
+                vec_appendf(line_buf, "S\tC%" PRIu64 "\t", lval);
+
+                {
+                    size_t seq_start = line_buf.size();
+                    line_buf.resize(seq_start + sofar + 1);
+                    size_t offset = 0;
+                    for (const auto &s : edges.seq) {
+                        s.convert_to_ascii(line_buf.data() + seq_start +
+                                           offset);
+                        offset += s.len;
+                    }
+                    line_buf.resize(seq_start + sofar);
+                }
+
+                vec_appendf(line_buf,
+                            "\tLN:i:%zu\tRC:i:%d\tCC:i:%u\tBE:i:%zu\tFE:i:%u\n",
+                            sofar, (int)(edges.avg_core_count() * sofar),
+                            edges.counts.core_count, edges.prev.size(),
+                            edges.counts.forward_edge_count);
+
+                for (uint64_t nl : edges.prev) {
+                    if (dbgi.dbg.contains(nl))
+                        vec_appendf(line_buf,
+                                    "L\tC%" PRIu64 "\t+\tC%" PRIu64
+                                    "\t+\t%dM\n",
+                                    nl, lval, 0);
+                }
+                fwrite(line_buf.data(), line_buf.size(), 1, out);
+
+                line_buf.clear();
+            }
+            active_workers.fetch_sub(1);
+        });
+    }
+
+    // ── Producer: main thread enqueues work ─────────────────────────
+    for (const auto &[lval, edges] : dbgi.dbg) {
+        if (edges.counts.core_count == 0 && edges.prev.size() == 0) continue;
+        if (edges.seq.size() == 0) continue;
+
+        while (!work_queue.try_enqueue(WorkItem{lval, &edges})) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(10));
         }
     }
+    work_done.store(true);
+
+    for (auto &w : workers) w.join();
+    // All workers have exited and decremented active_workers to 0;
+    // the writer thread will notice and drain the output queue.
 }
 
 inline void print_dbg_dot(const dbg_index &dbgi, int i) {
@@ -1340,9 +1828,10 @@ inline void print_dbg_dot(const dbg_index &dbgi, int i) {
         for (auto &node : dbgi.dbg) {
             fprintf(dot_file,
                     "\t%" PRIu64 " [label=\"%" PRIu64 "->%u,%zu,%zu,%d\"];\n",
-                    node.first, node.first, node.second.forward_edge_count,
+                    node.first, node.first,
+                    node.second.counts.forward_edge_count,
                     node.second.prev.size(), node.second.seq.size(),
-                    node.second.core_count);
+                    node.second.counts.core_count);
             for (auto &prev : node.second.prev) {
                 fprintf(dot_file, "\t%" PRIu64 " -> %" PRIu64 ";\n", prev,
                         node.first);

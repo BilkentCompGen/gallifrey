@@ -1,9 +1,44 @@
-#include "bgzf.h"
+#include <htslib/sam.h>
+
+#include <string>
+
 #include "ext/termbox2.h"
 #include "gtl/phmap.hpp"
 #include "histogram.h"
 #include "lcmer.h"
+#include "ext/lcptools/lcptools_ho.h"
 #include "syncmer.h"
+
+struct BAMReader {
+    std::string filename;
+    samFile *fp;
+    sam_hdr_t *hdr;
+
+    BAMReader(const std::string &filename, int threads [[maybe_unused]] = 2)
+        : fp{sam_open(filename.c_str(), "rb")} {
+        this->filename = filename;
+        if (!(hdr = sam_hdr_read(fp))) {
+            throw "Cannot read header from file!";
+        }
+    }
+    ~BAMReader() {
+        if (hdr) {
+            sam_hdr_destroy(hdr);
+        }
+        if (fp) {
+            sam_close(fp);
+        }
+    }
+
+    bool read(bam1_t *bamdata) { return sam_read1(fp, hdr, bamdata) >= 0; }
+    bam1_t *init_data() {
+        bam1_t *data = bam_init1();
+        if (data == NULL) {
+            throw "Not enough memory";
+        }
+        return data;
+    }
+};
 template <class T>
 struct stat_accu {
     T count;
@@ -53,17 +88,18 @@ int run_stats(const std::string &input, int update_frequency, int lcmer_level, d
         "{:.2f}");
 
     struct tb_event ev;
-    lps str = {0, 0, 0, 0};
+    lps lcstr = {0, 0, 0, 0};
     syncmer::DensitySyncmerRule<uint32_t, syncmer::MurMur> syncmer_functor{
         8,
         density, 423U, static_cast<unsigned int>(-1)};
     charsi chs;
+    pos_scratch pos_buf;
     lcp_read lcps;
     while (reader.read(bamdata)) {
         lcps.clear();
          parse_cores_from_bam_record(
-            bam_get_seq(bamdata), bamdata->core.l_qseq, lcmer_level, &str,
-            syncmer_functor, chs, lcps);
+            bam_get_seq(bamdata), bamdata->core.l_qseq, lcmer_level, &lcstr,
+            syncmer_functor, chs, lcps, pos_buf);
         stats["length"].update(bamdata->core.l_qseq);
         stats["core-count"].update(lcps.cores.size());
         for (const auto &len : lcps.pos) {
@@ -95,6 +131,6 @@ enough:
     while (tb_peek_event(&ev, 100) == TB_ERR_NO_EVENT) {
         if (ev.type == TB_EVENT_KEY) goto enough;
     }
-    lps_clear(&str);
+    lps_clear(&lcstr);
     return 0;
 }

@@ -2,10 +2,12 @@
 
 #ifndef _ASM_H_
 #define _ASM_H_
+
 #include <inttypes.h>
 #include <stdint.h>
 
 #include <string>
+#include <vector>
 struct syncmer_params {
     static constexpr unsigned long invalid_param_value = 127127127;
     enum class typeenum { Density, MinCodeOpen, MinCodeClosed, Invalid };
@@ -86,17 +88,21 @@ struct syncmer_params {
     }
 };
 struct asm_config {
-    std::string input;
+    std::vector<std::string> inputs;
     std::string output;
     int lcp_level = 3;
+    int dbg_lcmer_l = 8;
+    int olc_lcmer_l = 8;
     struct {
         int io = 4;
         int work = 8;
     } threads;
     size_t seed = 1453;
     bool rle = true;
+    bool parallel_file_reading = false;
     syncmer_params syncmer;
     bool print_precleanup_graph = false;
+    bool print_prelayout_graph = false;
     bool silent = false;
     struct {
         uint64_t projected_count = 100'000'000;
@@ -104,18 +110,30 @@ struct asm_config {
     } bloom;
     struct {
         int iterations = 2;
-        int max_tip_length = LCMER_L * 2;
+        int max_tip_length = 8 * 2;
         int min_bubble_length_difference = 2;
         double min_bubble_depth_difference_percentage = 2;
+        bool enable_loop_opening = false;
     } graph_cleaning;
 
     void print_cfg(FILE *f) const {
-        fprintf(f, "Input: %s\n", input.c_str());
+        if (!inputs.empty()) {
+            fprintf(f, "Inputs (%zu):\n", inputs.size());
+            for (const auto &in : inputs) {
+                fprintf(f, "\t%s\n", in.c_str());
+            }
+        } else {
+            fprintf(f, "Inputs (0):\n");
+        }
         fprintf(f, "Output: %s\n", output.c_str());
         fprintf(f, "LCP Level: %d\n", lcp_level);
+        fprintf(f, "DBG LCMER Length: %d\n", dbg_lcmer_l);
+        fprintf(f, "OLC LCMER Length: %d\n", olc_lcmer_l);
         fprintf(f, "Threads:\n\tIO: %d\n\tWork: %d\n", threads.io, threads.work);
         fprintf(f, "Seed: %zu\n", seed);
         fprintf(f, "RLE: %s\n", rle ? "true" : "false");
+        fprintf(f, "File Reading Mode: %s\n",
+                parallel_file_reading ? "parallel" : "sequential");
         syncmer.print_cfg(f);
         fprintf(f,
                 "Bloom Filter Parameters:\n\tProjected Count: %" PRIu64
@@ -125,10 +143,11 @@ struct asm_config {
         fprintf(f,
                 "Graph Cleaning Parameters: \n\tIterations: %d\n\tMax Tip "
                 "Length: %d\n\tMin Bubble Length Difference: %d\n\tMin Bubble "
-                "Depth Difference Rate: %.2f\n",
+                "Depth Difference Rate: %.2f\n\tOpen Simple Loops: %s\n",
                 graph_cleaning.iterations, graph_cleaning.max_tip_length,
                 graph_cleaning.min_bubble_length_difference,
-                graph_cleaning.min_bubble_depth_difference_percentage);
+                graph_cleaning.min_bubble_depth_difference_percentage,
+                graph_cleaning.enable_loop_opening ? "true" : "false");
     }
 };
 

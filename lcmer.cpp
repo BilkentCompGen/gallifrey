@@ -1,5 +1,6 @@
 #include "lcmer.h"
 
+#include <bit>
 #include <cstdint>
 
 #include "asm.h"
@@ -20,7 +21,7 @@ void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
     cr->label |= (bam_seqi(data, si) << 8);
     cr->label |= (bam_seqi(data, si + distance - 2) << 4);
     cr->label |= (bam_seqi(data, si + distance - 1));
-    cr->bit_rep = 0x8000000000000000 | cr->label;
+    cr->bit_rep = CL(uint128_t){0x8000000000000000, cr->label};
     cr->bit_size = 2 * distance;
 }
 
@@ -129,8 +130,8 @@ uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores) {
 int onehotto2bitDNA2(const uint8_t *data, char *ret) {
     static char table[] = {'A', 'C', 'G', 'T'};
     for (size_t i = 0;; ++i) {
-        int clz = __builtin_clz(data[i]);
-        int ctz = __builtin_ctz(data[i]);
+        int clz = std::countl_zero(static_cast<unsigned>(data[i]));
+        int ctz = std::countr_zero(static_cast<unsigned>(data[i]));
 
         if (clz < 0 || ctz > 3) {
             ret[i] = 0;
@@ -144,46 +145,92 @@ int onehotto2bitDNA2(const uint8_t *data, char *ret) {
 uint8_t *onehotto2bitDNA(uint8_t *data, size_t len) {
     uint8_t *ret = (uint8_t *)malloc(len);
     for (size_t i = 0; i < len / 2; ++i) {
-        ret[2 * i] = 27 - __builtin_clz(data[i]);
-        ret[2 * i + 1] = __builtin_ctz(data[i]);
+        ret[2 * i] = 27 - std::countl_zero(static_cast<unsigned>(data[i]));
+        ret[2 * i + 1] = std::countr_zero(static_cast<unsigned>(data[i]));
     }
     return ret;
 }
 void onehotto2bitDNA_bivec_chs(const uint8_t *data, size_t len, charsi &chs) {
     chs.require(len);
-
-    for (size_t i = 0; i < len / 2; ++i) {
-        chs.data[2 * i] = 27 - __builtin_clz(data[i]);
-        chs.data[2 * i + 1] = __builtin_ctz(data[i]);
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    static const uint8_t decode4_tbl_arr[16] = {
+        0,0,1,0, 2,0,0,0, 3,0,0,0, 0,0,0,0};
+    const uint8x16_t tbl = vld1q_u8(decode4_tbl_arr);
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    size_t i = 0;
+    for (; i + 16 <= len / 2; i += 16) {
+        uint8x16_t v = vld1q_u8(data + i);
+        uint8x16_t hi = vqtbl1q_u8(tbl, vshrq_n_u8(v, 4));
+        uint8x16_t lo = vqtbl1q_u8(tbl, vandq_u8(v, mask));
+        uint8x16x2_t interleaved = vzipq_u8(hi, lo);
+        vst1q_u8(chs.data + 2 * i,      interleaved.val[0]);
+        vst1q_u8(chs.data + 2 * i + 16, interleaved.val[1]);
     }
+    for (; i < len / 2; ++i) {
+        chs.data[2 * i]     = 27 - std::countl_zero(static_cast<unsigned>(data[i]));
+        chs.data[2 * i + 1] = std::countr_zero(static_cast<unsigned>(data[i]));
+    }
+#else
+    for (size_t i = 0; i < len / 2; ++i) {
+        chs.data[2 * i]     = 27 - std::countl_zero(static_cast<unsigned>(data[i]));
+        chs.data[2 * i + 1] = std::countr_zero(static_cast<unsigned>(data[i]));
+    }
+#endif
     if (len % 2 == 1) {
-        chs.data[len - 1] = 27 - __builtin_clz(data[len / 2]);
+        chs.data[len - 1] = 27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
     }
 }
 void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len,
                                        charsi &chs) {
     chs.require(len);
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    static const uint8_t rc_tbl_arr[16] = {
+        0,3,2,0, 1,0,0,0, 0,0,0,0, 0,0,0,0};
+    const uint8x16_t tbl = vld1q_u8(rc_tbl_arr);
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    size_t half = len / 2;
+    size_t i = 0;
+    for (; i + 16 <= half; i += 16) {
+        uint8x16_t v = vld1q_u8(data + i);
+        uint8x16_t lo = vqtbl1q_u8(tbl, vandq_u8(v, mask));
+        uint8x16_t hi = vqtbl1q_u8(tbl, vshrq_n_u8(v, 4));
+        uint8x16x2_t interleaved = vzipq_u8(lo, hi);
+        uint8x16_t r0 = vrev64q_u8(interleaved.val[1]);
+        r0 = vcombine_u8(vget_high_u8(r0), vget_low_u8(r0));
+        uint8x16_t r1 = vrev64q_u8(interleaved.val[0]);
+        r1 = vcombine_u8(vget_high_u8(r1), vget_low_u8(r1));
+        size_t out_pos = len - 2 * (i + 16);
+        vst1q_u8(chs.data + out_pos,      r0);
+        vst1q_u8(chs.data + out_pos + 16, r1);
+    }
+    size_t mid = half - 1;
+    for (; i < half; ++i) {
+        chs.data[2 * (mid - i)]     = std::countl_zero(static_cast<unsigned>(data[i])) - 24;
+        chs.data[2 * (mid - i) + 1] = 3 - std::countr_zero(static_cast<unsigned>(data[i]));
+    }
+#else
     size_t mid = len / 2 - 1;
     for (size_t i = 0; i < len / 2; ++i) {
-        chs.data[2 * (mid - i)] = __builtin_clz(data[i]) - 24;
-        chs.data[2 * (mid - i) + 1] = 3 - __builtin_ctz(data[i]);
+        chs.data[2 * (mid - i)]     = std::countl_zero(static_cast<unsigned>(data[i])) - 24;
+        chs.data[2 * (mid - i) + 1] = 3 - std::countr_zero(static_cast<unsigned>(data[i]));
     }
+#endif
     if (len % 2 == 1) {
-        chs.data[0] = __builtin_clz(data[len / 2]) - 24;
+        chs.data[0] = std::countl_zero(static_cast<unsigned>(data[len / 2])) - 24;
     }
 }
-uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len) {
-    uint8_t *ret = (uint8_t *)malloc(len);
-#pragma clang loop vectorize(enable) interleave(enable)
-    for (size_t i = 0; i < len / 2; ++i) {
-        ret[2 * i] = 27 - __builtin_clz(data[i]);
-        ret[2 * i + 1] = __builtin_ctz(data[i]);
-    }
-    if (len % 2 == 1) {
-        ret[len - 1] = 27 - __builtin_clz(data[len / 2]);
-    }
-    return ret;
-}
+// // uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len) {
+// //     uint8_t *ret = (uint8_t *)malloc(len);
+// // #pragma clang loop vectorize(enable) interleave(enable)
+// //     for (size_t i = 0; i < len / 2; ++i) {
+// //         ret[2 * i] = 27 - std::countl_zero(static_cast<unsigned>(data[i]));
+// //         ret[2 * i + 1] = std::countr_zero(static_cast<unsigned>(data[i]));
+// //     }
+// //     if (len % 2 == 1) {
+// //         ret[len - 1] = 27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
+// //     }
+// //     return ret;
+// }
 
 // lcp_read parse_cores_from_kseq(const char *s, size_t len, int lcp_level) {
 //     // uint64_t estimated_core_size = (int)(len / std::pow(1.5, lcp_level));
@@ -216,15 +263,15 @@ TEST_CASE("Nibbles to Crumbs") {
             expected[byte] = {tab[high], tab[low]};
         }
     }
-    SUBCASE("Even") {
-        uint8_t *conversion =
-            onehotto2bitDNA_bivec(bytes.data(), 2 * bytes.size());
-        for (unsigned i = 0; i < bytes.size(); ++i) {
-            CHECK(expected[bytes[i]].first == conversion[2 * i]);
-            CHECK(expected[bytes[i]].second == conversion[2 * i + 1]);
-        }
-        free(conversion);
-    }
+    // SUBCASE("Even") {
+    //     uint8_t *conversion =
+    //         onehotto2bitDNA_bivec(bytes.data(), 2 * bytes.size());
+    //     for (unsigned i = 0; i < bytes.size(); ++i) {
+    //         CHECK(expected[bytes[i]].first == conversion[2 * i]);
+    //         CHECK(expected[bytes[i]].second == conversion[2 * i + 1]);
+    //     }
+    //     free(conversion);
+    // }
     SUBCASE("Even reverse") {
         charsi c;
         c.require(2 * bytes.size());
@@ -237,15 +284,15 @@ TEST_CASE("Nibbles to Crumbs") {
     }
     bytes.push_back((1 << 4));
     expected[bytes.back()] = {tab[1], 0};
-    SUBCASE("Odd") {
-        uint8_t *conversion =
-            onehotto2bitDNA_bivec(bytes.data(), 2 * bytes.size() - 1);
-        for (unsigned i = 0; i < bytes.size(); ++i) {
-            CHECK(expected[bytes[i]].first == conversion[2 * i]);
-            CHECK(expected[bytes[i]].second == conversion[2 * i + 1]);
-        }
-        free(conversion);
-    }
+    // SUBCASE("Odd") {
+    //     uint8_t *conversion =
+    //         onehotto2bitDNA_bivec(bytes.data(), 2 * bytes.size() - 1);
+    //     for (unsigned i = 0; i < bytes.size(); ++i) {
+    //         CHECK(expected[bytes[i]].first == conversion[2 * i]);
+    //         CHECK(expected[bytes[i]].second == conversion[2 * i + 1]);
+    //     }
+    //     free(conversion);
+    // }
 }
 
 // TEST_CASE("CrumbledSubSeq reverse complement") {
@@ -552,7 +599,8 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
         gtl::vector<size_t> tos;
         for (int casei = 0; casei < N_RANDOM_CASES; ++casei) {
             int to = rand() % (seqlen - 100) + 100;
-            int from = to - 100 - (rand() % 12);
+            int back = 100 + (rand() % 12);
+            int from = (to > back) ? (to - back) : 0;
             copied.emplace_back(bam_get_seq(rec), from, to, 0,
                                 CrumbledSubSeq64::from_nibbles{});
             froms.push_back(from);
@@ -578,8 +626,8 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
     SUBCASE(
         "Compare two windowing functions to see if they produce the same "
         "lcmers") {
-        lps str1;
-        lps str2;
+        lps str1 = {0, 0, 0, nullptr};
+        lps str2 = {0, 0, 0, nullptr};
         using SYNCMER_HASHER = syncmer::MurMur;
         using SyncmerType =
             syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
@@ -588,9 +636,10 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
         spara.density = 0.05;
         SyncmerType fnctr(spara, 11);
         charsi chs;
+        pos_scratch pos_buf;
         lcp_read lr;
         parse_cores_from_bam_record(bam_get_seq(rec), rec->core.l_qseq, 3,
-                                    &str1, fnctr, chs, lr);
+                                    &str1, fnctr, chs, lr, pos_buf);
         gtl::vector<CrumbledSubSeq64> ss;
         ss.emplace_back(bam_get_seq(rec), 0, rec->core.l_qseq, 0,
                         CrumbledSubSeq64::from_nibbles{});
@@ -616,4 +665,180 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
     bam_hdr_destroy(hdr);
     sam_close(fp);
     free(seq_gt);
+}
+
+// Reference scalar-only two-pass: decode then RLE.
+// Used as ground truth for testing onehot_to_rle.
+static int64_t reference_onehot_to_rle(const uint8_t *data, int64_t len,
+                                        uint8_t *rle_data, uint32_t *rle_pos) {
+    if (len <= 0) return 0;
+    // Scalar decode table: BAM one-hot nibble → 2-bit
+    static constexpr uint8_t tbl[16] = {
+        0,0,1,0, 2,0,0,0, 3,0,0,0, 0,0,0,0};
+    // Decode all bases
+    gtl::vector<uint8_t> decoded(len);
+    for (int64_t i = 0; i < len / 2; ++i) {
+        decoded[2 * i]     = tbl[data[i] >> 4];
+        decoded[2 * i + 1] = tbl[data[i] & 0x0F];
+    }
+    if (len % 2 == 1) {
+        decoded[len - 1] = tbl[data[len / 2] >> 4];
+    }
+    // Scalar RLE compaction
+    rle_data[0] = decoded[0];
+    rle_pos[0] = 0;
+    int64_t out = 1;
+    for (int64_t i = 1; i < len; ++i) {
+        if (decoded[i] != decoded[i - 1]) {
+            rle_data[out] = decoded[i];
+            rle_pos[out] = static_cast<uint32_t>(i);
+            ++out;
+        }
+    }
+    return out;
+}
+
+TEST_CASE("onehot_to_rle correctness") {
+    // Encode a synthetic BAM nibble sequence from known bases
+    auto encode_bam = [](const gtl::vector<uint8_t> &bases) {
+        // bases: 0=A, 1=C, 2=G, 3=T → BAM nibbles: 1,2,4,8
+        static constexpr uint8_t to_bam[4] = {1, 2, 4, 8};
+        int64_t len = bases.size();
+        gtl::vector<uint8_t> bam_data((len + 1) / 2);
+        for (int64_t i = 0; i < len / 2; ++i) {
+            bam_data[i] = (to_bam[bases[2*i]] << 4) | to_bam[bases[2*i+1]];
+        }
+        if (len % 2 == 1) {
+            bam_data[len / 2] = to_bam[bases[len - 1]] << 4;
+        }
+        return bam_data;
+    };
+
+    auto run_test = [&](const gtl::vector<uint8_t> &bases, const char *label) {
+        INFO(label, " len=", bases.size());
+        auto bam_data = encode_bam(bases);
+        int64_t len = bases.size();
+
+        gtl::vector<uint8_t> rle_ref(len), rle_test(len);
+        gtl::vector<uint32_t> pos_ref(len), pos_test(len);
+
+        int64_t n_ref  = reference_onehot_to_rle(bam_data.data(), len,
+                                                  rle_ref.data(), pos_ref.data());
+        int64_t n_test = onehot_to_rle(bam_data.data(), len,
+                                       rle_test.data(), pos_test.data());
+
+        CHECK(n_ref == n_test);
+        for (int64_t i = 0; i < std::min(n_ref, n_test); ++i) {
+            INFO("  index ", i);
+            CHECK(rle_ref[i] == rle_test[i]);
+            CHECK(pos_ref[i] == pos_test[i]);
+        }
+    };
+
+    SUBCASE("Short sequences") {
+        run_test({0}, "single A");
+        run_test({0, 1}, "AC");
+        run_test({0, 0}, "AA");
+        run_test({0, 1, 2, 3}, "ACGT");
+        run_test({3, 3, 3, 3}, "TTTT");
+        run_test({0, 0, 1, 1, 2, 2, 3, 3}, "AACCGGTT");
+    }
+
+    SUBCASE("Odd length") {
+        run_test({0, 1, 2}, "ACG (odd)");
+        run_test({0, 1, 2, 3, 0}, "ACGTA (odd)");
+        gtl::vector<uint8_t> odd33(33, 0);
+        odd33[16] = 1; odd33[32] = 2;
+        run_test(odd33, "33 bases (odd, spans SIMD boundary)");
+    }
+
+    SUBCASE("Homopolymer run (all same, exercises fast-path skip)") {
+        run_test(gtl::vector<uint8_t>(64, 2), "64x G");
+        run_test(gtl::vector<uint8_t>(100, 0), "100x A");
+    }
+
+    SUBCASE("Alternating (max changes)") {
+        gtl::vector<uint8_t> alt(128);
+        for (size_t i = 0; i < alt.size(); ++i) alt[i] = i % 4;
+        run_test(alt, "128 alternating ACGT");
+    }
+
+    SUBCASE("Exactly 32 bases (one SIMD iteration)") {
+        gtl::vector<uint8_t> v(32);
+        for (size_t i = 0; i < 32; ++i) v[i] = (i / 8) % 4;
+        run_test(v, "32 bases, 4 blocks of 8");
+    }
+
+    SUBCASE("Boundary: 31, 32, 33 bases") {
+        for (int n : {31, 32, 33}) {
+            gtl::vector<uint8_t> v(n);
+            for (int i = 0; i < n; ++i) v[i] = (i * 7) % 4;
+            run_test(v, (std::string("len=") + std::to_string(n)).c_str());
+        }
+    }
+
+    SUBCASE("Large random sequence") {
+        srand(42);
+        for (int trial = 0; trial < 10; ++trial) {
+            int len = 500 + rand() % 15000;
+            gtl::vector<uint8_t> bases(len);
+            for (int i = 0; i < len; ++i) bases[i] = rand() % 4;
+            run_test(bases, (std::string("random trial ") +
+                             std::to_string(trial)).c_str());
+        }
+    }
+
+    SUBCASE("Real BAM record") {
+        // Try multiple paths for test data
+        const char *paths[] = {
+            "../tests/test_single.bam",
+            "../../data/remth.bam",
+            "../../../data/remth.bam",
+            "/Users/fatihkaraoglanoglu/Workspace/data/remth.bam",
+            nullptr
+        };
+        samFile *fp = nullptr;
+        std::string input;
+        for (int p = 0; paths[p]; ++p) {
+            input = paths[p];
+            fp = sam_open(input.c_str(), "r");
+            if (fp) break;
+        }
+        if (fp == NULL) {
+            MESSAGE("Skipping real BAM test: no test BAM found");
+            return;
+        }
+        bam_hdr_t *hdr = sam_hdr_read(fp);
+        bam1_t *rec = bam_init1();
+        int count = 0;
+        while (sam_read1(fp, hdr, rec) > 0 && count < 20) {
+            const uint8_t *data = bam_get_seq(rec);
+            int64_t len = rec->core.l_qseq;
+            INFO("BAM record ", count, " len=", len);
+
+            gtl::vector<uint8_t> rle_ref(len), rle_test(len);
+            gtl::vector<uint32_t> pos_ref(len), pos_test(len);
+
+            int64_t n_ref  = reference_onehot_to_rle(data, len,
+                                rle_ref.data(), pos_ref.data());
+            int64_t n_test = onehot_to_rle(data, len,
+                                rle_test.data(), pos_test.data());
+
+            CHECK(n_ref == n_test);
+            for (int64_t i = 0; i < std::min(n_ref, n_test); ++i) {
+                if (rle_ref[i] != rle_test[i] || pos_ref[i] != pos_test[i]) {
+                    INFO("  mismatch at rle index ", i,
+                         ": ref base=", (int)rle_ref[i], " pos=", pos_ref[i],
+                         " vs test base=", (int)rle_test[i], " pos=", pos_test[i]);
+                    CHECK(rle_ref[i] == rle_test[i]);
+                    CHECK(pos_ref[i] == pos_test[i]);
+                    break;  // stop at first mismatch for readable output
+                }
+            }
+            ++count;
+        }
+        bam_destroy1(rec);
+        bam_hdr_destroy(hdr);
+        sam_close(fp);
+    }
 }

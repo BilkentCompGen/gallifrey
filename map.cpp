@@ -286,6 +286,7 @@ struct mapper {
         std::atomic<bool> done(false);
         auto work = [&queue, &done, &seqs, this, reversed, atomic_emplace]() {
             charsi chs;
+            pos_scratch pos_buf;
             bam1_t* rec = NULL;
             lps str = {0, 0, 0, 0};
 
@@ -295,7 +296,7 @@ struct mapper {
                     lcp_read read;
                     parse_cores_from_bam_record(
                         bam_get_seq(rec), rec->core.l_qseq, cfg.lcp_level, &str,
-                        syncmer_functor, chs, read, reversed);
+                        syncmer_functor, chs, read, pos_buf, reversed);
                     atomic_emplace(seqs, bam_get_qname(rec), std::move(read));
                     bam_destroy1(rec);
                     lps_clear(&str);
@@ -437,10 +438,14 @@ int run_mapping(const asm_config& param) {
     INIT_TIMERS(Mapping)
     mapper map(param);
 
-    auto ref = map.read_hts(param.input, false);
+    if (param.inputs.empty()) {
+        fprintf(stderr, "Error: at least one input file is required.\n");
+        return -1;
+    }
+    auto ref = map.read_hts(param.inputs.front(), false);
     auto qry = map.read_hts(param.output, false);
     TIME_CHECKPOINT(Mapping, stderr, "Read input files %s and %s",
-                    param.input.c_str(), param.output.c_str());
+                    param.inputs.front().c_str(), param.output.c_str());
     // auto ref = map.read_hts(
     //     param.output);  // I am reusing output here for passing str, I
     //     dont want

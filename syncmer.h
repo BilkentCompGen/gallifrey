@@ -61,10 +61,10 @@ struct MurMur {
         switch (len & 3) {
             case 3:
                 k1 ^= tail[2] << 16;
-                break;
+
             case 2:
                 k1 ^= tail[1] << 8;
-                break;
+
             case 1:
                 k1 ^= tail[0];
                 k1 *= c1;
@@ -123,6 +123,7 @@ struct DensitySyncmerRule {
 // Builds a LuT for the given syncmer rule should work fine for K <= 11, 12
 template <class INT_TYPE, HashFunction<INT_TYPE> HASH_FUNCTION>
 struct GenericSyncmerRule {
+    static constexpr double pure_lcp_density_threshold = 0.5;
     using int_type = INT_TYPE;
     syncmer_params cfg;
     int_type seed;
@@ -130,6 +131,7 @@ struct GenericSyncmerRule {
     int_type s_mask;
     int_type k_mask;
     int64_t table_size;
+    bool pure_lcp;
     gtl::vector<bool> table;
 
     constexpr int_type k() const { return cfg.k; }
@@ -148,11 +150,11 @@ struct GenericSyncmerRule {
           hf{seed},
           k_mask{(INT_TYPE)cfg.compute_spaced_mask()},
           table_size{2 << (2 * k() - 1)},
+          pure_lcp(false),
           table(table_size, 0) {
         if (s() != cfg.invalid_param_value) {
             s_mask = (1U << s()) - 1U;
-        }
-        else{
+        } else {
             s_mask = -1;
         }
         size_t tc = 0;
@@ -161,6 +163,11 @@ struct GenericSyncmerRule {
             tc += table[i];
         }
         fprintf(stderr, "Real K-mer density: %lf\n", (double)tc / table_size);
+        if ((double)tc / table_size > pure_lcp_density_threshold) {
+            fprintf(stderr, "Density of %lf > %lf, switching to pure LCP!\n",
+                    (double)tc / table_size, pure_lcp_density_threshold);
+            pure_lcp = true;
+        }
     }
     constexpr bool operator()(int_type val) const { return table[val]; }
     constexpr bool is_syncmer(int_type val) const {

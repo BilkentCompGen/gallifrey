@@ -1,17 +1,18 @@
 #include <CLI/CLI.hpp>
 #include <string>
+#include <vector>
 
 #include "CLI/CLI.hpp"
 
 #define LCPTOOLS_IMPL
 #include "asm.h"
 #include "bamdoctor.h"
+#include "dump_cores.h"
 #include "ext/lcptools/lcptools_ho.h"
 #ifdef BUILD_HISTOGRAM_UTILS
 #include "stats.h"
 #include "sthist.h"
 #endif
-
 using std::string;
 
 // auto lam = []() -> int {
@@ -24,10 +25,14 @@ int asm_program(CLI::App &parent) {
     auto *app_ = parent.add_subcommand("hifi", "run hifi assembly");
     auto &app = *app_;
     asm_config *p = new asm_config;
-    app.add_option("input", p->input, "Input bam file")->required();
-    app.add_option("output", p->output, "Output gfa file")->required();
+    auto *inputs = new std::vector<std::string>;
+    auto *file_reading_mode = new std::string{"sequential"};
+    app.add_option("input", *inputs, "Input bam files")->required();
+    app.add_option("-o,--output", p->output, "Output gfa file")->required();
     app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
         ->required();
+    app.add_option("--dbg-lcmer-l", p->dbg_lcmer_l, "DBG LCMER window length")
+        ->capture_default_str();
     app.add_option("-t,--threads", p->threads.work, "Number of worker threads")
         ->capture_default_str();
     app.add_option("-@,--io-threads", p->threads.io,
@@ -35,12 +40,20 @@ int asm_program(CLI::App &parent) {
         ->capture_default_str();
     app.add_option("--random-seed", p->seed, "Random seed")
         ->capture_default_str();
+    app.add_option("--file-reading-mode", *file_reading_mode,
+                   "Input reader mode: parallel or sequential")
+        ->check(CLI::IsMember({"parallel", "sequential"}))
+        ->capture_default_str();
 
     app.add_flag("--rle", p->rle, "Enable Run Length Encoding")
         ->capture_default_str();
 
+
     app.add_flag("--print-raw-dbg", p->print_precleanup_graph,
-                 "Print DBG before cleanup (with .raw suffix)")
+                 "Print DBG before cleanup (with .raw.gfa suffix)")
+        ->capture_default_str();
+    app.add_flag("--print-bi-dbg", p->print_prelayout_graph,
+                 "Print DBG before layout (with .bi.gfa suffix)")
         ->capture_default_str();
     app.add_flag("--silent", p->silent, "Do not print progress to stderr")
         ->capture_default_str();
@@ -86,8 +99,23 @@ int asm_program(CLI::App &parent) {
                     "Minimum difference between the two ends of the bubbles to "
                     "pop. if depth(P1) * arg > depth(P2) then pop();")
         ->capture_default_str();
+    gcg->add_flag(
+           "--open-simple-loops", p->graph_cleaning.enable_loop_opening,
+           "Enable simple loop opening during graph cleaning. Warning: may "
+           "cause misassembly if loop copy counts are mispredicted.")
+        ->capture_default_str();
     app.callback([=]() {
+        if (inputs->empty()) {
+            delete file_reading_mode;
+            delete inputs;
+            delete p;
+            return -1;
+        }
+        p->parallel_file_reading = (*file_reading_mode == "parallel");
+        p->inputs = *inputs;
         int ret = run_assembly(*p);
+        delete file_reading_mode;
+        delete inputs;
         delete p;
         return ret;
     });
@@ -97,15 +125,25 @@ int map_prog(CLI::App &parent) {
     auto *app_ = parent.add_subcommand("map", "run hifi assembly");
     auto &app = *app_;
     asm_config *p = new asm_config;
-    app.add_option("input", p->input, "Input bam file")->required();
-    app.add_option("reference", p->output, "Input bam file")->required();
+    auto *inputs = new std::vector<std::string>;
+    auto *file_reading_mode = new std::string{"sequential"};
+    app.add_option("input", *inputs, "Input bam files")->required();
+    app.add_option("-o,--output", p->output,
+                   "Second input file (query; kept for current run_mapping semantics)")
+        ->required();
     app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
         ->required();
+    app.add_option("--dbg-lcmer-l", p->dbg_lcmer_l, "DBG LCMER window length")
+        ->capture_default_str();
     app.add_option("-t,--threads", p->threads.work, "Number of worker threads")
         ->capture_default_str();
     app.add_option("-@,--io-threads", p->threads.io, "Number of IO threads")
         ->capture_default_str();
     app.add_option("--random-seed", p->seed, "Random seed")
+        ->capture_default_str();
+    app.add_option("--file-reading-mode", *file_reading_mode,
+                   "Input reader mode: parallel or sequential")
+        ->check(CLI::IsMember({"parallel", "sequential"}))
         ->capture_default_str();
     app.add_flag("--rle", p->rle, "Enable Run Length Encoding")
         ->capture_default_str();
@@ -127,7 +165,17 @@ int map_prog(CLI::App &parent) {
         ->excludes("--density")
         ->needs("--submer-s");
     app.callback([=]() {
+        if (inputs->empty()) {
+            delete file_reading_mode;
+            delete inputs;
+            delete p;
+            return -1;
+        }
+        p->parallel_file_reading = (*file_reading_mode == "parallel");
+        p->inputs = *inputs;
         int ret = run_mapping(*p);
+        delete file_reading_mode;
+        delete inputs;
         delete p;
         return ret;
     });
@@ -264,6 +312,7 @@ int main(int argc, char **argv) {
     stdin_hist_prog(app);
 #endif
     sam_read_testing(app);
+    dump_cores_program(app);
     CLI11_PARSE(app, argc, argv);
     return 0;
 }
