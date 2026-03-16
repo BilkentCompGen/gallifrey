@@ -8,6 +8,7 @@
 #ifndef LCMER_H
 #define LCMER_H
 #include <htslib/sam.h>
+#include <stdint.h>
 
 #include <algorithm>
 #include <array>
@@ -17,22 +18,20 @@
 #include <iterator>
 #include <string>
 #include <type_traits>
-#include <stdint.h>
 
 #include "ext/lcptools/lcptools_ho.h"
 #include "nibble2base.hpp"
 using SequenceContainerType = CrumbledSubSeq64;
 
-struct lcp_bit_type{
+struct lcp_bit_type {
     uint64_t hi;
     uint64_t lo;
 
-    lcp_bit_type(uint64_t hi, uint64_t lo) : hi(hi), lo(lo) {
-
-    }
-    constexpr operator uint64_t () const {
-        return hi | lo;
-    }
+    lcp_bit_type(uint64_t hi, uint64_t lo) : hi(hi), lo(lo) {}
+    constexpr operator uint64_t() const { return hi | lo; }
+#ifdef BITREP128bit
+    constexpr operator decltype(core::bit_rep)() const { return {hi, lo}; }
+#endif
 };
 // Makes sure we have enough scratch space
 template <class T, double GF = 2, size_t ALIGN_BLOCK_BITS = 5>
@@ -652,8 +651,10 @@ inline int64_t rle_compact(const uint8_t *data, int64_t len, uint8_t *rle_data,
 #elif defined(__SSSE3__)
     int64_t i = 1;
     for (; i + 16 <= len; i += 16) {
-        __m128i curr = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + i));
-        __m128i prev = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + i - 1));
+        __m128i curr =
+            _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + i));
+        __m128i prev =
+            _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + i - 1));
         int mask = ~_mm_movemask_epi8(_mm_cmpeq_epi8(curr, prev)) & 0xFFFF;
         if (mask == 0) continue;
         while (mask) {
@@ -795,19 +796,20 @@ static inline int compact16_emit(
 // extract loop with table-lookup decode. Simpler and faster than the NEON
 // binary-reduction approach on x86.
 static inline int compact16_emit_sse(
-    __m128i data_vec,            // 16 one-hot bytes (BAM nibble values)
-    __m128i neq_vec,             // 0xFF where changed, 0x00 where same
-    const __m128i &decode_tbl,   // one-hot→2-bit decode table (16 entries)
-    uint8_t *rle_data,           // output: decoded 2-bit values
-    uint32_t *rle_pos,           // output: base positions
-    uint32_t pos_base            // position offset for this half
+    __m128i data_vec,           // 16 one-hot bytes (BAM nibble values)
+    __m128i neq_vec,            // 0xFF where changed, 0x00 where same
+    const __m128i &decode_tbl,  // one-hot→2-bit decode table (16 entries)
+    uint8_t *rle_data,          // output: decoded 2-bit values
+    uint32_t *rle_pos,          // output: base positions
+    uint32_t pos_base           // position offset for this half
 ) {
     int mask = _mm_movemask_epi8(neq_vec);
     if (mask == 0) return 0;
 
     // Extract changed lanes, decode one-hot→2-bit, store
     const __m128i lo_mask = _mm_set1_epi8(0x0F);
-    __m128i decoded = _mm_shuffle_epi8(decode_tbl, _mm_and_si128(data_vec, lo_mask));
+    __m128i decoded =
+        _mm_shuffle_epi8(decode_tbl, _mm_and_si128(data_vec, lo_mask));
 
     alignas(16) uint8_t dec_buf[16];
     _mm_store_si128(reinterpret_cast<__m128i *>(dec_buf), decoded);
@@ -895,8 +897,10 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
 
     // Scalar tail: remaining input bytes
     for (; byte_idx < len / 2; ++byte_idx) {
-        uint8_t hi_base = 27 - std::countl_zero(static_cast<unsigned>(data[byte_idx]));
-        uint8_t lo_base = std::countr_zero(static_cast<unsigned>(data[byte_idx]));
+        uint8_t hi_base =
+            27 - std::countl_zero(static_cast<unsigned>(data[byte_idx]));
+        uint8_t lo_base =
+            std::countr_zero(static_cast<unsigned>(data[byte_idx]));
         int64_t hi_pos = byte_idx * 2;
         int64_t lo_pos = byte_idx * 2 + 1;
         if (hi_pos > 0) {
@@ -915,7 +919,8 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
         }
     }
     if (len % 2 == 1) {
-        uint8_t last_base = 27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
+        uint8_t last_base =
+            27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
         if (last_base != rle_data[out - 1]) {
             rle_data[out] = last_base;
             rle_pos[out] = static_cast<uint32_t>(len - 1);
@@ -924,11 +929,11 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
     }
 #elif defined(__SSSE3__)
     const __m128i lo_mask = _mm_set1_epi8(0x0F);
-    const __m128i decode_tbl = _mm_loadu_si128(
-        reinterpret_cast<const __m128i *>(decode4_tbl_arr));
+    const __m128i decode_tbl =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(decode4_tbl_arr));
     // Mask to clear lane 0 (for skipping already-emitted first base)
     const __m128i clear_lane0_mask = _mm_set_epi8(
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0);
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0);
 
     // Track last one-hot value for cross-chunk comparison.
     __m128i prev_last = _mm_set1_epi8(static_cast<char>(data[0] >> 4));
@@ -937,8 +942,8 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
     // Each iteration processes 16 input bytes → 32 bases.
     for (; byte_idx + 16 <= len / 2; byte_idx += 16) {
         // Phase 1: Unpack BAM nibbles to one-hot bytes
-        __m128i v = _mm_loadu_si128(
-            reinterpret_cast<const __m128i *>(data + byte_idx));
+        __m128i v =
+            _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + byte_idx));
         __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), lo_mask);
         __m128i lo = _mm_and_si128(v, lo_mask);
         // Interleave hi/lo to get 32 one-hot bases in two registers
@@ -952,14 +957,11 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
         prev_last = d1;
 
         // Phase 3: Compare each base with its predecessor
-        __m128i neq0 = _mm_xor_si128(_mm_cmpeq_epi8(d0, p0),
-                                      _mm_set1_epi8(-1));
-        __m128i neq1 = _mm_xor_si128(_mm_cmpeq_epi8(d1, p1),
-                                      _mm_set1_epi8(-1));
+        __m128i neq0 = _mm_xor_si128(_mm_cmpeq_epi8(d0, p0), _mm_set1_epi8(-1));
+        __m128i neq1 = _mm_xor_si128(_mm_cmpeq_epi8(d1, p1), _mm_set1_epi8(-1));
 
         // Base 0 was already emitted; mark as unchanged.
-        if (byte_idx == 0)
-            neq0 = _mm_and_si128(neq0, clear_lane0_mask);
+        if (byte_idx == 0) neq0 = _mm_and_si128(neq0, clear_lane0_mask);
 
         // Fast path: skip if all 32 bases match their predecessors.
         int any_neq = _mm_movemask_epi8(_mm_or_si128(neq0, neq1));
@@ -969,21 +971,23 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
 
         // Phase 4: Extract changed bases via movemask + scalar loop
         if (_mm_movemask_epi8(neq0) != 0) {
-            out += compact16_emit_sse(d0, neq0, decode_tbl,
-                                      rle_data + out, rle_pos + out,
+            out += compact16_emit_sse(d0, neq0, decode_tbl, rle_data + out,
+                                      rle_pos + out,
                                       static_cast<uint32_t>(chunk_start));
         }
         if (_mm_movemask_epi8(neq1) != 0) {
-            out += compact16_emit_sse(d1, neq1, decode_tbl,
-                                      rle_data + out, rle_pos + out,
+            out += compact16_emit_sse(d1, neq1, decode_tbl, rle_data + out,
+                                      rle_pos + out,
                                       static_cast<uint32_t>(chunk_start + 16));
         }
     }
 
     // Scalar tail: remaining input bytes
     for (; byte_idx < len / 2; ++byte_idx) {
-        uint8_t hi_base = 27 - std::countl_zero(static_cast<unsigned>(data[byte_idx]));
-        uint8_t lo_base = std::countr_zero(static_cast<unsigned>(data[byte_idx]));
+        uint8_t hi_base =
+            27 - std::countl_zero(static_cast<unsigned>(data[byte_idx]));
+        uint8_t lo_base =
+            std::countr_zero(static_cast<unsigned>(data[byte_idx]));
         int64_t hi_pos = byte_idx * 2;
         int64_t lo_pos = byte_idx * 2 + 1;
         if (hi_pos > 0) {
@@ -1002,7 +1006,8 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
         }
     }
     if (len % 2 == 1) {
-        uint8_t last_base = 27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
+        uint8_t last_base =
+            27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
         if (last_base != rle_data[out - 1]) {
             rle_data[out] = last_base;
             rle_pos[out] = static_cast<uint32_t>(len - 1);
@@ -1012,8 +1017,10 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
 #else
     // Scalar fallback
     for (int64_t byte_idx = 0; byte_idx < len / 2; ++byte_idx) {
-        uint8_t hi_base = 27 - std::countl_zero(static_cast<unsigned>(data[byte_idx]));
-        uint8_t lo_base = std::countr_zero(static_cast<unsigned>(data[byte_idx]));
+        uint8_t hi_base =
+            27 - std::countl_zero(static_cast<unsigned>(data[byte_idx]));
+        uint8_t lo_base =
+            std::countr_zero(static_cast<unsigned>(data[byte_idx]));
         int64_t hi_pos = byte_idx * 2;
         int64_t lo_pos = byte_idx * 2 + 1;
         if (hi_pos > 0 || byte_idx > 0) {  // skip base 0 (already emitted)
@@ -1032,7 +1039,8 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
         }
     }
     if (len % 2 == 1) {
-        uint8_t last_base = 27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
+        uint8_t last_base =
+            27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
         if (last_base != rle_data[out - 1]) {
             rle_data[out] = last_base;
             rle_pos[out] = static_cast<uint32_t>(len - 1);
