@@ -1,8 +1,7 @@
 #ifndef NIBBLE2BASE_HPP
 #define NIBBLE2BASE_HPP
-// #include <sys/_types/_u_char.h>
+
 #include <cassert>
-#include <concepts>
 #include <cstdint>
 #include <cstring>
 #include <gtl/vector.hpp>
@@ -501,43 +500,6 @@ struct CrumbledSubSeq64 {
             base_index += count;
         };
 
-#if 0 && (defined(__ARM_NEON) || defined(__ARM_NEON__))
-        // Align to word boundary so the NEON path works for any skip_first_n.
-        if (len >= bases_per_word) {
-            const size_t total = len + skip_first_n;
-            const size_t blocks =
-                (total + bases_per_word - 1) / bases_per_word;
-            const uint64_t *word_ptr = data;
-            auto *out = reinterpret_cast<uint8_t *>(buffer);
-
-            static const uint8x8_t ascii_table =
-                {'A', 'C', 'G', 'T', 'A', 'C', 'G', 'T'};
-            const uint8x8_t mask = vdup_n_u8(0x3);
-
-            for (size_t b = 0; b < blocks; ++b) {
-                const uint8x8_t packed =
-                    vld1_u8(reinterpret_cast<const uint8_t *>(word_ptr));
-
-                const uint8x8_t c0 = vand_u8(packed, mask);
-                const uint8x8_t c1 = vand_u8(vshr_n_u8(packed, 2), mask);
-                const uint8x8_t c2 = vand_u8(vshr_n_u8(packed, 4), mask);
-                const uint8x8_t c3 = vand_u8(vshr_n_u8(packed, 6), mask);
-
-                uint8x8x4_t expanded;
-                expanded.val[0] = vtbl1_u8(ascii_table, c0);
-                expanded.val[1] = vtbl1_u8(ascii_table, c1);
-                expanded.val[2] = vtbl1_u8(ascii_table, c2);
-                expanded.val[3] = vtbl1_u8(ascii_table, c3);
-
-                vst4_u8(out, expanded);
-
-                word_ptr++;
-                out += bases_per_word;
-            }
-            buffer[total] = '\0';
-            return buffer + skip_first_n;
-        }
-#endif
         scalar_emit(len);
         buffer[len] = '\0';
         return buffer;

@@ -1,24 +1,52 @@
 # CMakeLists.txt
 cmake_minimum_required(VERSION 3.20)
 project(lasm)
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(CMAKE_CXX_USING_LINKER_mold)
+
+# Use the mold linker when available (much faster links). mold only links ELF,
+# so verify the compiler actually accepts it before selecting it -- on macOS
+# (Mach-O) the flag is present but unusable.
+find_program(MOLD_LINKER mold)
+if(MOLD_LINKER)
+    include(CheckLinkerFlag)
+    check_linker_flag(CXX "-fuse-ld=mold" LASM_HAVE_MOLD)
+    if(LASM_HAVE_MOLD)
+        if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.29)
+            set(CMAKE_LINKER_TYPE MOLD)
+        else()
+            add_link_options(-fuse-ld=mold)
+        endif()
+        message(STATUS "Using mold linker: ${MOLD_LINKER}")
+    endif()
+endif()
+
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 enable_testing()
+# Build options
+option(LASM_NATIVE "Optimize for the build host CPU (-march=native); produces non-portable binaries" OFF)
+
 # Compiler flags
 # Debug flags
-set(CMAKE_CXX_FLAGS_DEBUG "-g -pg -O0 -DDEBUG -Wall -Wextra -Wpedantic -fsanitize=undefined,null,bounds -fsanitize-trap=all")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG -Wall -Wextra -Wpedantic -fsanitize=undefined,null,bounds -fsanitize-trap=all")
 # Release flags
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -pg -march=native -ftree-vectorize -DNDEBUG -Wall -Wextra -Wpedantic")
-# RelWithDebInfo flags
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG -Wall -Wextra -mtune=native -ftree-vectorize -march=native")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -ftree-vectorize -DNDEBUG -Wall -Wextra -Wpedantic")
+# RelWithDebInfo flags — includes gprof instrumentation (-pg, -no-pie)
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -pg -DNDEBUG -Wall -Wextra -ftree-vectorize")
+set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "-pg -no-pie")
 # MinSizeRel flags
 set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG")
+
+# Optimize for the host CPU only when explicitly requested (non-portable;
+# default off so distributed binaries run on other machines).
+if(LASM_NATIVE)
+    add_compile_options($<$<CONFIG:Release,RelWithDebInfo>:-march=native>)
+    add_compile_options($<$<CONFIG:RelWithDebInfo>:-mtune=native>)
+endif()
 
 if(PGO_GENERATE)
     message(STATUS "Building with PGO instrumentation")
@@ -29,26 +57,18 @@ if(PGO_USE)
     add_compile_options(-fprofile-use=${PROFILE_DATA_FILE} -fprofile-correction)
     add_link_options(-fprofile-use=${PROFILE_DATA_FILE})
 endif()
-# Set linker flags for release builds
-if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -no-pie")
-endif()
-
 # # Remove problematic flags in debug mode
 # if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 #     # Remove optimization that can interfere with debugging
 #     string(REPLACE "-Wno-interference-size" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 # endif()
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(HTS REQUIRED htslib)
-include_directories(${HTS_INCLUDE_DIRS})
-link_directories(${HTS_LIBRARY_DIRS})
-add_definitions(${HTS_CFLAGS_OTHER})
+pkg_check_modules(HTS REQUIRED IMPORTED_TARGET htslib)
 
-set(SOURCE_FILES lasm.cpp asm2.cpp lcmer.cpp map.cpp dump_cores.cpp)
-include_directories(./ext)
+set(SOURCE_FILES lasm.cpp asm2.cpp lcmer.cpp dump_cores.cpp)
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
+target_include_directories(${PROJECT_NAME} PRIVATE ./ext)
 
 # External dependencies
 include(FetchContent)
@@ -84,30 +104,35 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(libbloom)
 
 # Link libraries
-target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11
+target_link_libraries(${PROJECT_NAME} PRIVATE
+                      PkgConfig::HTS gtl CLI11::CLI11
                       concurrentqueue pthread deflate z
                       $<$<PLATFORM_ID:Linux>:rt>)
 
-# Unit tests (doctest)
-# Lightweight DBG builder test tool (single-thread, no bloom/locks).
-#
-# IMPORTANT:
-# - Rely on stb-style header-only lcptools implementation (included by the tool),
-#   so do not link ext/lcptools/*.c here.
-# - Do NOT link lcmer.cpp here, because it includes doctest-based tests and
-#   will pull doctest runtime symbols at link time.
-# Temporarily disabled - source file missing
-# add_executable(light_dbg_build
-#     tools/light_dbg_build.cpp
-# )
-# target_include_directories(light_dbg_build PRIVATE . ./ext)
-# target_link_libraries(light_dbg_build PRIVATE gtl CLI11::CLI11)
-# target_compile_definitions(light_dbg_build PRIVATE
-#     SYNCMER_RULE=DensitySyncmerRule
-# )
+# ── Unit tests (doctest) ────────────────────────────────────────────
+# The TEST_CASE bodies live inline in asm2.cpp / lcmer.cpp because they
+# exercise TU-internal functions. The production `lasm` binary strips them via
+# DOCTEST_CONFIG_DISABLE (see compile definitions below); this target recompiles
+# the same TUs together with doctest's main (tests/test_main.cpp) so the tests
+# run for real, without shipping any test code in the production binary.
+add_executable(lasm_tests
+    tests/test_main.cpp
+    asm2.cpp
+    lcmer.cpp
+    dump_cores.cpp
+)
+target_include_directories(lasm_tests PRIVATE . ./ext)
+target_link_libraries(lasm_tests PRIVATE
+                      PkgConfig::HTS gtl CLI11::CLI11
+                      concurrentqueue pthread deflate z
+                      $<$<PLATFORM_ID:Linux>:rt>)
+target_compile_definitions(lasm_tests PRIVATE
+    __STDC_FORMAT_MACROS=1
+    SYNCMER_RULE=DensitySyncmerRule
+)
+add_test(NAME unit COMMAND lasm_tests)
 
-# Tests and custom targets
-add_test(NAME test COMMAND lasm hifi ../tests/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8 --density 0.05)
+# Convenience target: run the assembler on a local sample (data not in repo).
 add_custom_target(rtest COMMAND lasm hifi test/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8)
 add_dependencies(rtest ${PROJECT_NAME})
 
@@ -120,18 +145,21 @@ add_custom_target(debug
 
 
 # Compile definitions
-target_compile_definitions(${PROJECT_NAME} PUBLIC
+# DOCTEST_CONFIG_DISABLE strips the inline TEST_CASE bodies (in asm2.cpp /
+# lcmer.cpp) from the production binary; the tests are built into lasm_tests.
+target_compile_definitions(${PROJECT_NAME} PRIVATE
     __STDC_FORMAT_MACROS=1
     SYNCMER_RULE=DensitySyncmerRule
+    DOCTEST_CONFIG_DISABLE
 )
 
 
 
 # Debug-specific definitions
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_definitions(${PROJECT_NAME} PUBLIC DEBUG_MODE=1)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE DEBUG_MODE=1)
 
     # Enable additional debug features
-    target_compile_definitions(${PROJECT_NAME} PUBLIC ENABLE_DEBUG_LOGGING=1)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ENABLE_DEBUG_LOGGING=1)
 
 endif()

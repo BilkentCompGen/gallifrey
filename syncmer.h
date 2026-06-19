@@ -104,7 +104,7 @@ struct DensitySyncmerRule {
     HASH_FUNCTION hf;
     int_type mask;
     constexpr int_type k() const { return cfg.k; }
-    constexpr double density() const { return cfg.density; }
+    constexpr double density() const { return cfg.density.value(); }
     constexpr int_type threshold() const {
         return density() * std::numeric_limits<int_type>::max();
     }
@@ -135,9 +135,9 @@ struct GenericSyncmerRule {
     gtl::vector<bool> table;
 
     constexpr int_type k() const { return cfg.k; }
-    constexpr int_type s() const { return cfg.mincode.s; }
-    constexpr int_type t() const { return cfg.mincode.t; }
-    constexpr double density() const { return cfg.density; }
+    constexpr int_type s() const { return cfg.mincode.s.value(); }
+    constexpr int_type t() const { return cfg.mincode.t.value(); }
+    constexpr double density() const { return cfg.density.value(); }
     constexpr int_type threshold() const {
         return density() * std::numeric_limits<int_type>::max();
     }
@@ -152,7 +152,7 @@ struct GenericSyncmerRule {
           table_size{2 << (2 * k() - 1)},
           pure_lcp(false),
           table(table_size, 0) {
-        if (s() != cfg.invalid_param_value) {
+        if (cfg.mincode.s.has_value()) {
             s_mask = (1U << s()) - 1U;
         } else {
             s_mask = -1;

@@ -9,7 +9,6 @@
 #include "asm.h"
 #include "dump_cores.h"
 #include "ext/lcptools/lcptools_ho.h"
-#include "htslib/sam.h"
 #include "lcmer.h"
 #include "syncmer.h"
 
@@ -117,38 +116,24 @@ static int run_dump_cores(const std::string &input_path,
     return 0;
 }
 
-int dump_cores_program(CLI::App &parent) {
-    struct parameters {
-        std::string input;
-        std::string output;
-        int syncmer_k;
-        int submer_s;
-        int submer_t;
-        int lcp_level;
-        uint64_t seed;
-    };
-    auto *app_ =
-        parent.add_subcommand("dump-cores", "Read FASTA and dump LCP cores");
-    auto &app = *app_;
-    parameters *p = new parameters{"", "", 11, 4, 5, 4, 0};
-    app.add_option("input", p->input, "Input FASTA file")->required();
-    app.add_option("-o,--output", p->output, "Output TSV file")->required();
-    app.add_option("--syncmer-k", p->syncmer_k, "K-mer length")
+DumpCoresProgram::DumpCoresProgram(CLI::App &parent) {
+    auto &app =
+        *parent.add_subcommand("dump-cores", "Read FASTA and dump LCP cores");
+    app.add_option("input", input, "Input FASTA file")->required();
+    app.add_option("-o,--output", output, "Output TSV file")->required();
+    app.add_option("--syncmer-k", syncmer_k, "K-mer length")
         ->capture_default_str();
-    app.add_option("--submer-s", p->submer_s,
+    app.add_option("--submer-s", submer_s,
                    "Size of submers for mincode syncmers")
         ->capture_default_str();
-    app.add_option("--submer-t", p->submer_t,
+    app.add_option("--submer-t", submer_t,
                    "Position of submers for mincode syncmers")
         ->capture_default_str();
-    app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
+    app.add_option("-l,--level", lcp_level, "LCP level to compute")
         ->capture_default_str();
-    app.add_option("--seed", p->seed, "Random seed")->capture_default_str();
-    app.callback([=]() {
-        int ret = run_dump_cores(p->input, p->output, p->syncmer_k, p->submer_s,
-                                 p->submer_t, p->lcp_level, p->seed);
-        delete p;
-        return ret;
+    app.add_option("--seed", seed, "Random seed")->capture_default_str();
+    app.callback([this]() {
+        return run_dump_cores(input, output, syncmer_k, submer_s, submer_t,
+                              lcp_level, seed);
     });
-    return 0;
 }

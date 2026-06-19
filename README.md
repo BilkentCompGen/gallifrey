@@ -5,12 +5,12 @@
 Requirements:
 
 - CMake >= 3.20
-- C++20 compiler
+- C++23 compiler
 - `htslib`
 - `zlib`
 - POSIX threads
 
-Build:
+Build (defaults to `Release`):
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -21,6 +21,35 @@ The main executable is:
 
 ```bash
 ./build/lasm
+```
+
+### Build types
+
+Select a build type with `-DCMAKE_BUILD_TYPE=<type>`. Each writes to its own
+build directory so you can keep them side by side.
+
+| Type | Flags (summary) | 
+|------|-----------------|
+| `Release` (default) | `-O3 -g -ftree-vectorize -DNDEBUG` |
+| `RelWithDebInfo` | `-O2 -g -pg -DNDEBUG` | 
+| `Debug` | `-O0 -g -DDEBUG` + UBSan (`-fsanitize=undefined,null,bounds -fsanitize-trap=all`) | 
+| `MinSizeRel` | `-Os -DNDEBUG` |
+
+### Build options
+- `LASM_NATIVE` — add `-march=native`
+
+```bash
+# Default build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+# Fastest local build for this machine
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLASM_NATIVE=ON
+cmake --build build -j
+
+# Profiling build with native tuning (produces gmon.out after a run)
+cmake -S . -B build-prof -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLASM_NATIVE=ON
+cmake --build build-prof -j
 ```
 
 ## Input

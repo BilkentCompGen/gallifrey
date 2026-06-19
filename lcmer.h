@@ -68,7 +68,7 @@ struct charsi_base {
             free(data);
             size_t target_cap = capacity * sizeof(T);
             target_cap = (target_cap | align_block_mask) + 1;
-            data = (decltype(data))std::aligned_alloc(32, target_cap);
+            data = (decltype(data))aligned_alloc(32, target_cap);
         }
         return data == NULL;
     }
@@ -119,41 +119,6 @@ struct lcp_read {
 
 template <int N>
 struct lcmer {
-    // static uint32_t MaskedMurmur3(const std::array<uint32_t, N> &key,
-    //                               uint32_t seed) {
-    //     //        const uint8_t *data = (const uint8_t *)key;
-
-    //     uint32_t h1 = seed;
-
-    //     const uint32_t c1 = 0xcc9e2d51;
-    //     const uint32_t c2 = 0x1b873593;
-
-    //     // Body: Process blocks of 4 bytes at a time
-    //     const uint32_t *blocks = key.data() + N;
-
-    //     for (int i = -N; i; i++) {
-    //         uint32_t k1 = lcmer<N>::mask[i + N] ? blocks[i] : 0;
-
-    //         k1 *= c1;
-    //         k1 = (k1 << 15) | (k1 >> (32 - 15));
-    //         k1 *= c2;
-
-    //         h1 ^= k1;
-    //         h1 = (h1 << 15) | (h1 >> (32 - 15));
-    //         h1 = h1 * 5 + 0xe6546b64;
-    //     }
-    //     // Finalization: Mix the hash to ensure the last few bits are fully
-    //     // mixed
-    //     // h1 ^= (N*4);
-
-    //     /* fmix32 */
-    //     h1 ^= h1 >> 16;
-    //     h1 *= 0x85ebca6b;
-    //     h1 ^= h1 >> 13;
-    //     h1 *= 0xc2b2ae35;
-    //     h1 ^= h1 >> 16;
-    //     return h1;
-    // }
     static constexpr size_t size = N;
     std::array<uint32_t, N> data;
 
@@ -172,10 +137,6 @@ struct lcmer {
     bool operator==(const lcmer &other) const {
         return memcmp(data.data(), other.data.data(), N * sizeof(uint32_t)) ==
                0;
-        // for (int i = 0; i < N; ++i) {
-        //     if (data[i] != other.data[i]) return false;
-        // }
-        // return true;
     }
     bool operator<(const lcmer &other) const {
         for (int i = 0; i < N; ++i) {

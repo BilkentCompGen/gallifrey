@@ -6,17 +6,17 @@
 #include <inttypes.h>
 #include <stdint.h>
 
+#include <optional>
 #include <string>
 #include <vector>
 struct syncmer_params {
-    static constexpr unsigned long invalid_param_value = 127127127;
     enum class typeenum { Density, MinCodeOpen, MinCodeClosed, Invalid };
     constexpr typeenum type() const {
-        if (invalid_density != invalid_param_value) {
+        if (density.has_value()) {
             return typeenum::Density;
         }
-        if (mincode.s != invalid_param_value) {
-            if (mincode.t != invalid_param_value) {
+        if (mincode.s.has_value()) {
+            if (mincode.t.has_value()) {
                 return typeenum::MinCodeOpen;
             } else {
                 return typeenum::MinCodeClosed;
@@ -25,13 +25,10 @@ struct syncmer_params {
         return typeenum::Invalid;
     }
     unsigned k = 8;
-    union {
-        double density;
-        unsigned long invalid_density = invalid_param_value;
-    };
+    std::optional<double> density;
     struct {
-        unsigned long s = invalid_param_value;
-        unsigned long t = invalid_param_value;
+        std::optional<unsigned long> s;
+        std::optional<unsigned long> t;
     } mincode;
     std::string spaced_seed_mask = "11111111111111111111111111111111";
     uint64_t compute_spaced_mask() const {
@@ -73,17 +70,20 @@ struct syncmer_params {
     void print_cfg(FILE *f) const {
         fprintf(f, "spaced-seed-mask: \"%s\"\n", spaced_seed_mask.c_str());
         fprintf(f, "k: %d\n", k);
-        if (invalid_density != invalid_param_value) {
+        if (density.has_value()) {
             fprintf(f, "kmer-selection: \"density\"\n");
-            fprintf(f, "Density: %f\n", density);
-        } else {
-            if (mincode.t != invalid_param_value) {
+            fprintf(f, "Density: %f\n", *density);
+        } else if (mincode.s.has_value()) {
+            if (mincode.t.has_value()) {
                 fprintf(f, "kmer-selection: \"open-syncmers\"\n");
-                fprintf(f, "syncmer-s:%lu\nsyncmer-t:%lu\n", mincode.s, mincode.t);
+                fprintf(f, "syncmer-s:%lu\nsyncmer-t:%lu\n", *mincode.s,
+                        *mincode.t);
             } else {
                 fprintf(f, "kmer-selection: \"closed-syncmers\"\n");
-                fprintf(f, "syncmer-s: %lu\n", mincode.s);
+                fprintf(f, "syncmer-s: %lu\n", *mincode.s);
             }
+        } else {
+            fprintf(f, "kmer-selection: \"none\"\n");
         }
     }
 };
@@ -153,5 +153,4 @@ struct asm_config {
 
 
 int run_assembly(const asm_config &param);
-int run_mapping(const asm_config &param);
 #endif

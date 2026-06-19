@@ -16,3 +16,4 @@ target_compile_features.cmake
 *.json
 build*/*
 *.idx
+.DS_STORE
