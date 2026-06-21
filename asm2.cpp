@@ -1062,7 +1062,12 @@ int run_assembly(const asm_config &cfg) {
                        "Count forward edges");
 
     if (cfg.print_precleanup_graph) {
-        FILE *out = fopen((cfg.output + ".raw").c_str(), "w");
+        const std::string raw_path = cfg.output + ".raw";
+        FILE *out = fopen(raw_path.c_str(), "w");
+        if (!out) {
+            fprintf(stderr, "Cannot open output: %s\n", raw_path.c_str());
+            return 1;
+        }
         print_dbg_seqs(out, dbg);
         fclose(out);
 
@@ -1076,7 +1081,12 @@ int run_assembly(const asm_config &cfg) {
 
     // Dump pre-layout unitig graph
     {
-        FILE *pre = fopen((cfg.output + ".pre_layout").c_str(), "w");
+        const std::string pre_path = cfg.output + ".pre_layout";
+        FILE *pre = fopen(pre_path.c_str(), "w");
+        if (!pre) {
+            fprintf(stderr, "Cannot open output: %s\n", pre_path.c_str());
+            return 1;
+        }
         print_dbg_seqs(pre, dbg);
         fclose(pre);
     }
@@ -1084,6 +1094,10 @@ int run_assembly(const asm_config &cfg) {
     // Later stages commented out for profiling graph building
     {
         FILE *out = fopen(cfg.output.c_str(), "w");
+        if (!out) {
+            fprintf(stderr, "Cannot open output: %s\n", cfg.output.c_str());
+            return 1;
+        }
         // print_dbg_seqs(out, dbg);
         layout_graph_emit::emit_ultra_merged_graph(as, dbg, out);
         fclose(out);

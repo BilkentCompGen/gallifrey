@@ -98,12 +98,7 @@ inline void unroll_cycles(layout_small_graph &lsg) {
             gtl::vector<SequenceContainerType> seq_copy;
             seq_copy.reserve(orig.seq.size());
             for (const auto &s : orig.seq) {
-                size_t n_words =
-                    SequenceContainerType::storage_size(s.len + s.skip_first_n);
-                uint64_t *buf = new uint64_t[n_words];
-                std::memcpy(buf, s.data, n_words * sizeof(uint64_t));
-                seq_copy.emplace_back(s.len, s.skip_first_n, buf,
-                                      s.origin_node);
+                seq_copy.push_back(SequenceContainerType::copy_of(s));
             }
             dups.push_back({id, dup_id,
                             static_cast<unsigned>(orig.counts.core_count),
