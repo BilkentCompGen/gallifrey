@@ -1,6 +1,7 @@
 #ifndef _SYNCMER_H_
 #define _SYNCMER_H_
 
+#include <cassert>
 #include <concepts>
 #include <cstdint>
 #include <limits>
@@ -196,8 +197,10 @@ struct GenericSyncmerRule {
             }
             case syncmer_params::typeenum::Invalid:
             default:
-                fprintf(stderr, "Invalid syncmer type\n");
-                exit(EXIT_FAILURE);
+                // Unreachable: syncmer_params::validate() rejects Invalid
+                // before any functor is constructed.
+                assert(false && "syncmer type validated before construction");
+                __builtin_unreachable();
         }
     }
 };

@@ -325,7 +325,7 @@ struct assembler {
 
     // Populates the caller-owned dbgi. The dbg_index lives in the caller's
     // storage (see run_assembly) so it is not heap-allocated here.
-    void construct_dbg(dbg_index &dbgi) {
+    std::expected<void, std::string> construct_dbg(dbg_index &dbgi) {
         dqt data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
         dqt recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
         std::atomic<bool> done{false};
@@ -365,13 +365,18 @@ struct assembler {
                 if (!generate_data(input, std::ref(data_queue),
                                    std::ref(recycle_queue), threads.io)) {
                     fprintf(stderr, "Failed to read from input %s\n", input.c_str());
+                    read_failed.store(true);
                     break;
                 }
             }
         }
         if (read_failed.load()) {
-            fprintf(stderr, "Error in reading data for DBG construction. Terminating.\n");
-            exit(-1);
+            done.store(true);
+            for (auto &worker : workers) {
+                worker.join();
+            }
+            return std::unexpected(
+                "Error in reading data for DBG construction.");
         }
 
         done.store(true);
@@ -387,6 +392,7 @@ struct assembler {
         }
         fprintf(stderr, "%" PRIu64 " processed\n%" PRIu64 " total reads\n",
                 valid_sum, all_sum);
+        return {};
     }
 
     auto convert2basespace(dbg_index &dbgi) -> int {
@@ -431,8 +437,12 @@ struct assembler {
             }
         }
         if (read_failed.load()) {
+            done.store(true);
+            for (auto &worker : workers) {
+                worker.join();
+            }
             fprintf(stderr, "Error in reading data for basespace conversion\n");
-            exit(-1);
+            return -1;
         }
 
         done.store(true);
@@ -1021,6 +1031,13 @@ static bool validate_path(const std::string &path) {
 int run_assembly(const asm_config &cfg) {
     if (!validate_path(cfg.output)) return 1;
 
+    // Validate the syncmer configuration once, up front, before any syncmer
+    // functor is constructed (the functor ctor assumes a valid mask/mode).
+    if (auto v = cfg.syncmer.validate(); !v) {
+        fprintf(stderr, "Error: %s\n", v.error().c_str());
+        return 1;
+    }
+
     if (!cfg.silent) cfg.print_cfg(stderr);
     // free(malloc(1024ULL * 1024 * 1024 * 20)); INTIMIDATE the OS for the
     // ram
@@ -1034,7 +1051,10 @@ int run_assembly(const asm_config &cfg) {
     NoDestructor<dbg_index> dbg_storage(cfg.bloom.false_positive_rate,
                                         cfg.bloom.projected_count, cfg.seed);
     dbg_index &dbg = *dbg_storage;
-    as.construct_dbg(dbg);
+    if (auto r = as.construct_dbg(dbg); !r) {
+        fprintf(stderr, "%s Terminating.\n", r.error().c_str());
+        return 1;
+    }
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "DBG construction");
 
     dbg.count_forward_edges();

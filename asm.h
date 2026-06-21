@@ -6,6 +6,8 @@
 #include <inttypes.h>
 #include <stdint.h>
 
+#include <cassert>
+#include <expected>
 #include <optional>
 #include <string>
 #include <vector>
@@ -31,11 +33,15 @@ struct syncmer_params {
         std::optional<unsigned long> t;
     } mincode;
     std::string spaced_seed_mask = "11111111111111111111111111111111";
-    uint64_t compute_spaced_mask() const {
+
+    // Validating mask builder: returns the packed mask or an error message.
+    // This is the single source of truth for mask parsing; the total
+    // compute_spaced_mask() below delegates here.
+    std::expected<uint64_t, std::string> compute_spaced_mask_checked() const {
         if (spaced_seed_mask.size() > 32) {
-            fprintf(stderr, "Error: mask string is too long %zu > 32\n",
-                    spaced_seed_mask.size());
-            exit(EXIT_FAILURE);
+            return std::unexpected(
+                "mask string is too long " +
+                std::to_string(spaced_seed_mask.size()) + " > 32");
         }
         uint64_t acc = -1;
         for (char c : spaced_seed_mask) {
@@ -53,19 +59,45 @@ struct syncmer_params {
                     acc |= 1;
                     break;
                 default:
-                    fprintf(stderr,
-                            "Error: invalid character '%c' in mask string\n",
-                            c);
-                    exit(EXIT_FAILURE);
+                    return std::unexpected(
+                        std::string("invalid character '") + c +
+                        "' in mask string");
             }
         }
-        if ((int64_t)acc != -1) {
+        return acc;
+    }
+
+    // Total accessor for the hot construction paths (member-init lists). The
+    // config is validated once up front via validate(); reaching the error
+    // branch here means that contract was broken.
+    uint64_t compute_spaced_mask() const {
+        auto r = compute_spaced_mask_checked();
+        if (!r) {
+            assert(false && "mask must be validated before use");
+            __builtin_unreachable();
+        }
+        if ((int64_t)*r != -1) {
             fprintf(stderr,
                     "Using spaced seeds with mask %s built into 0x%" PRIX64
                     "!\n",
-                    spaced_seed_mask.c_str(), acc);
+                    spaced_seed_mask.c_str(), *r);
         }
-        return acc;
+        return *r;
+    }
+
+    // Validate the whole syncmer configuration once, before any syncmer
+    // functor is constructed. Lets callers surface a clean error instead of
+    // exit()-ing from deep inside a constructor.
+    std::expected<void, std::string> validate() const {
+        if (type() == typeenum::Invalid) {
+            return std::unexpected(
+                std::string("Provide a k-mer selection: either --density or "
+                            "--submer-s (optionally with --submer-t)"));
+        }
+        if (auto r = compute_spaced_mask_checked(); !r) {
+            return std::unexpected(r.error());
+        }
+        return {};
     }
     void print_cfg(FILE *f) const {
         fprintf(f, "spaced-seed-mask: \"%s\"\n", spaced_seed_mask.c_str());

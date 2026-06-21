@@ -108,16 +108,19 @@ public:
                "cause misassembly if loop copy counts are mispredicted.")
             ->capture_default_str();
         app.callback([this]() {
-            // A k-mer selection mode is mandatory: require either --density or
-            // the mincode submer options. Throwing a CLI error makes CLI11
-            // print the message and exit with a non-zero status.
-            if (cfg.syncmer.type() == syncmer_params::typeenum::Invalid) {
-                throw CLI::ValidationError(
-                    "Provide a k-mer selection: either --density or --submer-s "
-                    "(optionally with --submer-t)");
+            // Validate the syncmer configuration (selection mode + mask) up
+            // front. Throwing a CLI error makes CLI11 print the message and
+            // exit with a non-zero status.
+            if (auto v = cfg.syncmer.validate(); !v) {
+                throw CLI::ValidationError(v.error());
             }
             cfg.parallel_file_reading = (file_reading_mode == "parallel");
-            return run_assembly(cfg);
+            // Propagate assembly failures to the process exit status: CLI11
+            // callbacks return void, so surface a nonzero result as a
+            // CLI::RuntimeError, which CLI11_PARSE prints and exits with.
+            if (int rc = run_assembly(cfg); rc != 0) {
+                throw CLI::RuntimeError("assembly failed", rc);
+            }
         });
     }
     AsmProgram(const AsmProgram &) = delete;
