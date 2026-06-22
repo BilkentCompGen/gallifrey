@@ -73,15 +73,28 @@ struct dbg_index_base {
     struct bidbg_val {
         struct counts_t {
             unsigned core_count;
-            unsigned forward_edge_count;
         };
 
         bidbg_val(unsigned core_count)
-            : redirected_flag(false), counts{core_count, 0}, seq{}, prev{} {}
+            : redirected_flag(false), forward_edge_count(0), counts{core_count},
+              seq{}, prev{} {}
         bidbg_val(unsigned core_count, u64 prev)
-            : redirected_flag(false), counts{core_count, 0}, seq{}, prev{prev} {}
+            : redirected_flag(false), forward_edge_count(0), counts{core_count},
+              seq{}, prev{prev} {}
 
         bool redirected_flag;
+        // forward_edge_count is deliberately OUTSIDE the redirect_to union
+        // (see RC_REVIEW.md RC1). Adjacent simple-path chains share their
+        // boundary node: one chain reads the boundary's forward_edge_count
+        // while the neighbouring chain (which owns that node as its seed)
+        // redirects it. Keeping fec out of the union means mark_redirected's
+        // redirect_to write never aliases the fec a concurrent walker reads,
+        // and fec itself is only ever written on representatives — never on a
+        // fec!=1 boundary node. It occupies the padding that already followed
+        // redirected_flag, so this costs zero extra bytes per node. core_count
+        // stays unioned with redirect_to because it is only ever touched by a
+        // node's own (single) owning chain, so it cannot race.
+        unsigned forward_edge_count;
         union {
             counts_t counts;
             u64 redirect_to;
@@ -110,7 +123,14 @@ struct dbg_index_base {
         }
 
         constexpr double avg_core_count() const {
-            return (double)counts.core_count / seq.size();
+            // Precondition: live (non-consumed) node. seq.empty() ⟺ the node
+            // was absorbed by another during simplification (see
+            // mark_redirected) and must be skipped via redirected() before
+            // calling this. The assert catches a broken invariant in debug/
+            // tests; the release path degrades to 0.0 rather than letting inf
+            // propagate into depth comparisons.
+            assert(!seq.empty());
+            return seq.empty() ? 0.0 : (double)counts.core_count / seq.size();
         }
     };
     using dbg_map_t = gtl::parallel_flat_hash_map<
@@ -167,7 +187,7 @@ struct dbg_index_base {
                 if (it == dbg.end()) {
                     continue;
                 }
-                it->second.counts.forward_edge_count++;
+                it->second.forward_edge_count++;
             }
         }
     }
@@ -284,7 +304,7 @@ struct GraphCleaning {
             const size_t len_proxy = it->second.seq.size();
             const bool topology_stable =
                 (it->second.prev.size() <= 1 &&
-                 it->second.counts.forward_edge_count <= 1);
+                 it->second.forward_edge_count <= 1);
             samples.push_back({d, len_proxy, topology_stable});
             lengths.push_back(len_proxy);
         }
@@ -459,13 +479,13 @@ struct GraphCleaning {
         if (current == dbg.end()) {
             return false;
         }
-        unsigned first_fec = current->second.counts.forward_edge_count;
+        unsigned first_fec = current->second.forward_edge_count;
         bool simplified = false;
         auto prev_it = dbg.find(current->second.prev[0]);
         gtl::vector<dbg_map_t::iterator> merged;
         unsigned cc_sum = 0;
         while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
-               prev_it->second.counts.forward_edge_count == 1) {
+               prev_it->second.forward_edge_count == 1) {
             if (prev_it != dbg.end()) {
                 cc_sum += current->second.counts.core_count;
                 merged.push_back(current);
@@ -484,7 +504,7 @@ struct GraphCleaning {
             redirect_deleted[id] = current->first;
         }
 
-        current->second.counts.forward_edge_count = first_fec;
+        current->second.forward_edge_count = first_fec;
         current->second.counts.core_count += cc_sum;
         for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
             // for (auto &seq : (*it)->second.seq)
@@ -505,8 +525,8 @@ struct GraphCleaning {
 
     static auto attempt_simplify_one_path_lockless(dbg_map_t &dbg,
                                                    redir_map &redirect_deleted,
-                                                   u64 id, auto starting_from,
-                                                   auto &to_delete) -> bool {
+                                                   u64 id,
+                                                   auto starting_from) -> bool {
         // Find a node we cannot simplify
         // Iterate backwards and merge until we cannot simplify
         // o->o->o->o->o->o -> o->o
@@ -516,14 +536,14 @@ struct GraphCleaning {
         if (current == dbg.end()) {
             return false;
         }
-        unsigned first_fec = current->second.counts.forward_edge_count;
+        unsigned first_fec = current->second.forward_edge_count;
         bool simplified = false;
         auto prev_hash = dbg.hash(current->second.prev[0]);
         auto prev_it = dbg.find(current->second.prev[0], prev_hash, no_lock);
         gtl::vector<dbg_map_t::iterator> merged;
         unsigned cc_sum = 0;
         while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
-               prev_it->second.counts.forward_edge_count == 1) {
+               prev_it->second.forward_edge_count == 1) {
             if (prev_it != dbg.end()) {
                 cc_sum += current->second.counts.core_count;
                 merged.push_back(current);
@@ -543,20 +563,16 @@ struct GraphCleaning {
             redirect_deleted[id] = current->first;
         }
 
-        current->second.counts.forward_edge_count = first_fec;
+        current->second.forward_edge_count = first_fec;
         current->second.counts.core_count += cc_sum;
         for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
             // for (auto &seq : (*it)->second.seq)
             gtl::vector<SequenceContainerType> &seqs = (*it)->second.seq;
             for (auto sit = seqs.begin(); sit != seqs.end(); ++sit) {
-                to_delete.emplace(sit->origin_node, current->first);
-
                 current->second.seq.emplace_back(std::move(*sit));
             }
             seqs.clear();
             (*it)->second.mark_redirected(current->first);
-
-            to_delete.emplace((*it)->first, current->first);
         }
 
         return simplified;
@@ -573,7 +589,7 @@ struct GraphCleaning {
             [&to_simplify_from, &no_lock, &dbg](
                 int tid, const dbg_index::dbg_map_t::value_type &item) {
                 // printf("TTTT:%d\n", tid);
-                if (item.second.counts.forward_edge_count != 1 &&
+                if (item.second.forward_edge_count != 1 &&
                     item.second.prev.size() == 1) {
                     auto ih = dbg.hash(item.first);
                     auto iit = dbg.find(item.first, ih, no_lock);
@@ -583,8 +599,16 @@ struct GraphCleaning {
                         auto prev_hash = dbg.hash(prev_id);
 
                         auto prev_it = dbg.find(prev_id, prev_hash, no_lock);
+                        // Seed only fec==1 predecessors here. A fec!=1
+                        // predecessor is already a type-1 seed (above), so
+                        // seeding it again would have two threads walk the
+                        // same chain -> RC1 race + double merge. With this
+                        // guard, type-1 (fec!=1) and type-2 (fec==1) seeds are
+                        // disjoint and every chain is owned by one thread.
+                        // (See RC_REVIEW.md RC1.)
                         if (prev_it != dbg.end() &&
-                            prev_it->second.prev.size() == 1) {
+                            prev_it->second.prev.size() == 1 &&
+                            prev_it->second.forward_edge_count == 1) {
                             to_simplify_from[tid].emplace_back(prev_id,
                                                                prev_it);
                         }
@@ -600,28 +624,18 @@ struct GraphCleaning {
             gtl::vector<std::pair<u64, dbg_index::dbg_map_t::iterator>>>
             &to_simplify,
         redir_map &redirect_deleted, auto &active_set) {
-        gtl::LockableBaseImpl<gtl::NullMutex>::DoNothing no_lock;
-
-        // int tid=0;
+        // Chains are node-disjoint (see simplify_simple_parallel_mark's seed
+        // guard), so each thread mutates only the nodes of its own chains with
+        // no synchronization. The shared redirect_deleted is a mutexed
+        // parallel map; active_set is pruned after the join (below) rather than
+        // via a per-node id list. (See RC_REVIEW.md RC1.)
         gtl::vector<std::thread> threads;
-        std::mutex del_mutex;
         for (size_t i = 0; i < to_simplify.size(); ++i) {
             threads.emplace_back(
                 [&](int i) {
-                    gtl::flat_hash_map<u64, u64> to_delete;
-                    // printf("tid: %d\n", tid++);
                     for (const auto &[node, it] : to_simplify[i]) {
-                        // printf("%llu\n", node);
-                        // auto hv = dbg.hash(node);
-                        // auto it = dbg.find(node, hv, no_lock);
-                        // attempt_simplify_one_path(dbg,lci, redirect_deleted,
-                        // it.first, auto starting_from, auto &to_delete);
                         attempt_simplify_one_path_lockless(
-                            dbg, redirect_deleted, node, it, to_delete);
-                    }
-                    std::lock_guard lock(del_mutex);
-                    for (const auto &[del, to] : to_delete) {
-                        active_set.erase(del);
+                            dbg, redirect_deleted, node, it);
                     }
                 },
                 i);
@@ -629,6 +643,18 @@ struct GraphCleaning {
 
         for (auto &thread : threads) {
             thread.join();
+        }
+
+        // Prune absorbed nodes from active_set by state, not by a stored id
+        // list: every node merged into a representative was marked
+        // redirected() during the sweep, and nodes no longer in dbg are gone.
+        for (auto it = active_set.begin(); it != active_set.end();) {
+            auto nit = dbg.find(*it);
+            if (nit == dbg.end() || nit->second.redirected()) {
+                it = active_set.erase(it);
+            } else {
+                ++it;
+            }
         }
 
         for (auto &node : dbg) {
@@ -639,7 +665,7 @@ struct GraphCleaning {
                     p = it->second;
                 } else if (p == node.first) {  // Self edge // TODO: reconsider
                                                // how this is done
-                    // node.second.counts.forward_edge_count--;
+                    // node.second.forward_edge_count--;
                     // self_idx = idx;
                 }
             }
@@ -660,19 +686,17 @@ struct GraphCleaning {
         // 8 threads
 
         // for (auto &dn : lci) {
-        gtl::flat_hash_map<u64, u64> to_delete;
         for (u64 node : active_set) {
             auto current = dbg.find(node);
             if (current == dbg.end()) {
-                to_delete.emplace(node, 0);
                 continue;
             }
 
             // Simple paths
-            if ((current->second.counts.forward_edge_count != 1 &&
+            if ((current->second.forward_edge_count != 1 &&
                  current->second.prev.size() == 1)) {
                 attempt_simplify_one_path_lockless(dbg, redirect_deleted, node,
-                                                   current, to_delete);
+                                                   current);
             } else if (current->second.prev.size() > 1) {
                 std::sort(current->second.prev.begin(),
                           current->second.prev.end());
@@ -681,13 +705,20 @@ struct GraphCleaning {
                     if (prev_it != dbg.end() &&
                         prev_it->second.prev.size() == 1) {
                         attempt_simplify_one_path_lockless(
-                            dbg, redirect_deleted, prev_id, prev_it, to_delete);
+                            dbg, redirect_deleted, prev_id, prev_it);
                     }
                 }
             }
         }
-        for (auto [del, to] : to_delete) {
-            active_set.erase(del);
+        // Prune absorbed nodes by state (mirrors the parallel sweep); no stored
+        // per-node id list. (See RC_REVIEW.md RC1.)
+        for (auto it = active_set.begin(); it != active_set.end();) {
+            auto nit = dbg.find(*it);
+            if (nit == dbg.end() || nit->second.redirected()) {
+                it = active_set.erase(it);
+            } else {
+                ++it;
+            }
         }
 
         for (auto &node : dbg) {
@@ -698,7 +729,7 @@ struct GraphCleaning {
                     p = it->second;
                 } else if (p == node.first) {  // Self edge // TODO: reconsider
                                                // how this is done
-                    // node.second.counts.forward_edge_count--;
+                    // node.second.forward_edge_count--;
                     // self_idx = idx;
                 }
             }
@@ -733,14 +764,14 @@ struct GraphCleaning {
             }
             if (current->second.avg_core_count() < min_core_depth) {
                 // Forlorn
-                if (current->second.counts.forward_edge_count == 0 &&
+                if (current->second.forward_edge_count == 0 &&
                     current->second.prev.size() == 0) {
                     dbg.erase(current);  // MARK
-                } else if (current->second.counts.forward_edge_count == 0 &&
+                } else if (current->second.forward_edge_count == 0 &&
                            current->second.prev.size() == 1) {
                     auto prev_it = dbg.find(current->second.prev[0]);
                     if (prev_it != dbg.end() && !prev_it->second.redirected()) {
-                        prev_it->second.counts.forward_edge_count--;
+                        prev_it->second.forward_edge_count--;
                     }
                     dbg.erase(current);  // MARK
                 }
@@ -753,7 +784,7 @@ struct GraphCleaning {
                     if (prev_it != dbg.end() && !prev_it->second.redirected()) {
                         if (prev_it->second.avg_core_count() < min_core_depth &&
                             prev_it->second.prev.size() == 0 &&
-                            prev_it->second.counts.forward_edge_count == 1) {
+                            prev_it->second.forward_edge_count == 1) {
                             dbg.erase(prev_it);  // MARK
                         }
                     }
@@ -775,7 +806,7 @@ struct GraphCleaning {
                             prev_it->second.seq.size() < max_tip_length &&
                             current->second.seq.size() > 2 * max_tip_length &&
                             prev_it->second.prev.size() == 0 &&
-                            prev_it->second.counts.forward_edge_count == 1) {
+                            prev_it->second.forward_edge_count == 1) {
                             dbg.erase(prev_it);  // MARK
                         }
                     }
@@ -820,7 +851,7 @@ struct GraphCleaning {
                                 auto nn = dbg.find(p1->second.prev[0]);
                                 if (nn != dbg.end() &&
                                     !nn->second.redirected()) {
-                                    nn->second.counts.forward_edge_count--;
+                                    nn->second.forward_edge_count--;
                                 }
                             } else if (p1->second.avg_core_count() /
                                            p2->second.avg_core_count() <
@@ -835,7 +866,7 @@ struct GraphCleaning {
                                 auto nn = dbg.find(p2->second.prev[0]);
                                 if (nn != dbg.end() &&
                                     !nn->second.redirected()) {
-                                    nn->second.counts.forward_edge_count--;
+                                    nn->second.forward_edge_count--;
                                 }
                             }
                         }
@@ -848,15 +879,17 @@ struct GraphCleaning {
         // Death by thousand cuts
         for (auto &node : active_set) {
             auto current = dbg.find(node);
-            if (current == dbg.end()) {
+            if (current == dbg.end() || current->second.redirected()) {
+                // Skip consumed husks: a redirected node's seq is empty and
+                // its active union member is redirect_to, not counts.
                 continue;
             }
             if (current->second.avg_core_count() < 2 &&
                 current->second.prev.size() == 1 &&
-                current->second.counts.forward_edge_count == 1) {
+                current->second.forward_edge_count == 1) {
                 auto prev_it = dbg.find(current->second.prev[0]);
                 if (prev_it != dbg.end())
-                    prev_it->second.counts.forward_edge_count--;
+                    prev_it->second.forward_edge_count--;
                 dbg.erase(current);
             }
         }
@@ -870,7 +903,7 @@ struct GraphCleaning {
             if (current == dbg.end() || current->second.redirected()) {
                 continue;
             }
-            if (current->second.counts.forward_edge_count == 2 &&
+            if (current->second.forward_edge_count == 2 &&
                 current->second.prev.size() == 2) {
                 // 2 in 2 out
                 //
@@ -887,7 +920,7 @@ struct GraphCleaning {
                         if (pit == dbg.end() || pit->second.redirected()) {
                             continue;
                         }
-                        if (pit->second.counts.forward_edge_count != 1 ||
+                        if (pit->second.forward_edge_count != 1 ||
                             pit->second.prev.size() != 1) {  // Prev is simple
                             continue;
                         }
@@ -940,7 +973,7 @@ struct GraphCleaning {
                 to_rm.push_back(
                     current->second.prev[merged_node_index_in_prev]);
                 // active_set.erase(current->second.prev[merged_node_index_in_prev]);
-                current->second.counts.forward_edge_count = 1;
+                current->second.forward_edge_count = 1;
                 if (merged_node_index_in_prev == 0) {
                     current->second.prev[0] = current->second.prev[1];
                 }
@@ -1106,7 +1139,7 @@ inline void print_dbg_seqs(FILE *out, const dbg_index &dbgi, int nthreads = 0) {
                     "\tLN:i:%zu\tRC:i:%d\tCC:i:%u\tBE:i:%zu\tFE:i:%u\n", sofar,
                     (int)(edges.avg_core_count() * sofar),
                     edges.counts.core_count, edges.prev.size(),
-                    edges.counts.forward_edge_count);
+                    edges.forward_edge_count);
 
         // L-lines for incoming edges.
         for (uint64_t nl : edges.prev) {
@@ -1163,7 +1196,7 @@ inline void print_dbg_seqs(FILE *out, const dbg_index &dbgi, int nthreads = 0) {
                             "\tLN:i:%zu\tRC:i:%d\tCC:i:%u\tBE:i:%zu\tFE:i:%u\n",
                             sofar, (int)(edges.avg_core_count() * sofar),
                             edges.counts.core_count, edges.prev.size(),
-                            edges.counts.forward_edge_count);
+                            edges.forward_edge_count);
 
                 for (uint64_t nl : edges.prev) {
                     if (dbgi.dbg.contains(nl))
@@ -1219,7 +1252,7 @@ inline void print_dbg_dot(const dbg_index &dbgi, int i) {
             fprintf(dot_file,
                     "\t%" PRIu64 " [label=\"%" PRIu64 "->%u,%zu,%zu,%d\"];\n",
                     node.first, node.first,
-                    node.second.counts.forward_edge_count,
+                    node.second.forward_edge_count,
                     node.second.prev.size(), node.second.seq.size(),
                     node.second.counts.core_count);
             for (auto &prev : node.second.prev) {
