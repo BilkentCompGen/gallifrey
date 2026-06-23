@@ -62,8 +62,7 @@ consteval int_type nextpowerof2(int_type v) {
 using u64 = uint64_t;
 using i64 = int64_t;
 using u32 = uint32_t;
-using DefaultBF =
-    bloom_interface<bloom_ext::BlockedLockedBloomFilter<0, std::mutex>>;
+using DefaultBF = bloom_interface<bloom_ext::BlockedAtomicBloomFilter<>>;
 template <class BFT = DefaultBF>
 struct dbg_index_base {
     using BloomFilterType = BFT;

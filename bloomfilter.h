@@ -4,7 +4,9 @@
 #define KOMIHASH_NS_CUSTOM komihash
 
 #include <algorithm>
+#include <atomic>
 #include <inttypes.h>
+#include <memory>
 #include <vector>
 #include <cmath>
 
@@ -229,6 +231,89 @@ struct BlockedLockedBloomFilter {
     std::vector<block_type> bv;
     std::unique_ptr<mutex_type[]> locks;
 };
+// Lock-free blocked Bloom filter. Same block geometry and sizing as
+// BlockedLockedBloomFilter, but the bit array is a flat array of atomic words:
+// Insert uses fetch_or, Query uses load (both relaxed -- nothing is published
+// *through* the filter, so no cross-location ordering is required). This removes
+// the data race between an unlocked Query and a locked Insert (RC_REVIEW.md RC2)
+// without a per-block mutex array (which, at one mutex per block, is as large as
+// the filter itself). atomic<block_type> is the same 8 bytes as the plain word,
+// so the bit vector costs the same and the lock array disappears entirely.
+template <int BLOCK_BYTES = hardware_constructive_interference_size>
+struct BlockedAtomicBloomFilter {
+    static constexpr int block_bytes = BLOCK_BYTES;
+    static constexpr int block_bits = block_bytes * 8;
+    using block_type = unsigned long long;
+    static constexpr int word_bits = sizeof(block_type) * 8;
+    static constexpr int words_per_block = block_bytes / sizeof(block_type);
+    static_assert(std::atomic<block_type>::is_always_lock_free,
+                  "atomic block word must be lock-free for this filter to be "
+                  "useful");
+
+    BlockedAtomicBloomFilter(int n, float eps)
+        : n(n),
+          epsilon(eps),
+          m{ComputeNumBits()},
+          k{ComputeNumHashFns()},
+          num_blocks{(m + block_bits - 1) / block_bits},
+          num_words{num_blocks * words_per_block},
+          bv{std::make_unique<std::atomic<block_type>[]>(num_words)} {
+        fprintf(stderr,
+                "BloomFilter(atomic): n=%d, eps=%.2e, m=%" PRIu64
+                ", k=%d, num_blocks=%" PRIu64 ", num_words=%" PRIu64 "\n",
+                n, epsilon, m, k, num_blocks, num_words);
+    }
+
+    uint64_t ComputeNumBits() {
+        return static_cast<uint64_t>(-1.44 * n * std::log2(epsilon) + 0.5);
+    }
+
+    int ComputeNumHashFns() {
+        return static_cast<int>(-std::log2(epsilon) + 0.5);
+    }
+
+    uint64_t BlockWordBase(uint32_t h1) const {
+        return static_cast<uint64_t>(h1 % num_blocks) * words_per_block;
+    }
+
+    void Insert(uint32_t h1, uint32_t h2) {
+        const uint64_t base = BlockWordBase(h1);
+        for (int i = 1; i < k; i++) {
+            uint32_t bit_pos = (h1 + i * h2) % block_bits;
+            bv[base + bit_pos / word_bits].fetch_or(
+                block_type(1) << (bit_pos % word_bits),
+                std::memory_order_relaxed);
+        }
+    }
+
+    bool Query(uint32_t h1, uint32_t h2) const {
+        bool result = true;
+        const uint64_t base = BlockWordBase(h1);
+        for (int i = 1; i < k; i++) {
+            uint32_t bit_pos = (h1 + i * h2) % block_bits;
+            result &= (bv[base + bit_pos / word_bits].load(
+                           std::memory_order_relaxed) >>
+                       (bit_pos % word_bits)) &
+                      1;
+        }
+        return result;
+    }
+
+    void Reset() {
+        for (uint64_t i = 0; i < num_words; i++)
+            bv[i].store(0, std::memory_order_relaxed);
+    }
+
+    int n;
+    float epsilon;
+
+    uint64_t m;
+    int k;
+    uint64_t num_blocks;
+    uint64_t num_words;
+    std::unique_ptr<std::atomic<block_type>[]> bv;
+};
+
 template <int Compensation>
 struct RegisterBlockedBloomFilter {
     RegisterBlockedBloomFilter(int n, float eps) : n(n), epsilon(eps) {
