@@ -466,62 +466,6 @@ struct GraphCleaning {
         return est;
     }
 
-    static auto attempt_simplify_one_path(dbg_map_t &dbg,
-                                          redir_map &redirect_deleted, u64 id,
-                                          auto starting_from, auto &to_delete)
-        -> bool {
-        // Find a node we cannot simplify
-        // Iterate backwards and merge until we cannot simplify
-        // o->o->o->o->o->o -> o->o
-
-        auto current = starting_from;
-        if (current == dbg.end()) {
-            return false;
-        }
-        unsigned first_fec = current->second.forward_edge_count;
-        bool simplified = false;
-        auto prev_it = dbg.find(current->second.prev[0]);
-        gtl::vector<dbg_map_t::iterator> merged;
-        unsigned cc_sum = 0;
-        while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
-               prev_it->second.forward_edge_count == 1) {
-            if (prev_it != dbg.end()) {
-                cc_sum += current->second.counts.core_count;
-                merged.push_back(current);
-
-                simplified = true;
-            } else {  // Prev is erased
-            }
-            current = prev_it;
-            if (prev_it->second.prev.size() > 0) {
-                prev_it = dbg.find(current->second.prev[0]);
-            } else {
-                break;
-            }
-        }
-        if (current->first != id) {
-            redirect_deleted[id] = current->first;
-        }
-
-        current->second.forward_edge_count = first_fec;
-        current->second.counts.core_count += cc_sum;
-        for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
-            // for (auto &seq : (*it)->second.seq)
-            gtl::vector<SequenceContainerType> &seqs = (*it)->second.seq;
-            for (auto sit = seqs.begin(); sit != seqs.end(); ++sit) {
-                to_delete.emplace(sit->origin_node, current->first);
-
-                current->second.seq.emplace_back(std::move(*sit));
-            }
-            seqs.clear();
-            (*it)->second.mark_redirected(current->first);
-
-            to_delete.emplace((*it)->first, current->first);
-        }
-
-        return simplified;
-    };
-
     static auto attempt_simplify_one_path_lockless(dbg_map_t &dbg,
                                                    redir_map &redirect_deleted,
                                                    u64 id,
@@ -673,69 +617,17 @@ struct GraphCleaning {
             }
         }
     }
+    // Unified simple-path simplification: discover node-disjoint chains in
+    // parallel (mark), then merge them lock-free (sweep). Used for both the
+    // initial pass and every cleaning iteration; threads==1 just means a single
+    // partition. Replaces the old divergent single-threaded simplify_simple_paths
+    // and the dead attempt_simplify_one_path. (See RC_REVIEW.md RC1.)
     static void simplify_simple_paths(dbg_index::dbg_map_t &dbg,
                                       redir_map &redirect_deleted,
-                                      auto &active_set) {
-        // TODO Parallel idea
-        // First run a parallel discovery step which does not modify the graph
-        // and finds the pairs of nodes we want to simplify (from, to) and
-        // extracts the sequences. On a single thread we fix the edges and add
-        // sequences to the target. Then in parallel we redirect marked nodes to
-        // simplified () Should reduce the time needed 4X (20s to 5s on HG) with
-        // 8 threads
-
-        // for (auto &dn : lci) {
-        for (u64 node : active_set) {
-            auto current = dbg.find(node);
-            if (current == dbg.end()) {
-                continue;
-            }
-
-            // Simple paths
-            if ((current->second.forward_edge_count != 1 &&
-                 current->second.prev.size() == 1)) {
-                attempt_simplify_one_path_lockless(dbg, redirect_deleted, node,
-                                                   current);
-            } else if (current->second.prev.size() > 1) {
-                std::sort(current->second.prev.begin(),
-                          current->second.prev.end());
-                for (auto &prev_id : current->second.prev) {
-                    auto prev_it = dbg.find(prev_id);
-                    if (prev_it != dbg.end() &&
-                        prev_it->second.prev.size() == 1) {
-                        attempt_simplify_one_path_lockless(
-                            dbg, redirect_deleted, prev_id, prev_it);
-                    }
-                }
-            }
-        }
-        // Prune absorbed nodes by state (mirrors the parallel sweep); no stored
-        // per-node id list. (See RC_REVIEW.md RC1.)
-        for (auto it = active_set.begin(); it != active_set.end();) {
-            auto nit = dbg.find(*it);
-            if (nit == dbg.end() || nit->second.redirected()) {
-                it = active_set.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        for (auto &node : dbg) {
-            int self_idx = -1;
-            for (auto &p : node.second.prev) {
-                auto it = redirect_deleted.find(p);
-                if (it != redirect_deleted.end()) {
-                    p = it->second;
-                } else if (p == node.first) {  // Self edge // TODO: reconsider
-                                               // how this is done
-                    // node.second.forward_edge_count--;
-                    // self_idx = idx;
-                }
-            }
-            if (self_idx != -1) {
-                node.second.prev.erase(node.second.prev.begin() + self_idx);
-            }
-        }
+                                      auto &active_set, int threads) {
+        auto to_simplify = simplify_simple_parallel_mark(dbg, threads);
+        simplify_simple_parallel_sweep(dbg, to_simplify, redirect_deleted,
+                                       active_set);
     }
 
     static void cut_tips(dbg_map_t &dbg, int min_core_depth,
@@ -1015,16 +907,8 @@ struct GraphCleaning {
             active_set.insert(node.first);
         }
         if (cfg.iterations > -1) {
-            if (acfg.threads.work > 1) {
-                auto to_simplify =
-                    simplify_simple_parallel_mark(dbgi.dbg, acfg.threads.work);
-                simplify_simple_parallel_sweep(dbgi.dbg, to_simplify,
-                                               redirect_deleted, active_set);
-            } else {
-                simplify_simple_paths(dbgi.dbg, redirect_deleted, active_set);
-            }
-            // simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted,
-            //                       active_set);
+            simplify_simple_paths(dbgi.dbg, redirect_deleted, active_set,
+                                  acfg.threads.work);
             IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                "Initial Simplification");
             cut_low_support_edges(dbgi.dbg, active_set);
@@ -1049,7 +933,12 @@ struct GraphCleaning {
                 // erase_if(dbgi.lci, [](const auto &node) {  // MARK
                 //     return node.second.id == lci_type::max_id;
                 // });
-                simplify_simple_paths(dbgi.dbg, redirect_deleted, active_set);
+                // Iterations run the simplify serially (single partition) --
+                // the committed behavior. Parallelizing them is a future perf
+                // win once RC3 (a residual cross-chain fec race in the parallel
+                // sweep -- see RC_REVIEW.md) is resolved. The initial pass above
+                // keeps the committed parallelism (threads.work).
+                simplify_simple_paths(dbgi.dbg, redirect_deleted, active_set, 1);
                 IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                    "Iteration %d done.", i);
             }
