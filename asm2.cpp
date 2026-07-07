@@ -37,6 +37,30 @@
 using std::string;
 enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 
+// OLC end-skip policy: cores skipped at each end of a DBG node before
+// overlap-anchoring (see find_lcmer_ranges). Written as function-like macros of
+// the OLC lcmer length `l` so they scale with --olc-lcmer-l and can be retuned
+// at compile time without editing source, e.g.:
+//   cmake -DCMAKE_CXX_FLAGS='-DOLC_SKIP_FIRST(l)=0 -DOLC_SKIP_LAST(l)=((l))'
+// The old (l, 2l) required >=4*l cores and forced ~29% of good nodes (chr22)
+// into singletons; the (1, l/2) default drops singleton contigs 87.0%->84.5%
+// and lifts N50 +13% with no extra misassemblies. A node needs
+// (l + OLC_SKIP_FIRST(l) + OLC_SKIP_LAST(l)) cores to anchor any overlap.
+#ifndef OLC_SKIP_FIRST
+#define OLC_SKIP_FIRST(l) (1)
+#endif
+#ifndef OLC_SKIP_LAST
+#define OLC_SKIP_LAST(l) ((l) / 2)
+#endif
+
+// Prototype: also keep one-directional (non-reciprocal) overlaps. When A finds
+// B but B never finds A, the reverse overlap normally gets dropped. Enabling
+// this synthesizes an approximate reverse span so those extra nodes can still
+// join a layout. Off by default; build with -DOLC_NONRECIPROCAL=1 to measure.
+#ifndef OLC_NONRECIPROCAL
+#define OLC_NONRECIPROCAL 0
+#endif
+
 struct assembler {
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
@@ -65,9 +89,23 @@ struct assembler {
           syncmer_params{cfg.syncmer},
           syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)},
           dbg_lcmer_l{cfg.dbg_lcmer_l},
-          olc_lcmer_l{cfg.dbg_lcmer_l},
+          olc_lcmer_l{cfg.olc_lcmer_l},
           parallel_file_reading{cfg.parallel_file_reading} {
         inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
+        // Overlap detection (fold_dbg_graph → find_lcmer_ranges) queries the
+        // DBG, which is keyed by length-`dbg_lcmer_l` lcmers. The litecmer hash
+        // is window-length dependent, so querying with a different length misses
+        // every key. The two lengths must therefore match for overlaps to be
+        // found; warn loudly rather than silently produce an empty graph.
+        if (olc_lcmer_l != dbg_lcmer_l) {
+            fprintf(stderr,
+                    "[config] WARNING: --olc-lcmer-l (%d) != --dbg-lcmer-l (%d). "
+                    "Overlap detection queries the DBG built at --dbg-lcmer-l, "
+                    "so mismatched lengths lose overlaps and collapse the "
+                    "layout. Set them equal unless you are deliberately "
+                    "probing this behavior.\n",
+                    olc_lcmer_l, dbg_lcmer_l);
+        }
     }
 
     template <class BFT>
@@ -139,8 +177,11 @@ struct assembler {
     }
     static auto find_lcmer_ranges(const lcp_read &lr, const dbg_index &dbgi,
                                   int lcmer_l) {
-        long skip_first = lcmer_l;
-        long skip_last = 2 * lcmer_l;
+        // Cores skipped at each node end before overlap-anchoring (see the
+        // OLC_SKIP_* macros). Node ends are boundary-noisy, so a small skip
+        // avoids false anchors.
+        long skip_first = OLC_SKIP_FIRST(lcmer_l);
+        long skip_last = OLC_SKIP_LAST(lcmer_l);
         // Need enough cores to form at least one valid lcmer after skipping
         if (lr.cores.size() <
             static_cast<size_t>(lcmer_l + skip_first + skip_last)) {
@@ -468,111 +509,31 @@ struct assembler {
         }
         return sum;
     }
-    struct rev_match {
-        u64 node;
-        struct ival {
-            u64 from;
-            u64 to;
-            u64 size;
-        };
-        ival tgt;
-        ival qry;
-
-        // Matching LCMER indices.
-        //
-        // Convention:
-        // - *_query_* refer to the QUERY/SOURCE node (the map key / "from"
-        // node)
-        // - *_target_* refer to the TARGET node (rev_match::node)
-        //
-        // These indices are later used to "switch" between SequenceContainer
-        // streams at overlap boundaries without base-offset arithmetic.
-        LCmer first_matching_lcmer_query;
-        LCmer last_matching_lcmer_query;
-        LCmer first_matching_lcmer_target;
-        LCmer last_matching_lcmer_target;
+    // One documented coordinate space for overlaps: inclusive core indices on a
+    // node's (reverse-complemented) core sequence. `len` is the node's core-span
+    // length in *steps* (cores - 1), carried so downstream never re-derives it.
+    struct CoreSpan {
+        u64 from;
+        u64 to;
+        u64 len;
     };
 
-    auto btg_connected_components(gtl::btree_multimap<u64, rev_match> &recig) {
-        gtl::vector<gtl::vector<u64>> components;
-        gtl::flat_hash_set<u64> visited;
-        for (const auto &[from, to] : recig) {
-            gtl::vector<u64> component;
-            gtl::vector<u64> stack;
-            stack.push_back(from);
-            while (!stack.empty()) {
-                u64 node = stack.back();
-                stack.pop_back();
-                if (visited.find(node) != visited.end()) {
-                    continue;
-                }
-                visited.emplace(node);
-                component.push_back(node);
-                auto range = recig.equal_range(node);
-                for (auto it = range.first; it != range.second; ++it) {
-                    if (visited.find(it->second.node) == visited.end()) {
-                        stack.push_back(it->second.node);
-                    }
-                }
-            }
-            if (component.size() > 1) {
-                components.push_back(component);
-            }
-        }
-        return components;
-    }
+    // Phase-A record: on some key node, an overlap with `other` covers `self`
+    // (coordinates on the key node itself). Only the key node's own span is
+    // known at this stage; the partner's span is joined in phase B.
+    struct SelfMatch {
+        u64 other;
+        CoreSpan self;
+    };
 
-
-    auto add_lcmers(const gtl::vector<SequenceContainerType> &subseqs,
-                    auto &node, dbg_index &dbgi, u64 &idx, int tid) {
-        lps str = {0, 0, 0, 0};
-        lcp_read lr;
-        // dbgi.dbg.for_each([&](auto &node) {
-        if (node.second.redirected()) {
-            return;
-        }
-        // good_n.fetch_add(1);
-        lr.clear();
-
-        // Extract a subsequence [from, to) from the concatenated rev_seqs
-        // Returns a single CrumbledSubSeq64 containing the extracted range
-
-        init_lps_crumbled(&str, subseqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
-
-        for (int i = 0; i < str.size; ++i) {
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-        }
-
-
-        if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 1)) {
-            // good_n.fetch_sub(1);
-            free_lps(&str);
-            return;
-        }
-        gtl::vector<u64> ll = {0};
-        LCmer l{lr.cores.begin() + 1, olc_lcmer_l};  // Skip first core;
-        ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
-        for (size_t i = 2; i + olc_lcmer_l + 1 < lr.cores.size(); ++i) {
-            uint32_t in_core = lr.cores[i + olc_lcmer_l];
-            l.update_lcmer(in_core, lr.cores[i], olc_lcmer_l);
-            ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
-        }
-        ll.push_back(0);
-
-        for (size_t i = 1; i < ll.size() - 1; ++i) {
-            if (insert_lcmer_helper(ll, i, dbgi)) {
-                dbgi.dbg.modify_if(
-                    ll[i], [&lr, i, &subseqs,
-                            this](dbg_index::dbg_map_t::value_type &val) {
-                        val.second.seq.emplace_back(
-                            subseqs, lr.pos[i + olc_lcmer_l - 1].second,
-                            lr.pos[i + olc_lcmer_l].second);
-                    });
-            }
-        }
-    }
+    // Phase-B record (a reciprocal overlap), keyed by the query node: `target`
+    // is the partner node id; `query`/`target_span` are each node's core span in
+    // the shared overlap. No reinterpreted fields — names match meaning.
+    struct Overlap {
+        u64 target;
+        CoreSpan query;
+        CoreSpan target_span;
+    };
 
     static auto build_lr_cores(const gtl::vector<SequenceContainerType> &seqs,
                                const SyncmerType &syncmer_functor,
@@ -791,55 +752,21 @@ struct assembler {
         return {std::move(lr), std::move(core_seqs)};
     }
 
-    auto find_rev_lcmers(const gtl::vector<SequenceContainerType> &subseqs,
-                         dbg_index &dbgi, int tid, u64 &idx)
-        -> gtl::vector<SequenceContainerType> {
-        lps str = {0, 0, 0, 0};
-        lcp_read lr;
-        lr.clear();
-
-        gtl::vector<SequenceContainerType> rev_seqs;
-        for (auto it = subseqs.rbegin(); it != subseqs.rend(); ++it) {
-            rev_seqs.emplace_back(it->reverse_complement());
-        }
-        init_lps_crumbled(&str, rev_seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
-
-        for (int i = 0; i < str.size; ++i) {
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-        }
-        if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 2)) {
-            free_lps(&str);
-            return {};
-        }
-        LCmer l{lr.cores.begin() + 1, olc_lcmer_l};  // Skip first core;
-        gtl::vector<u64> ll;
-
-        u64 lval = dbgi.emplace_nobloomfilter(l, idx, tid);
-        ll.emplace_back(lval);
-        for (size_t i = 2; i + olc_lcmer_l + 1 < lr.cores.size(); ++i) {
-            uint32_t in_core = lr.cores[i + olc_lcmer_l];
-            l.update_lcmer(in_core, lr.cores[i], olc_lcmer_l);
-            lval = dbgi.emplace_nobloomfilter(l, idx, tid);
-            ll.emplace_back(lval);
-        }
-        gtl::vector<SequenceContainerType> seqs;
-        for (size_t i = 1; i < ll.size() - 1; ++i) {
-            seqs.emplace_back(rev_seqs, lr.pos[i + olc_lcmer_l - 1].second,
-                              lr.pos[i + olc_lcmer_l].second);
-            seqs.back().origin_node = ll[i];
-        }
-        // TODO: index it if needed
-        return seqs;
-    }
     auto fold_dbg_graph(dbg_index &dbgi) {
         fprintf(stderr, "dbg_size: %zu\n", dbgi.dbg.size());
+
+        // Discard a reciprocal match that spans less than this fraction (1/N) of
+        // the query node's cores — too short to be a reliable overlap.
+        constexpr size_t MIN_OVERLAP_CORE_FRACTION_DIV = 20;
 
         std::atomic<int> all_n{0};
         std::atomic<int> hits{0};
         std::atomic<int> bad{0};
-        gtl::parallel_flat_hash_map_d<u64, gtl::vector<rev_match>, HT_SHARD_BC,
+        // Phase-0 matching diagnostics: why do good nodes fail to match?
+        std::atomic<int> too_short{0};   // < 4*olc_lcmer_l cores → no ranges (#4)
+        std::atomic<int> no_ranges{0};   // long enough but 0 lcmer hits
+        std::atomic<int> frac_drop{0};   // overlap < 5% of cores, filtered (#6)
+        gtl::parallel_flat_hash_map_d<u64, gtl::vector<SelfMatch>, HT_SHARD_BC,
                                       std::mutex>
             matched;
         for_each_map(
@@ -883,23 +810,29 @@ struct assembler {
                 // `find_lcmer_ranges()` already returns [from_core,to_core] in
                 // core indices (inclusive), which is the correct coordinate
                 // system for connected_comp_plus_layout().
+                // Matching diagnostic: bucket why a good node yields no match.
+                // Mirrors find_lcmer_ranges' gate via the same OLC_SKIP_* macros.
+                if (lr.cores.size() <
+                    static_cast<size_t>(olc_lcmer_l + OLC_SKIP_FIRST(olc_lcmer_l) +
+                                        OLC_SKIP_LAST(olc_lcmer_l))) {
+                    too_short.fetch_add(1);  // fails find_lcmer_ranges gate (#4)
+                }
                 auto found_ranges = find_lcmer_ranges(lr, dbgi, olc_lcmer_l);
+                bool any_hit = false;
                 for (const auto &[id, from_core, to_core, from_lcmer,
                                   to_lcmer] : found_ranges) {
                     if (id != 0) {
                         if (to_core - from_core <
-                            lr.pos.size() / 20) {  // TODO: parameterize this
+                            lr.pos.size() / MIN_OVERLAP_CORE_FRACTION_DIV) {
+                            frac_drop.fetch_add(1);
                             continue;
                         }
+                        any_hit = true;
                         hits.fetch_add(1);
 
-                        // Store match intervals in CORE indices (inclusive).
-                        // IMPORTANT: rev_match fields are u64 and we keep them
-                        // semantically as core-space indices here. Base-space
-                        // scaling happens at emission time.
-                        //
-                        // We also store "length" fields in core-space to keep
-                        // conversions consistent. Core-space length is number
+                        // Store the overlap on THIS node in CORE indices
+                        // (inclusive; see CoreSpan). Base-space scaling happens
+                        // only at emission time. Core-space length is the number
                         // of steps between endpoints: (cores.size() - 1).
                         const u64 core_len_steps =
                             (lr.cores.size() > 0)
@@ -911,80 +844,72 @@ struct assembler {
                             [&](auto &val) {
                                 val.second.emplace_back(
                                     id,
-                                    rev_match::ival{static_cast<u64>(from_core),
-                                                    static_cast<u64>(to_core),
-                                                    core_len_steps},
-                                    rev_match::ival{0, 0, 0}, from_lcmer,
-                                    to_lcmer, LCmer{}, LCmer{});
+                                    CoreSpan{static_cast<u64>(from_core),
+                                             static_cast<u64>(to_core),
+                                             core_len_steps});
                             },
                             [&](const auto &ctr) {
                                 ctr(node.first,
-                                    gtl::vector<rev_match>{rev_match{
+                                    gtl::vector<SelfMatch>{SelfMatch{
                                         id,
-                                        rev_match::ival{
-                                            static_cast<u64>(from_core),
-                                            static_cast<u64>(to_core),
-                                            core_len_steps},
-                                        rev_match::ival{0, 0, 0}, from_lcmer,
-                                        to_lcmer, LCmer{}, LCmer{}}});
+                                        CoreSpan{static_cast<u64>(from_core),
+                                                 static_cast<u64>(to_core),
+                                                 core_len_steps}}});
                             });
                     }
                 }
+                if (!any_hit &&
+                    lr.cores.size() >=
+                        static_cast<size_t>(olc_lcmer_l +
+                                            OLC_SKIP_FIRST(olc_lcmer_l) +
+                                            OLC_SKIP_LAST(olc_lcmer_l)))
+                    no_ranges.fetch_add(1);
                 free_lps(&str);
             },
             threads.work);
 
-        gtl::btree_multimap<u64, rev_match> reciprocal;
+        gtl::btree_multimap<u64, Overlap> reciprocal;
+        int non_recip = 0, recip_kept = 0;
         for (const auto &[k, v] : matched) {
             for (const auto &match : v) {
-                // if (k < match.node) {  // smaller node is the key
-                auto it = matched.find(
-                    match.node);  // and matched node also has overlaps
-                if (it != matched.end()) {
-                    auto ff = std::find_if(
-                        it->second.begin(), it->second.end(),
-                        [k](const auto &val) { return val.node == k; });
-                    if (ff != it->second.end()) {  // and has the reverse match
-                        // Store both query and target coordinates in CORE-INDEX
-                        // space. match.from/to are core indices on k's rev_comp
-                        // (query) ff->from/to are core indices on match.node's
-                        // rev_comp (target)
-                        //
-                        // NOTE: rev_match uses generic u64 fields; here we
-                        // interpret them as core-space units. Base-space
-                        // scaling will be applied only when emitting merged
-                        // sequences / reporting.
-                        rev_match full_match;
-                        full_match.node = match.node;
-                        full_match.tgt.from =
-                            ff->tgt.from;  // ts (target start) in cores
-                        full_match.tgt.to =
-                            ff->tgt.to;  // te (target end) in cores
-                        full_match.tgt.size =
-                            ff->tgt.size;  // tlen in cores (steps)
-                        full_match.qry.from =
-                            match.tgt.from;  // qs (query start) in cores
-                        full_match.qry.to =
-                            match.tgt.to;  // qe (query end) in cores
-                        full_match.qry.size =
-                            match.tgt.size;  // qlen in cores (steps)
-                        full_match.first_matching_lcmer_query =
-                            match.first_matching_lcmer_query;
-                        full_match.last_matching_lcmer_query =
-                            match.last_matching_lcmer_query;
-                        full_match.first_matching_lcmer_target =
-                            ff->first_matching_lcmer_query;
-                        full_match.last_matching_lcmer_target =
-                            ff->last_matching_lcmer_query;
-                        reciprocal.emplace(k, full_match);
-
-                    } else {  // Handle after reciprocals are good
-                    }
+                // Keep the overlap only if the partner records the reverse one
+                // too (a reciprocal match). `match.self` is k's core span in the
+                // overlap; `ff->self` is the partner's. Both are core-index
+                // spans (see CoreSpan); base-space scaling happens at emission.
+                auto it = matched.find(match.other);
+                auto ff = (it != matched.end())
+                              ? std::find_if(it->second.begin(),
+                                             it->second.end(),
+                                             [k](const auto &val) {
+                                                 return val.other == k;
+                                             })
+                              : gtl::vector<SelfMatch>::const_iterator{};
+                if (it != matched.end() && ff != it->second.end()) {
+                    reciprocal.emplace(k,
+                                       Overlap{match.other, match.self, ff->self});
+                    ++recip_kept;
+                } else {
+                    ++non_recip;  // one-directional match (#7)
+#if OLC_NONRECIPROCAL
+                    // Prototype: keep it anyway. We only know k's span
+                    // (match.self); approximate the partner's span as the same
+                    // shape (self-symmetric) so connected_comp_plus_layout can
+                    // still position the partner. Coarse — it measures whether
+                    // wiring these extra nodes in helps before we compute the
+                    // partner's real overlap interval.
+                    reciprocal.emplace(
+                        k, Overlap{match.other, match.self, match.self});
+#endif
                 }
             }
         }
         fprintf(stderr, "all:%d\ngood: %d nodes\nhits: %d\n", all_n.load(),
                 all_n.load() - bad.load(), hits.load());
+        fprintf(stderr,
+                "[match-diag] too_short:%d no_ranges:%d frac_drop:%d "
+                "recip_kept:%d non_recip:%d\n",
+                too_short.load(), no_ranges.load(), frac_drop.load(), recip_kept,
+                non_recip);
         auto layouts =
             layout_graph_algo::connected_comp_plus_layout(reciprocal);
 
@@ -1410,5 +1335,358 @@ TEST_CASE(
         CHECK_EQ(merged.len, 0);
         CHECK_EQ(merged.skip_first_n, 0);
         CHECK_EQ(merged.origin_node, 0);
+    }
+}
+
+// ── Characterization tests: layout_graph_emit core algorithms ──────────
+// These pin down the observable behavior of the seed-chain DAG pipeline
+// (build_scd_graph → find_heaviest_paths → collect_path_sequences) so the
+// planned complexity/quality refactors (docs/layout-graph-plan.md) can be
+// proven behavior-preserving. They exercise the pure struct-based functions
+// in isolation, without the assembler.
+TEST_CASE("layout_graph_emit::build_scd_graph merges shared cores") {
+    using namespace layout_graph_emit;
+
+    // Two contigs sharing cores 20 and 30 (contig0: 10,20,30; contig1: 20,30,40).
+    // contig ids double as indices into `nodes`.
+    gtl::vector<lane_node> nodes(2);
+    nodes[0] = {/*id*/ 0, /*from*/ 0, /*to*/ 100, /*fwd*/ true, nullptr};
+    nodes[1] = {/*id*/ 1, /*from*/ 10, /*to*/ 110, /*fwd*/ true, nullptr};
+
+    gtl::flat_hash_map<size_t, lcp_read> contig_lr;
+    lcp_read lr0;
+    lr0.cores = {10u, 20u, 30u};
+    lr0.pos = {{0u, 1u}, {1u, 2u}, {2u, 3u}};
+    lcp_read lr1;
+    lr1.cores = {20u, 30u, 40u};
+    lr1.pos = {{0u, 1u}, {1u, 2u}, {2u, 3u}};
+    contig_lr[0] = std::move(lr0);
+    contig_lr[1] = std::move(lr1);
+
+    gtl::vector<size_t> contig_order = {0, 1};
+
+    gtl::vector<scd_node> scd;
+    gtl::vector<scd_adj_t> scd_fwd;
+    gtl::flat_hash_map<uint32_t, gtl::vector<uint32_t>> label_nodes;
+    gtl::vector<gtl::vector<std::pair<size_t, size_t>>> node_contigs;
+
+    build_scd_graph(contig_order, contig_lr, nodes, scd, scd_fwd, label_nodes,
+                    node_contigs);
+
+    // contig0 creates 3 nodes; contig1 merges 20 & 30, adds only 40 → 4 total.
+    CHECK_EQ(scd.size(), 4u);
+    CHECK_EQ(scd_fwd.size(), scd.size());
+    CHECK_EQ(node_contigs.size(), scd.size());
+
+    // Weights: shared cores seen twice, private cores once.
+    auto weight_of_label = [&](uint32_t label) -> int {
+        for (const auto &n : scd)
+            if (n.core_label == label) return n.weight;
+        return -1;
+    };
+    CHECK_EQ(weight_of_label(10u), 1);
+    CHECK_EQ(weight_of_label(20u), 2);
+    CHECK_EQ(weight_of_label(30u), 2);
+    CHECK_EQ(weight_of_label(40u), 1);
+
+    // Merged nodes carry both contigs' provenance.
+    for (size_t idx = 0; idx < scd.size(); ++idx) {
+        if (scd[idx].core_label == 20u || scd[idx].core_label == 30u)
+            CHECK_EQ(node_contigs[idx].size(), 2u);
+    }
+}
+
+TEST_CASE("layout_graph_emit::find_heaviest_paths follows the heaviest chain") {
+    using namespace layout_graph_emit;
+
+    // Graph: 0→1→2 (main chain) plus a light branch 0→3.
+    // All weights 1 → main-chain sink (2, dp=3) beats branch sink (3, dp=2).
+    gtl::vector<lane_node> nodes(1);
+    nodes[0] = {/*id*/ 0, /*from*/ 0, /*to*/ 100, /*fwd*/ true, nullptr};
+
+    gtl::vector<scd_node> scd(4);
+    for (auto &n : scd) { n.contig_idx = 0; n.core_idx = 0; n.weight = 1; }
+    scd[0].core_label = 0;
+    scd[1].core_label = 1;
+    scd[2].core_label = 2;
+    scd[3].core_label = 3;
+
+    gtl::vector<scd_adj_t> scd_fwd(4);
+    scd_fwd[0].push_back({1u, 1});
+    scd_fwd[1].push_back({2u, 1});
+    scd_fwd[0].push_back({3u, 1});
+
+    auto paths = find_heaviest_paths(scd, scd_fwd, nodes, /*layout_idx*/ 0);
+
+    REQUIRE_EQ(paths.size(), 1u);         // single connected component
+    REQUIRE_EQ(paths[0].path.size(), 3u);
+    CHECK_EQ(paths[0].path[0], 0u);
+    CHECK_EQ(paths[0].path[1], 1u);
+    CHECK_EQ(paths[0].path[2], 2u);       // heaviest sink, not the branch
+    CHECK_EQ(paths[0].total_weight, 3);
+}
+
+TEST_CASE("layout_graph_emit::collect_path_sequences concatenates with gaps") {
+    using namespace layout_graph_emit;
+
+    auto make_seq = [](const char *s) {
+        return SequenceContainerType(s, 0, std::strlen(s), 0,
+                                     SequenceContainerType::from_ascii{});
+    };
+
+    // node_contigs: node0→(contig0,core0), node1→(contig0,core1),
+    //               node2→(contig1,core0)
+    gtl::vector<gtl::vector<std::pair<size_t, size_t>>> node_contigs(3);
+    node_contigs[0] = {{0, 0}};
+    node_contigs[1] = {{0, 1}};
+    node_contigs[2] = {{1, 0}};
+
+    gtl::flat_hash_map<size_t, gtl::vector<SequenceContainerType>>
+        contig_core_seqs;
+    contig_core_seqs[0].push_back(make_seq("ACGT"));      // len 4
+    contig_core_seqs[0].push_back(make_seq("TTTT"));      // len 4
+    contig_core_seqs[1].push_back(make_seq("GGGGGG"));    // len 6
+
+    SUBCASE("single component, path order preserved") {
+        gtl::vector<comp_path> paths;
+        paths.push_back({0, 100, 2, gtl::vector<uint32_t>{0u, 1u}});
+
+        auto merged = collect_path_sequences(paths, node_contigs,
+                                             contig_core_seqs, 3);
+        REQUIRE_EQ(merged.size(), 2u);
+        CHECK_EQ(merged[0].len, 4u);
+        CHECK_EQ(merged[1].len, 4u);
+    }
+
+    SUBCASE("two components separated by a zero-length gap") {
+        gtl::vector<comp_path> paths;
+        paths.push_back({0, 100, 2, gtl::vector<uint32_t>{0u, 1u}});
+        paths.push_back({200, 300, 1, gtl::vector<uint32_t>{2u}});
+
+        auto merged = collect_path_sequences(paths, node_contigs,
+                                             contig_core_seqs, 3);
+        // seqA, seqB, GAP, seqC
+        REQUIRE_EQ(merged.size(), 4u);
+        CHECK_EQ(merged[0].len, 4u);
+        CHECK_EQ(merged[1].len, 4u);
+        CHECK_EQ(merged[2].len, 0u);   // gap sentinel between components
+        CHECK_EQ(merged[3].len, 6u);
+    }
+
+    SUBCASE("fallback picks longest representative, not arbitrary first (C12)") {
+        // A single-node path whose node has two candidate contigs and no
+        // continuity hint. The fallback must pick the longer core sequence
+        // (contig 3, len 6), not the first-listed one (contig 5, len 2).
+        gtl::vector<gtl::vector<std::pair<size_t, size_t>>> nc(1);
+        nc[0] = {{5, 0}, {3, 0}};  // first-listed (5) is the SHORT one
+
+        gtl::flat_hash_map<size_t, gtl::vector<SequenceContainerType>> ccs;
+        ccs[5].push_back(make_seq("AC"));      // len 2 (arbitrary nc[0] choice)
+        ccs[3].push_back(make_seq("ACGTAC"));  // len 6 (longest representative)
+
+        gtl::vector<comp_path> paths;
+        paths.push_back({0, 100, 1, gtl::vector<uint32_t>{0u}});
+
+        auto merged = collect_path_sequences(paths, nc, ccs, 1);
+        REQUIRE_EQ(merged.size(), 1u);
+        CHECK_EQ(merged[0].len, 6u);  // longest, not nc[0]'s len 2
+    }
+}
+
+TEST_CASE("layout_graph_emit::PostLayoutCleaning::cut_tips peels short tips") {
+    using namespace layout_graph_emit;
+
+    auto add_node = [](supernode_vec &sn, const char *name, bool layout,
+                       size_t len) {
+        supernode_out s;
+        s.name = name;
+        s.is_layout = layout;
+        s.ref_seqs = nullptr;
+        s.aux_id = 0;
+        std::string seq(len, 'A');
+        s.owned_seqs.emplace_back(seq.c_str(), 0, len, 0,
+                                  SequenceContainerType::from_ascii{});
+        sn.push_back(std::move(s));
+    };
+    auto add_edge = [](edge_map &em, u64 s, u64 d) {
+        edge_key k{s, d, '+', '+', uint8_t{0}, uint8_t{0}};
+        edge_agg a;
+        a.src_super = s;
+        a.dst_super = d;
+        a.count = 1;
+        em[k] = a;
+    };
+
+    // Topology (M = layout, C = unitig; short len 4, long len 50):
+    //   M0 → C1(short, tip)                 → removed
+    //   M0 → C2(short) → C3(short, dead-end) → both peeled (C3 then C2)
+    //   M0 → C4(long, tip)                  → kept (too long)
+    supernode_vec sn;
+    add_node(sn, "M0", true, 100);
+    add_node(sn, "C1", false, 4);
+    add_node(sn, "C2", false, 4);
+    add_node(sn, "C3", false, 4);
+    add_node(sn, "C4", false, 50);
+
+    edge_map edges;
+    add_edge(edges, 0, 1);
+    add_edge(edges, 0, 2);
+    add_edge(edges, 2, 3);
+    add_edge(edges, 0, 4);
+
+    PostLayoutCleaning::run(sn, edges, /*max_tip_len*/ 10);
+
+    CHECK_FALSE(sn[0].name.empty());  // M-node never removed
+    CHECK(sn[1].name.empty());        // short tip removed
+    CHECK(sn[2].name.empty());        // peeled after C3
+    CHECK(sn[3].name.empty());        // short dead-end removed
+    CHECK_FALSE(sn[4].name.empty());  // long tip kept
+
+    // Only the M0 → C4 edge survives.
+    REQUIRE_EQ(edges.size(), 1u);
+    CHECK_EQ(edges.begin()->second.src_super, 0u);
+    CHECK_EQ(edges.begin()->second.dst_super, 4u);
+}
+
+TEST_CASE("layout_graph_emit::find_heaviest_paths emits only the connected "
+          "heaviest chain, never a disconnected prefix (R1)") {
+    using namespace layout_graph_emit;
+
+    // Main heaviest path A(0)→B(1)→C(2). An earlier source D(3) branches to a
+    // heavy dead-end E(4) and also to A. Under the old span-extension heuristics
+    // (C13) a greedy backward walk from D could try to splice D/E onto the front;
+    // R1 removed all extensions, so the result is purely the virtual-source→sink
+    // heaviest path — the connected chain [0,1,2]. D(3) and E(4) are never
+    // prepended because they are not on that traceback.
+    gtl::vector<lane_node> nodes(5);
+    nodes[0] = {0, 10, 20, true, nullptr};  // A
+    nodes[1] = {1, 20, 30, true, nullptr};  // B
+    nodes[2] = {2, 30, 40, true, nullptr};  // C
+    nodes[3] = {3, 0, 5, true, nullptr};    // D (earliest source)
+    nodes[4] = {4, 1, 6, true, nullptr};    // E
+
+    gtl::vector<scd_node> scd(5);
+    for (uint32_t i = 0; i < 5; ++i) {
+        scd[i].contig_idx = i;
+        scd[i].core_idx = 0;
+        scd[i].core_label = i;
+    }
+    scd[0].weight = 1;  // A
+    scd[1].weight = 1;  // B
+    scd[2].weight = 1;  // C
+    scd[3].weight = 0;  // D (0 → not pulled onto the main path as a parent)
+    scd[4].weight = 2;  // E (heavier → greedy walk from D goes here)
+
+    gtl::vector<scd_adj_t> scd_fwd(5);
+    scd_fwd[0].push_back({1u, 1});  // A→B
+    scd_fwd[1].push_back({2u, 1});  // B→C
+    scd_fwd[3].push_back({0u, 1});  // D→A
+    scd_fwd[3].push_back({4u, 1});  // D→E (dead-end)
+
+    auto paths = find_heaviest_paths(scd, scd_fwd, nodes, /*layout_idx*/ 0);
+
+    // The result must be exactly the connected chain [0,1,2] — D(3),E(4) are
+    // NOT prepended, since with extensions removed the emitted path is just the
+    // heaviest edge-connected traceback (0→1 and 1→2 are the only edges here).
+    REQUIRE_EQ(paths.size(), 1u);
+    REQUIRE_EQ(paths[0].path.size(), 3u);
+    CHECK_EQ(paths[0].path[0], 0u);
+    CHECK_EQ(paths[0].path[1], 1u);
+    CHECK_EQ(paths[0].path[2], 2u);
+}
+
+TEST_CASE("layout_graph_emit::find_heaviest_paths does not forward-extend to a "
+          "wider-span lighter sink (R1)") {
+    using namespace layout_graph_emit;
+
+    // Heaviest chain A(0)→B(1)→C(2) (C is heavy). B also branches to D(3), a
+    // sink whose `to` (50) is wider than the whole main path (max_to 30) but
+    // whose path weight is lower. The OLD forward extension spliced D on after
+    // B — emitting [0,1,2,3] to grab the extra span. R1 removed extensions, so
+    // the result is exactly the heaviest edge-connected chain [0,1,2]; the
+    // wider-but-lighter D is dropped. This is the behavior R1 deliberately
+    // changes (verify with QUAST that dropping such span does not regress).
+    gtl::vector<lane_node> nodes(4);
+    nodes[0] = {0, 0, 10, true, nullptr};   // A
+    nodes[1] = {1, 10, 20, true, nullptr};  // B
+    nodes[2] = {2, 20, 30, true, nullptr};  // C (main sink)
+    nodes[3] = {3, 20, 50, true, nullptr};  // D (wider `to`, lighter)
+
+    gtl::vector<scd_node> scd(4);
+    for (uint32_t i = 0; i < 4; ++i) {
+        scd[i].contig_idx = i;
+        scd[i].core_idx = 0;
+        scd[i].core_label = i;
+    }
+    scd[0].weight = 1;  // A
+    scd[1].weight = 1;  // B
+    scd[2].weight = 2;  // C → dp[C]=4 beats dp[D]=3
+    scd[3].weight = 1;  // D
+
+    gtl::vector<scd_adj_t> scd_fwd(4);
+    scd_fwd[0].push_back({1u, 1});  // A→B
+    scd_fwd[1].push_back({2u, 1});  // B→C
+    scd_fwd[1].push_back({3u, 1});  // B→D (wider-span lighter branch)
+
+    auto paths = find_heaviest_paths(scd, scd_fwd, nodes, /*layout_idx*/ 0);
+
+    REQUIRE_EQ(paths.size(), 1u);
+    REQUIRE_EQ(paths[0].path.size(), 3u);   // NOT 4 — D is not appended
+    CHECK_EQ(paths[0].path[0], 0u);
+    CHECK_EQ(paths[0].path[1], 1u);
+    CHECK_EQ(paths[0].path[2], 2u);
+    CHECK_EQ(paths[0].total_weight, 4);
+}
+
+TEST_CASE("layout_graph_emit::resolve_layout_orientations policies (C10)") {
+    using namespace layout_graph_emit;
+    using layout_graph_algo::layout_result_t;
+
+    auto mk = [](i64 a, i64 b, bool o) { return std::make_tuple(a, b, o); };
+
+    SUBCASE("no conflict → both policies agree, conflicts=0") {
+        layout_result_t layouts;
+        layouts.emplace_back();
+        layouts.back().emplace(100u, mk(0, 10, true));
+        layouts.back().emplace(200u, mk(0, 10, false));
+
+        size_t conf = 123;
+        auto fw = resolve_layout_orientations(
+            layouts, orientation_policy::first_wins, &conf);
+        CHECK_EQ(conf, 0u);
+        CHECK_EQ(fw.at(100u), true);
+        CHECK_EQ(fw.at(200u), false);
+
+        auto mv = resolve_layout_orientations(
+            layouts, orientation_policy::majority_vote, &conf);
+        CHECK_EQ(conf, 0u);
+        CHECK_EQ(mv.at(100u), true);
+        CHECK_EQ(mv.at(200u), false);
+    }
+
+    SUBCASE("conflict → first_wins and majority_vote differ") {
+        // node 100: layout0 says '+', layouts 1&2 say '-' (majority '-').
+        // node 200: only layout0, '+', no conflict.
+        layout_result_t layouts;
+        layouts.emplace_back();
+        layouts.back().emplace(100u, mk(0, 10, true));
+        layouts.back().emplace(200u, mk(0, 10, true));
+        layouts.emplace_back();
+        layouts.back().emplace(100u, mk(0, 10, false));
+        layouts.emplace_back();
+        layouts.back().emplace(100u, mk(0, 10, false));
+
+        size_t conf = 0;
+        auto fw = resolve_layout_orientations(
+            layouts, orientation_policy::first_wins, &conf);
+        CHECK_EQ(conf, 1u);            // exactly node 100 conflicts
+        CHECK_EQ(fw.at(100u), true);   // layout 0 claimed it first
+        CHECK_EQ(fw.at(200u), true);
+
+        auto mv = resolve_layout_orientations(
+            layouts, orientation_policy::majority_vote, &conf);
+        CHECK_EQ(conf, 1u);
+        CHECK_EQ(mv.at(100u), false);  // 2 '-' outvote 1 '+'
+        CHECK_EQ(mv.at(200u), true);
     }
 }
