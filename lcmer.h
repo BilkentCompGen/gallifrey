@@ -439,7 +439,12 @@ struct KmerViewOnCrumbs64 {
                  int_type skip_first_n) {
         int_type i;
         int_type it = move_get_rle(data_words, skip_first_n, cap);
-        for (i = 0; i < k && it < cap; i++) {
+        // k-1 more insertions (k total incl. the initial one), so the first
+        // window checked by the caller is runs[0..k-1] — the same window
+        // parse1_bam_syncmers checks first. (Was i < k, which inserted k+1
+        // values and silently skipped the first window; see the parser
+        // comparison test in lcmer.cpp.)
+        for (i = 0; i < k - 1 && it < cap; i++) {
             it = move_get_rle(data_words, it, cap);
         }
         return it;
@@ -1014,15 +1019,21 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
 
 inline uint64_t parse1_bam_syncmers(const uint8_t *rle_data,
                                     const uint32_t *rle_pos, int64_t rle_len,
-                                    struct lps *str,
+                                    int64_t seq_len, struct lps *str,
                                     const auto &syncmer_functor) {
     const auto k = syncmer_functor.k();
     if (rle_len < k) return 0;
 
     if (str->capacity < rle_len * CONSTANT_FACTOR) {
-        str->capacity = 2 * rle_len * CONSTANT_FACTOR;
-        str->cores = (struct core *)realloc(
-            str->cores, (str->capacity) * sizeof(struct core));
+        const size_t newcap = 2 * rle_len * CONSTANT_FACTOR;
+        struct core *p =
+            (struct core *)realloc(str->cores, newcap * sizeof(struct core));
+        if (p == nullptr) {
+            fprintf(stderr, "parse1_bam_syncmers: out of memory\n");
+            abort();
+        }
+        str->cores = p;
+        str->capacity = newcap;
     }
 
     uint64_t KMASK = ((uint64_t)1 << (2 * k)) - 1;
@@ -1035,9 +1046,16 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *rle_data,
     auto *cores = str->cores;
     for (int64_t i = k; i <= rle_len; ++i) {
         if (syncmer_functor(value)) {
-            uint32_t pos = rle_pos[i - 1] + 1;
-            init_core_kmer<uint32_t>(&(cores[core_index]), value, pos, pos + k,
-                                     k);
+            // True span of the RLE-space k-mer (runs [i-k, i-1]) in original
+            // base coordinates: start of the window's first run up to the
+            // start of the next run (= one past the window's last base). The
+            // previous convention ([start-of-last-run + 1, +k)) slid the span
+            // past the real k-mer whenever the window ended in a multi-base
+            // homopolymer run ("TODO fix si, ei").
+            const uint32_t si = rle_pos[i - k];
+            const uint32_t ei =
+                (i < rle_len) ? rle_pos[i] : static_cast<uint32_t>(seq_len);
+            init_core_kmer<uint32_t>(&(cores[core_index]), value, si, ei, k);
             core_index++;
         }
         if (i < rle_len) {
@@ -1054,42 +1072,48 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
     rle_buf.require(len);
     pos_buf.require(len);
     int64_t rle_len = rle_compact(data, len, rle_buf.data, pos_buf.data);
-    return parse1_bam_syncmers(rle_buf.data, pos_buf.data, rle_len, str,
+    return parse1_bam_syncmers(rle_buf.data, pos_buf.data, rle_len, len, str,
                                syncmer_functor);
 }
 inline uint64_t parse1_CrumbledSubSeqs_syncmers(
     const gtl::vector<SequenceContainerType> &sseqs, struct lps *str,
     const auto &syncmer_functor) {
-    int core_index = 0;
     if (sseqs.empty()) {
         fprintf(stderr, "Error: Empty sequence list\n");
-        return core_index;
+        return 0;
     }
-    KmerViewOnCrumbs64<uint64_t> kmer_view{syncmer_functor.k()};
-    size_t it1 =
-        kmer_view.fill_rle(sseqs[0].data, sseqs[0].len + sseqs[0].skip_first_n,
-                           sseqs[0].skip_first_n);
+    // Materialize the RLE stream of the concatenated fragments in original
+    // (l_so_far) coordinates, then window it with the exact same code as the
+    // BAM path so the two parsers can never diverge again (this fixes the
+    // first-window off-by-one and the si/ei drift the old streaming kmer-view
+    // had). A run is NOT restarted when the next fragment begins with the
+    // run's base — the same boundary carry-over the old kmer-view had.
+    size_t total_len = 0;
+    for (const auto &s : sseqs) total_len += s.len;
+    gtl::vector<uint8_t> rle_data;
+    gtl::vector<uint32_t> rle_pos;
+    rle_data.reserve(total_len);
+    rle_pos.reserve(total_len);
     size_t l_so_far = 0;
-    for (size_t i = 0; i < sseqs.size(); ++i) {
-        for (; it1 < sseqs[i].len + sseqs[i].skip_first_n;) {
-            if (syncmer_functor(kmer_view.get())) {
-                init_core_kmer<uint32_t>(&(str->cores[core_index]),
-                                         kmer_view.get(),
-                                         l_so_far + it1 - sseqs[i].skip_first_n,
-                                         l_so_far + it1 + syncmer_functor.k() -
-                                             sseqs[i].skip_first_n,
-                                         syncmer_functor.k());
-                core_index++;
+    uint8_t prev_base = 255;
+    for (const auto &s : sseqs) {
+        const size_t cap = s.len + s.skip_first_n;
+        for (size_t idx = s.skip_first_n; idx < cap; ++idx) {
+            const uint8_t b =
+                KmerViewOnCrumbs64<uint64_t>::base_at(s.data, idx);
+            if (b != prev_base) {
+                rle_data.push_back(b);
+                rle_pos.push_back(
+                    static_cast<uint32_t>(l_so_far + idx - s.skip_first_n));
+                prev_base = b;
             }
-            it1 = kmer_view.move_get_rle(sseqs[i].data, it1,
-                                         sseqs[i].len + sseqs[i].skip_first_n);
         }
-        if (sseqs.size() > i + 1) {
-            it1 = sseqs[i + 1].skip_first_n;
-        }
-        l_so_far += sseqs[i].len;
+        l_so_far += s.len;
     }
-    return core_index;
+    return parse1_bam_syncmers(rle_data.data(), rle_pos.data(),
+                               static_cast<int64_t>(rle_data.size()),
+                               static_cast<int64_t>(total_len), str,
+                               syncmer_functor);
 }
 
 uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores);
@@ -1099,16 +1123,25 @@ uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores);
 //
 inline void prepare_lps(lps *lps_ptr, size_t len) {
     lps_ptr->level = 1;
+    const size_t needed = (size_t)(len / CONSTANT_FACTOR);
     if (lps_ptr->cores == nullptr) {
         lps_ptr->size = 0;
-        lps_ptr->capacity = (len / CONSTANT_FACTOR);
-        lps_ptr->cores = (struct core *)malloc((len / CONSTANT_FACTOR) *
-                                               sizeof(struct core));
+        lps_ptr->capacity = (int)needed;
+        lps_ptr->cores = (struct core *)malloc(needed * sizeof(struct core));
+        if (lps_ptr->cores == nullptr && needed > 0) {
+            fprintf(stderr, "prepare_lps: out of memory\n");
+            abort();
+        }
     } else {
-        if (lps_ptr->capacity < len / CONSTANT_FACTOR) {
-            lps_ptr->capacity = len / CONSTANT_FACTOR;
-            lps_ptr->cores = (struct core *)realloc(
-                lps_ptr->cores, (len / CONSTANT_FACTOR) * sizeof(struct core));
+        if ((size_t)lps_ptr->capacity < needed) {
+            struct core *p = (struct core *)realloc(
+                lps_ptr->cores, needed * sizeof(struct core));
+            if (p == nullptr) {
+                fprintf(stderr, "prepare_lps: out of memory\n");
+                abort();
+            }
+            lps_ptr->cores = p;
+            lps_ptr->capacity = (int)needed;
         }
     }
 }
@@ -1149,8 +1182,8 @@ inline void parse_cores_from_bam_record(const uint8_t *data, size_t len,
                                         chs, pos_buf);
     } else {
         int64_t rle_len = onehot_to_rle(data, len, chs.data, pos_buf.data);
-        str->size = parse1_bam_syncmers(chs.data, pos_buf.data, rle_len, str,
-                                        syncmer_functor);
+        str->size = parse1_bam_syncmers(chs.data, pos_buf.data, rle_len, len,
+                                        str, syncmer_functor);
     }
     lps_deepen(str, lcp_level);
 

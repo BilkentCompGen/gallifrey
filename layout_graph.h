@@ -1052,6 +1052,7 @@ inline gtl::flat_hash_set<u64> find_contained_cnodes(
 
     gtl::flat_hash_set<u64> cc_visited;
     gtl::flat_hash_set<u64> contained_nodes;
+    size_t standalone_components = 0;
 
     for (u64 seed : candidate_set) {
         if (cc_visited.contains(seed)) continue;
@@ -1061,6 +1062,7 @@ inline gtl::flat_hash_set<u64> find_contained_cnodes(
         bfs.push(seed);
         cc_visited.insert(seed);
         bool has_boundary_neighbor = false;
+        bool has_external_edge = false;
 
         while (!bfs.empty()) {
             u64 cur = bfs.front();
@@ -1074,15 +1076,18 @@ inline gtl::flat_hash_set<u64> find_contained_cnodes(
                         cc_visited.insert(pred_id);
                         bfs.push(pred_id);
                     }
-                } else if (!nodes_in_layouts.contains(pred_id)) {
-                    has_boundary_neighbor = true;
-                }
-                if (nodes_in_layouts.contains(pred_id)) {
-                    auto bm_it = node_boundary_mask.find(pred_id);
-                    if (bm_it != node_boundary_mask.end()) {
-                        bool ori = node_layout_ori.at(pred_id);
-                        uint8_t needed = ori ? SIDE_END : SIDE_START;
-                        if (bm_it->second & needed) has_boundary_neighbor = true;
+                } else {
+                    has_external_edge = true;
+                    if (!nodes_in_layouts.contains(pred_id)) {
+                        has_boundary_neighbor = true;
+                    } else {
+                        auto bm_it = node_boundary_mask.find(pred_id);
+                        if (bm_it != node_boundary_mask.end()) {
+                            bool ori = node_layout_ori.at(pred_id);
+                            uint8_t needed = ori ? SIDE_END : SIDE_START;
+                            if (bm_it->second & needed)
+                                has_boundary_neighbor = true;
+                        }
                     }
                 }
             }
@@ -1092,22 +1097,36 @@ inline gtl::flat_hash_set<u64> find_contained_cnodes(
                         cc_visited.insert(succ_id);
                         bfs.push(succ_id);
                     }
-                } else if (!nodes_in_layouts.contains(succ_id)) {
-                    has_boundary_neighbor = true;
-                }
-                if (nodes_in_layouts.contains(succ_id)) {
-                    auto bm_it = node_boundary_mask.find(succ_id);
-                    if (bm_it != node_boundary_mask.end()) {
-                        bool ori = node_layout_ori.at(succ_id);
-                        uint8_t needed = ori ? SIDE_START : SIDE_END;
-                        if (bm_it->second & needed) has_boundary_neighbor = true;
+                } else {
+                    has_external_edge = true;
+                    if (!nodes_in_layouts.contains(succ_id)) {
+                        has_boundary_neighbor = true;
+                    } else {
+                        auto bm_it = node_boundary_mask.find(succ_id);
+                        if (bm_it != node_boundary_mask.end()) {
+                            bool ori = node_layout_ori.at(succ_id);
+                            uint8_t needed = ori ? SIDE_START : SIDE_END;
+                            if (bm_it->second & needed)
+                                has_boundary_neighbor = true;
+                        }
                     }
                 }
             }
         }
 
-        if (!has_boundary_neighbor && !component.empty())
+        // A component is contained only if it HAS external adjacency and none
+        // of it reaches a layout boundary — i.e. it hangs off layout
+        // interiors, so its sequence is already represented inside a layout.
+        // A component with NO external adjacency is standalone (isolated
+        // node, or a closed circular component whose neighbors are all
+        // internal): nothing else represents its sequence, so it must be
+        // kept. Previously the vacuous "no boundary neighbor" case dropped
+        // such components (and e.g. plasmids) from the assembly.
+        if (!has_boundary_neighbor && has_external_edge) {
             for (u64 nid : component) contained_nodes.insert(nid);
+        } else if (!has_external_edge && !component.empty()) {
+            ++standalone_components;
+        }
     }
 
     size_t contained_bp = 0;
@@ -1115,10 +1134,12 @@ inline gtl::flat_hash_set<u64> find_contained_cnodes(
         auto it = dbg.dbg.find(node_id);
         for (const auto &s : it->second.seq) contained_bp += s.len;
     }
-    if (!contained_nodes.empty())
+    if (!contained_nodes.empty() || standalone_components > 0)
         std::fprintf(stderr,
-                     "[layout-emit] Skipped %zu contained C-nodes (%zu bp)\n",
-                     contained_nodes.size(), contained_bp);
+                     "[layout-emit] Skipped %zu contained C-nodes (%zu bp); "
+                     "kept %zu standalone components\n",
+                     contained_nodes.size(), contained_bp,
+                     standalone_components);
     return contained_nodes;
 }
 

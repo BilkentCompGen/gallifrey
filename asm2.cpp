@@ -1690,3 +1690,57 @@ TEST_CASE("layout_graph_emit::resolve_layout_orientations policies (C10)") {
         CHECK_EQ(mv.at(200u), true);
     }
 }
+
+TEST_CASE("layout_graph_emit::find_contained_cnodes keeps standalone/circular "
+          "components (C3)") {
+    using namespace layout_graph_emit;
+
+    // Component zoo (expected outcome):
+    //   10            isolated node (no edges at all)              -> keep
+    //   20 <-> 21     closed circular pair (neighbors internal)    -> keep
+    //   30 -> L1      adjacent to layout interior only             -> contained
+    //   40 -> L2      adjacent to a layout boundary                -> keep
+    //   50 -> 99      adjacent to a non-layout node                -> keep
+    dbg_index dbgi(0.001, 1024, 42);
+    auto add_node = [&](u64 id, std::initializer_list<u64> prevs) {
+        dbgi.dbg.emplace(id, dbg_index::bidbg_val{100u});
+        auto it = dbgi.dbg.find(id);
+        for (u64 p : prevs) it->second.prev.push_back(p);
+        it->second.seq.emplace_back(64, 0);  // non-empty seq => valid candidate
+        dbgi.active_set.insert(id);
+    };
+
+    constexpr u64 L1 = 1001, L2 = 1002;  // layout nodes
+    add_node(10, {});
+    add_node(20, {21});
+    add_node(21, {20});
+    add_node(30, {L1});
+    add_node(40, {L2});
+    add_node(50, {99});
+    add_node(L1, {});
+    add_node(L2, {});
+    // Node 99: present in the DBG but neither active nor part of a layout.
+    dbgi.dbg.emplace(99, dbg_index::bidbg_val{100u});
+
+    gtl::flat_hash_set<u64> nodes_in_layouts{L1, L2};
+    gtl::flat_hash_map<u64, uint8_t> node_boundary_mask;
+    gtl::flat_hash_map<u64, bool> node_layout_ori;
+    node_boundary_mask[L1] = 0;          // interior: no side bits set
+    node_layout_ori[L1] = false;
+    node_boundary_mask[L2] = SIDE_START;  // boundary on the side a
+    node_layout_ori[L2] = false;          // predecessor looks for
+
+    gtl::flat_hash_set<u64> candidate_set;
+    auto contained =
+        find_contained_cnodes(dbgi, nodes_in_layouts, node_boundary_mask,
+                              node_layout_ori, candidate_set);
+
+    CHECK(candidate_set.size() == 6);  // all active non-layout nodes
+    CHECK(contained.size() == 1);
+    CHECK(contained.contains(30));   // only the interior-adjacent component
+    CHECK(!contained.contains(10));  // isolated: kept (was dropped pre-C3-fix)
+    CHECK(!contained.contains(20));  // closed circular pair: kept (was dropped)
+    CHECK(!contained.contains(21));
+    CHECK(!contained.contains(40));  // boundary-adjacent: kept
+    CHECK(!contained.contains(50));  // non-layout-adjacent: kept
+}

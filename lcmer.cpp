@@ -337,7 +337,10 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
     SUBCASE(
         "Converting Nibble-encoded data to crumbs and decoding it to bases") {
         int seqlen = strlen(seq_gt);
-        srand(time(NULL));
+        if (seqlen <= 112) {
+            return;  // record too short for the random windows below
+        }
+        srand(42);  // deterministic: this test must be reproducible
         int N_RANDOM_CASES = 50;
 
         gtl::vector<CrumbledSubSeq64> copied;
@@ -385,26 +388,117 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
         charsi chs;
         pos_scratch pos_buf;
         lcp_read lr;
-        parse_cores_from_bam_record(bam_get_seq(rec), rec->core.l_qseq, 3,
-                                    &str1, fnctr, chs, lr, pos_buf);
+        constexpr int LCP_LEVEL = 3;
+        parse_cores_from_bam_record(bam_get_seq(rec), rec->core.l_qseq,
+                                    LCP_LEVEL, &str1, fnctr, chs, lr, pos_buf);
         gtl::vector<CrumbledSubSeq64> ss;
         ss.emplace_back(bam_get_seq(rec), 0, rec->core.l_qseq, 0,
                         CrumbledSubSeq64::from_nibbles{});
 
         lcp_read lr2;
         init_lps_crumbled(&str2, ss, fnctr);
-        // printf("\n");
-        lps_deepen(&str2, 2);
+        // Deepen to the SAME level as the BAM path (parse_cores_from_bam_record
+        // deepens internally): comparing different levels is meaningless —
+        // deeper levels merge more cores. (The pre-fix version compared
+        // level 3 vs level 2 counts only: 167 vs 386.)
+        lps_deepen(&str2, LCP_LEVEL);
         for (int i = 0; i < str2.size; ++i) {
             lr2.cores.emplace_back(str2.cores[i].label);
             lr2.pos.emplace_back(str2.cores[i].start, str2.cores[i].end);
         }
-        CHECK(lr.cores.size() == lr2.cores.size());
+        REQUIRE(lr.cores.size() == lr2.cores.size());
+        for (size_t i = 0; i < lr.cores.size(); ++i) {
+            INFO("core index ", i);
+            CHECK(lr.cores[i] == lr2.cores[i]);
+            CHECK(lr.pos[i].first == lr2.pos[i].first);
+            CHECK(lr.pos[i].second == lr2.pos[i].second);
+        }
+        free(str1.cores);
+        free(str2.cores);
     }
 
+    bam_destroy1(rec);
     bam_hdr_destroy(hdr);
     sam_close(fp);
     free(seq_gt);
+}
+
+TEST_CASE("BAM and crumbled parsers agree on homopolymer-rich sequence") {
+    // Homopolymer runs stress the RLE windowing and the si/ei span
+    // convention: windows ending inside multi-base runs are exactly where
+    // the old convention slid the span past the real k-mer.
+    std::string bases;
+    {
+        const char *runs[] = {"AAAAAAA",  "CC",     "GGGGGGGGGG", "T",
+                              "ACGTACGT", "CCCCCCCC", "GG",        "TTTTTTT",
+                              "AACCGGTTAACCGGTT", "AAAA", "CCCC",  "GGGG",
+                              "TTTT",     "ACGT"};
+        for (int r = 0; r < 12; ++r) {
+            for (const char *run : runs) bases += run;
+        }
+    }
+    const int64_t len = static_cast<int64_t>(bases.size());
+
+    // BAM one-hot nibbles: A=1, C=2, G=4, T=8 (high nibble = even index).
+    gtl::vector<uint8_t> nib((len + 1) / 2, 0);
+    auto code = [](char c) {
+        switch (c) {
+            case 'A': return 1;
+            case 'C': return 2;
+            case 'G': return 4;
+            default: return 8;
+        }
+    };
+    for (int64_t i = 0; i < len; ++i) {
+        if (i % 2 == 0) {
+            nib[i / 2] |= code(bases[i]) << 4;
+        } else {
+            nib[i / 2] |= code(bases[i]);
+        }
+    }
+
+    using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, syncmer::MurMur>;
+    decltype(asm_config::syncmer) spara;
+    spara.k = 6;          // small k so homopolymer windows are frequent
+    spara.density = 0.3;  // select a good fraction of windows
+    SyncmerType fnctr(spara, 7);
+
+    lps str1 = {0, 0, 0, nullptr};
+    lps str2 = {0, 0, 0, nullptr};
+    charsi chs;
+    pos_scratch pos_buf;
+    lcp_read lr;
+    parse_cores_from_bam_record(nib.data(), len, 1, &str1, fnctr, chs, lr,
+                                pos_buf);
+
+    gtl::vector<CrumbledSubSeq64> ss;
+    ss.emplace_back(bases.c_str(), 0, bases.size(), 0,
+                    CrumbledSubSeq64::from_ascii{});
+    lcp_read lr2;
+    init_lps_crumbled(&str2, ss, fnctr);
+    for (int i = 0; i < str2.size; ++i) {
+        lr2.cores.emplace_back(str2.cores[i].label);
+        lr2.pos.emplace_back(str2.cores[i].start, str2.cores[i].end);
+    }
+
+    REQUIRE(!lr.cores.empty());
+    REQUIRE(lr.cores.size() == lr2.cores.size());
+    for (size_t i = 0; i < lr.cores.size(); ++i) {
+        INFO("core ", i);
+        CHECK(lr.cores[i] == lr2.cores[i]);
+        CHECK(lr.pos[i].first == lr2.pos[i].first);
+        CHECK(lr.pos[i].second == lr2.pos[i].second);
+    }
+    // True-span sanity: every span lies inside the sequence and covers at
+    // least k bases (an RLE k-mer spans >= k original bases).
+    for (size_t i = 0; i < lr.pos.size(); ++i) {
+        INFO("span ", i);
+        CHECK(lr.pos[i].second <= static_cast<uint64_t>(len));
+        CHECK(lr.pos[i].second - lr.pos[i].first >=
+              static_cast<uint64_t>(spara.k));
+    }
+    free(str1.cores);
+    free(str2.cores);
 }
 
 // Reference scalar-only two-pass: decode then RLE.
