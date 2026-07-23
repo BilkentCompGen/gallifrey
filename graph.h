@@ -505,9 +505,16 @@ struct GraphCleaning {
                 break;
             }
         }
-        if (current->first != id) {
-            redirect_deleted[id] = current->first;
+        if (!simplified) {
+            // Degenerate: nothing was merged (merged empty, cc_sum == 0,
+            // current == seed). Mutating the seed here would be a
+            // value-identical self-store that races neighbor chains'
+            // stop-condition reads of forward_edge_count (CONFIRMATION_C1.md)
+            // — the only write that could cross chain boundaries. Skip it.
+            return false;
         }
+        // simplified implies the walk moved, i.e. current != seed.
+        redirect_deleted[id] = current->first;
 
         current->second.forward_edge_count = first_fec;
         current->second.counts.core_count += cc_sum;
@@ -521,7 +528,7 @@ struct GraphCleaning {
             (*it)->second.mark_redirected(current->first);
         }
 
-        return simplified;
+        return true;
     };
 
     static auto simplify_simple_parallel_mark(dbg_index::dbg_map_t &dbg,
@@ -575,9 +582,14 @@ struct GraphCleaning {
         redir_map &redirect_deleted, auto &active_set) {
         // Chains are node-disjoint (see simplify_simple_parallel_mark's seed
         // guard), so each thread mutates only the nodes of its own chains with
-        // no synchronization. The shared redirect_deleted is a mutexed
-        // parallel map; active_set is pruned after the join (below) rather than
-        // via a per-node id list. (See RC_REVIEW.md RC1.)
+        // no synchronization. forward_edge_count in particular is written only
+        // on representatives strictly inside the writer's own chain: the
+        // degenerate-path gate in attempt_simplify_one_path_lockless (the C1
+        // fix) removed the one cross-chain self-store, so the sweep is
+        // data-race free under the disjointness invariant (CONFIRMATION_C1.md).
+        // The shared redirect_deleted is a mutexed parallel map; active_set is
+        // pruned after the join (below) rather than via a per-node id list.
+        // (See RC_REVIEW.md RC1.)
         gtl::vector<std::thread> threads;
         for (size_t i = 0; i < to_simplify.size(); ++i) {
             threads.emplace_back(

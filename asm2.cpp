@@ -1782,3 +1782,58 @@ TEST_CASE("GraphCleaning::simplify_simple_paths terminates on self-loops (C1b)"
     CHECK(a0->second.prev.size() == 2);  // untouched
     CHECK(dbgi.dbg.find(300) != dbgi.dbg.end());
 }
+
+TEST_CASE("GraphCleaning::simplify_simple_paths leaves degenerate boundary "
+          "seeds untouched (C1)") {
+    // Configuration: boundary node S (fec=2, prev={T}, T.fec=2) is a type-1
+    // seed whose backward walk is degenerate (merges nothing), while a
+    // reader chain stops at S. The degenerate path must be a pure no-op:
+    // mutating S would race the reader chain's stop-condition read of S.fec
+    // (see CONFIRMATION_C1.md). Under a TSan build this doubles as the race
+    // regression test (pre-fix it reports graph.h read/write on S.fec).
+    dbg_index dbgi(0.001, 1024, 42);
+    auto add_node = [&](u64 id, std::initializer_list<u64> prevs,
+                        unsigned fec) {
+        dbgi.dbg.emplace(id, dbg_index::bidbg_val{100u});
+        auto it = dbgi.dbg.find(id);
+        for (u64 p : prevs) it->second.prev.push_back(p);
+        it->second.forward_edge_count = fec;
+        dbgi.active_set.insert(id);
+    };
+    constexpr u64 T = 1, D = 2, S = 3;
+    add_node(T, {}, 2);
+    add_node(D, {T}, 0);
+    add_node(S, {T}, 2);
+    // Reader chain: X(=109) -> 103 -> 102 -> 101 -> S (backward walk order).
+    add_node(101, {S}, 1);
+    add_node(102, {101}, 1);
+    add_node(103, {102}, 1);
+    add_node(109, {103}, 2);
+    add_node(110, {109}, 0);
+    add_node(111, {109}, 0);
+
+    GraphCleaning::redir_map redirect_deleted;
+    GraphCleaning::simplify_simple_paths(dbgi.dbg, redirect_deleted,
+                                         dbgi.active_set, 4);
+
+    // Degenerate boundary seed S: completely untouched.
+    auto s = dbgi.dbg.find(S);
+    REQUIRE(s != dbgi.dbg.end());
+    CHECK(s->second.forward_edge_count == 2);
+    CHECK(s->second.counts.core_count == 100);
+    CHECK(s->second.prev.size() == 1);
+    CHECK(s->second.prev[0] == T);
+    CHECK(!s->second.redirected());
+
+    // Reader chain merged into its representative (node 101, next to S).
+    auto rep = dbgi.dbg.find(101);
+    REQUIRE(rep != dbgi.dbg.end());
+    CHECK(rep->second.forward_edge_count == 2);      // inherited seed's fec
+    CHECK(rep->second.counts.core_count == 400);     // 100 + 3 merged nodes
+    for (u64 merged : {102, 103, 109}) {
+        auto m = dbgi.dbg.find(merged);
+        REQUIRE(m != dbgi.dbg.end());
+        CHECK(m->second.redirected());
+    }
+    CHECK(redirect_deleted.find(109)->second == 101);
+}
