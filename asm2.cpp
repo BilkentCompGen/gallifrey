@@ -1744,3 +1744,41 @@ TEST_CASE("layout_graph_emit::find_contained_cnodes keeps standalone/circular "
     CHECK(!contained.contains(40));  // boundary-adjacent: kept
     CHECK(!contained.contains(50));  // non-layout-adjacent: kept
 }
+
+TEST_CASE("GraphCleaning::simplify_simple_paths terminates on self-loops (C1b)"
+          * doctest::timeout(10)) {
+    // A self-loop node with fec==1 used to send the backward walk into an
+    // infinite merge-itself loop (worker spun inside
+    // attempt_simplify_one_path_lockless growing `merged`; main parked in
+    // join). The walk must now skip self steps, and the post-sweep redirect
+    // rewrite must drop self-references.
+    dbg_index dbgi(0.001, 1024, 7);
+    auto add_node = [&](u64 id, std::initializer_list<u64> prevs,
+                        unsigned fec) {
+        dbgi.dbg.emplace(id, dbg_index::bidbg_val{100u});
+        auto it = dbgi.dbg.find(id);
+        for (u64 p : prevs) it->second.prev.push_back(p);
+        it->second.forward_edge_count = fec;
+        dbgi.active_set.insert(id);
+    };
+    add_node(100, {100}, 1);       // A: self-loop, fec==1
+    add_node(200, {100, 300}, 0);  // A0: multi-prev (type-2 seeds A)
+    add_node(300, {}, 1);          // B
+
+    GraphCleaning::redir_map redirect_deleted;
+    GraphCleaning::simplify_simple_paths(dbgi.dbg, redirect_deleted,
+                                         dbgi.active_set, 4);
+
+    auto a = dbgi.dbg.find(100);
+    REQUIRE(a != dbgi.dbg.end());
+    for (u64 p : a->second.prev) {
+        CHECK(p != 100);  // no self-reference survives the rewrite
+    }
+    CHECK(a->second.prev.empty());  // its only edge was the self-edge
+    CHECK(a->second.forward_edge_count == 0);  // bookkeeping stays consistent
+
+    auto a0 = dbgi.dbg.find(200);
+    REQUIRE(a0 != dbgi.dbg.end());
+    CHECK(a0->second.prev.size() == 2);  // untouched
+    CHECK(dbgi.dbg.find(300) != dbgi.dbg.end());
+}

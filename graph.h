@@ -486,6 +486,9 @@ struct GraphCleaning {
         gtl::vector<dbg_map_t::iterator> merged;
         unsigned cc_sum = 0;
         while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
+               prev_it->first != current->first &&  // never step onto a self-
+                                                    // loop (would merge the
+                                                    // node into itself forever)
                prev_it->second.forward_edge_count == 1) {
             if (prev_it != dbg.end()) {
                 cc_sum += current->second.counts.core_count;
@@ -539,6 +542,9 @@ struct GraphCleaning {
                     to_simplify_from[tid].emplace_back(item.first, iit);
                 } else if (item.second.prev.size() > 1) {
                     for (auto &prev_id : item.second.prev) {
+                        if (prev_id == item.first) {
+                            continue;  // never seed a self-loop
+                        }
                         auto prev_hash = dbg.hash(prev_id);
 
                         auto prev_it = dbg.find(prev_id, prev_hash, no_lock);
@@ -601,19 +607,24 @@ struct GraphCleaning {
         }
 
         for (auto &node : dbg) {
-            int self_idx = -1;
-            for (auto &p : node.second.prev) {
+            for (size_t idx = 0; idx < node.second.prev.size(); ++idx) {
+                auto &p = node.second.prev[idx];
                 auto it = redirect_deleted.find(p);
                 if (it != redirect_deleted.end()) {
                     p = it->second;
-                } else if (p == node.first) {  // Self edge // TODO: reconsider
-                                               // how this is done
-                    // node.second.forward_edge_count--;
-                    // self_idx = idx;
                 }
-            }
-            if (self_idx != -1) {
-                node.second.prev.erase(node.second.prev.begin() + self_idx);
+                if (p == node.first) {
+                    // Cycle collapse: the redirect rewrite turned this prev
+                    // entry into a self-reference. The self-edge is spurious
+                    // bookkeeping (the collapsed cycle edge) — drop it and
+                    // keep in/out bookkeeping consistent. (At most one such
+                    // entry can exist: emplace_prev dedups.)
+                    if (node.second.forward_edge_count > 0) {
+                        node.second.forward_edge_count--;
+                    }
+                    node.second.prev.erase(node.second.prev.begin() + idx);
+                    --idx;
+                }
             }
         }
     }
