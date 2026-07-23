@@ -2,6 +2,8 @@
 #define _BAMDOCTOR_H_
 
 #include <string>
+#include <vector>
+#include <functional>
 #include <htslib/sam.h>
 #include <htslib/hts.h>
 #include <htslib/thread_pool.h>
@@ -38,11 +40,14 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     sam_hdr_t *hdr = sam_hdr_read(fp);
     if(!hdr){
         fprintf(stderr, "Error: Could not read header from file %s\n", input.c_str());
+        sam_close(fp);
         return 1;
     }
     bam1_t *bamdata = bam_init1();
     if(!bamdata){
         fprintf(stderr, "Error: Could not initialize bamdata\n");
+        sam_hdr_destroy(hdr);
+        sam_close(fp);
         return 1;
     }
     htsThreadPool pool = {NULL, 0};
@@ -54,10 +59,17 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
             pool.pool = hts_tpool_init(threads);
             if(!pool.pool){
                 fprintf(stderr, "Error: Could not initialize thread pool\n");
+                bam_destroy1(bamdata);
+                sam_hdr_destroy(hdr);
+                sam_close(fp);
                 return 1;
             }
             if(hts_set_opt(fp, HTS_OPT_THREAD_POOL, &pool) < 0){
                 fprintf(stderr, "Error: Could not set thread pool\n");
+                hts_tpool_destroy(pool.pool);
+                bam_destroy1(bamdata);
+                sam_hdr_destroy(hdr);
+                sam_close(fp);
                 return 1;
             }
         }
@@ -66,18 +78,25 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     moodycamel::ConcurrentQueue<bam1_t *> recycle_queue {1024, 1, static_cast<size_t>(threads)};
     gtl::vector<std::thread> workers;
     std::atomic<bool> done{false};
-    int counts[1024] = {0};
-    syncmer::DensitySyncmerRule<uint32_t, syncmer::MurMur> sr{8, density, 423, static_cast<unsigned int>(-1)};
-    charsi chs;
-    pos_scratch pos_buf;
-    auto job = [&]() -> std::function<int(bam1_t *, lps *)> {
+    // One slot per worker; sized by the (CLI-clamped) thread count instead of a
+    // fixed 1024 so a large -t can never index out of bounds.
+    std::vector<int> counts(threads, 0);
+    // Use the same rule the assembly pipeline uses (GenericSyncmerRule) so the
+    // diagnostic counts measure what production computes (H8).
+    syncmer_params sr_params;
+    sr_params.k = 8;
+    sr_params.density = density;
+    syncmer::GenericSyncmerRule<uint32_t, syncmer::MurMur> sr{sr_params, 423};
+    // Per-worker scratch (charsi/pos_scratch) is passed in as arguments rather
+    // than captured, so the single shared `job` closure stays race-free.
+    auto job = [&]() -> std::function<int(bam1_t *, lps *, charsi &, pos_scratch &)> {
         if (job_type == "read_count"){
-            return [](bam1_t *, lps *) -> int {
+            return [](bam1_t *, lps *, charsi &, pos_scratch &) -> int {
                 return 1;
             };
         }
         else if (job_type == "core_count"){
-            return [&, lcp_level](bam1_t *bamdata, lps *str) -> int {
+            return [&, lcp_level](bam1_t *bamdata, lps *str, charsi &chs, pos_scratch &pos_buf) -> int {
                 lcp_read lr;
                 lr.clear();
                 parse_cores_from_bam_record(bam_get_seq(bamdata), bamdata->core.l_qseq, lcp_level, str, sr, chs, lr, pos_buf);
@@ -88,7 +107,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
                 return (int)lr.cores.size();
             };
         }
-        return [](bam1_t *, lps *) -> int {
+        return [](bam1_t *, lps *, charsi &, pos_scratch &) -> int {
             return 0;
         };
     }();
@@ -97,13 +116,17 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
         workers.emplace_back([&, i](){
             bam1_t *bamdata = NULL;
             lps str = {0, 0, 0, nullptr};
+            charsi chs;
+            pos_scratch pos_buf;
             while(!done.load() || data_queue.size_approx() > 0){
                 if(!data_queue.try_dequeue(bamdata)){
                     std::this_thread::sleep_for(std::chrono::nanoseconds(10));
                     continue;
                 }
-                counts[i] += job(bamdata, &str);
-                // ++counts[i];
+                counts[i] += job(bamdata, &str, chs, pos_buf);
+                // Hand the buffer back for the producer to refill. Only the
+                // producer reads into it, and only after it has been recycled,
+                // so no worker is still touching it.
                 if(!recycle_queue.try_enqueue(bamdata)){
                     bam_destroy1(bamdata);
                 }
@@ -114,12 +137,14 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
         });
     }
 
+    // Fill `bamdata`, hand it off to a worker, then obtain the *next* buffer
+    // from the recycle queue (or allocate one). This is the correct direction:
+    // the producer never reuses a record a worker may still be reading (H3).
     while(sam_read1(fp, hdr, bamdata) >= 0){
         while(!data_queue.try_enqueue(bamdata)){
             std::this_thread::sleep_for(std::chrono::nanoseconds(100));
         }
-        if(!recycle_queue.try_enqueue(bamdata)){
-            // bam_destroy1(bamdata);
+        if(!recycle_queue.try_dequeue(bamdata)){
             bamdata = bam_init1();
         }
     }
@@ -127,23 +152,29 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     for(auto &worker : workers){
         worker.join();
     }
-    bam1_t *item;
-    size_t count =  0;
-    while(data_queue.try_dequeue(item)){
-        ++count;
-        // bam_destroy1(item);
-    }
+    size_t count = 0;
     for(int i = 0; i < threads; ++i){
         count += counts[i];
     }
-    // while(recycle_queue.try_dequeue(item)){
-    //     bam_destroy1(item);
-    // }
+    // Reclaim every buffer. After the joins no worker is running: data_queue is
+    // drained by the workers (loop condition keeps them going until empty), but
+    // destroy any straggler defensively; recycle_queue holds the buffers handed
+    // back; `bamdata` is the spare read buffer left over at EOF.
+    bam1_t *item;
+    while(data_queue.try_dequeue(item)){
+        bam_destroy1(item);
+    }
+    while(recycle_queue.try_dequeue(item)){
+        bam_destroy1(item);
+    }
+    bam_destroy1(bamdata);
     TIME_CHECKPOINT(BAM_READING, stderr, "Read %zu reads", count);
 
-    // bam_destroy1(bamdata);
     sam_hdr_destroy(hdr);
     sam_close(fp);
+    if(pool.pool){
+        hts_tpool_destroy(pool.pool);
+    }
 
     return 0;
 }

@@ -97,6 +97,27 @@ struct syncmer_params {
         if (auto r = compute_spaced_mask_checked(); !r) {
             return std::unexpected(r.error());
         }
+        // Cross-field numeric checks: reject configurations that select no
+        // k-mers or index an s-window out of the k-mer before any functor is
+        // constructed (a per-option CLI::Range can't express these relations).
+        if (density.has_value() && *density == 0.0) {
+            return std::unexpected(std::string(
+                "--density must be > 0 (0 selects no k-mers -> empty "
+                "assembly)"));
+        }
+        if (mincode.s.has_value()) {
+            if (*mincode.s >= k) {
+                return std::unexpected(
+                    "--submer-s (" + std::to_string(*mincode.s) +
+                    ") must be < --syncmer-k (" + std::to_string(k) + ")");
+            }
+            if (mincode.t.has_value() && *mincode.t >= k - *mincode.s + 1) {
+                return std::unexpected(
+                    "--submer-t (" + std::to_string(*mincode.t) +
+                    ") must be < k - s + 1 (" +
+                    std::to_string(k - *mincode.s + 1) + ")");
+            }
+        }
         return {};
     }
     void print_cfg(FILE *f) const {

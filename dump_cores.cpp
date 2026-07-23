@@ -133,7 +133,13 @@ DumpCoresProgram::DumpCoresProgram(CLI::App &parent) {
         ->capture_default_str();
     app.add_option("--seed", seed, "Random seed")->capture_default_str();
     app.callback([this]() {
-        return run_dump_cores(input, output, syncmer_k, submer_s, submer_t,
-                              lcp_level, seed);
+        // CLI11 callbacks return void, so surface a nonzero result as a
+        // CLI::RuntimeError (CLI11_PARSE prints it and exits with that code)
+        // instead of silently discarding the rc and exiting 0.
+        if (int rc = run_dump_cores(input, output, syncmer_k, submer_s,
+                                    submer_t, lcp_level, seed);
+            rc != 0) {
+            throw CLI::RuntimeError("dump-cores failed", rc);
+        }
     });
 }

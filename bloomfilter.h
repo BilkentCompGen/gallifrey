@@ -250,7 +250,7 @@ struct BlockedAtomicBloomFilter {
                   "atomic block word must be lock-free for this filter to be "
                   "useful");
 
-    BlockedAtomicBloomFilter(int n, float eps)
+    BlockedAtomicBloomFilter(int64_t n, float eps)
         : n(n),
           epsilon(eps),
           m{ComputeNumBits()},
@@ -259,13 +259,21 @@ struct BlockedAtomicBloomFilter {
           num_words{num_blocks * words_per_block},
           bv{std::make_unique<std::atomic<block_type>[]>(num_words)} {
         fprintf(stderr,
-                "BloomFilter(atomic): n=%d, eps=%.2e, m=%" PRIu64
+                "BloomFilter(atomic): n=%" PRId64 ", eps=%.2e, m=%" PRIu64
                 ", k=%d, num_blocks=%" PRIu64 ", num_words=%" PRIu64 "\n",
                 n, epsilon, m, k, num_blocks, num_words);
     }
 
     uint64_t ComputeNumBits() {
-        return static_cast<uint64_t>(-1.44 * n * std::log2(epsilon) + 0.5);
+        // Keep the log math in double, then clamp so a very large n neither
+        // overflows the double->uint64 cast (UB) nor requests an absurd
+        // allocation. Ceiling ~1e13 bits ≈ 1.25 TB — far above any real run
+        // (n=1e10 @ eps=1e-3 ⇒ ~18 GB).
+        double bits = -1.44 * static_cast<double>(n) * std::log2(epsilon) + 0.5;
+        if (bits < 1.0) bits = 1.0;
+        constexpr double kMaxBits = 1e13;
+        if (bits > kMaxBits) bits = kMaxBits;
+        return static_cast<uint64_t>(bits);
     }
 
     int ComputeNumHashFns() {
@@ -304,7 +312,7 @@ struct BlockedAtomicBloomFilter {
             bv[i].store(0, std::memory_order_relaxed);
     }
 
-    int n;
+    int64_t n;
     float epsilon;
 
     uint64_t m;

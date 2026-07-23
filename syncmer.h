@@ -154,7 +154,8 @@ struct GenericSyncmerRule {
           pure_lcp(false),
           table(table_size, 0) {
         if (cfg.mincode.s.has_value()) {
-            s_mask = (1U << s()) - 1U;
+            // s bases packed 2 bits each ⇒ the submer occupies 2*s low bits.
+            s_mask = (int_type)((1ULL << (2 * s())) - 1ULL);
         } else {
             s_mask = -1;
         }
@@ -176,10 +177,12 @@ struct GenericSyncmerRule {
             case syncmer_params::typeenum::MinCodeClosed:  // Intentional
                                                            // fallthrough
             case syncmer_params::typeenum::MinCodeOpen: {
-                int_type min_index = -1;
+                // There are k-s+1 submer windows in a k-mer; window i starts at
+                // base i, i.e. bit 2*i, and spans 2*s bits (s_mask).
+                int_type min_index = 0;
                 int_type min_val = std::numeric_limits<int_type>::max();
-                for (int_type i = 0; i < k() - s(); ++i) {
-                    int_type masked_s = (val >> i) & s_mask;
+                for (int_type i = 0; i < k() - s() + 1; ++i) {
+                    int_type masked_s = (val >> (2 * i)) & s_mask;
                     int_type hashed_s = hf(masked_s);
                     if (hashed_s < min_val) {
                         min_index = i;
@@ -187,7 +190,9 @@ struct GenericSyncmerRule {
                     }
                 }
                 if (type() == syncmer_params::typeenum::MinCodeClosed) {
-                    return min_index == 0 || min_index == k() - s() - 1;
+                    // Closed syncmer: minimal submer at either end (window 0 or
+                    // the last window, index k-s).
+                    return min_index == 0 || min_index == k() - s();
                 } else {
                     return t() == min_index;
                 }

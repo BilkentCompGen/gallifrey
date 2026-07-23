@@ -29,20 +29,25 @@ public:
         app.add_option("-o,--output", cfg.output, "Output gfa file")
             ->required();
         app.add_option("-l,--level", cfg.lcp_level, "LCP level to compute")
-            ->required();
+            ->required()
+            ->check(CLI::Range(1, 64));
         app.add_option("--dbg-lcmer-l", cfg.dbg_lcmer_l,
                        "DBG LCMER window length")
+            ->check(CLI::Range(1, 64))
             ->capture_default_str();
         app.add_option("--olc-lcmer-l", cfg.olc_lcmer_l,
                        "OLC (overlap) LCMER window length. Overlap detection "
                        "queries the DBG (built at --dbg-lcmer-l), so this must "
                        "equal --dbg-lcmer-l or overlaps are lost")
+            ->check(CLI::Range(1, 64))
             ->capture_default_str();
         app.add_option("-t,--threads", cfg.threads.work,
                        "Number of worker threads")
+            ->check(CLI::Range(1, MAXIMUM_WORK_THREADS))
             ->capture_default_str();
         app.add_option("-@,--io-threads", cfg.threads.io,
                        "Number of IO threads (Used by htslib for decompressing)")
+            ->check(CLI::Range(0, 64))
             ->capture_default_str();
         app.add_option("--random-seed", cfg.seed, "Random seed")
             ->capture_default_str();
@@ -66,23 +71,29 @@ public:
                        "Mask for spaced seeding. (0->skip, 1->keep, 2->mask "
                        "left bit, 3->mask right bit.")
             ->capture_default_str();
-        app.add_option("--syncmer-k", cfg.syncmer.k, "K-mer length")
+        app.add_option("--syncmer-k", cfg.syncmer.k,
+                       "K-mer length (table is 4^k bits; k=15 ⇒ 128 MiB)")
+            ->check(CLI::Range(3u, 15u))
             ->capture_default_str();
         app.add_option("--density", cfg.syncmer.density,
                        "Density of selected k-mers")
             ->check(CLI::Range(0.0, 1.0));
         app.add_option("--submer-s", cfg.syncmer.mincode.s,
                        "Size of submers for mincode syncmers")
+            ->check(CLI::Range(1ul, 31ul))
             ->excludes("--density");
         app.add_option("--submer-t", cfg.syncmer.mincode.t,
                        "Position of submers for mincode syncmers (Closed "
                        "syncmer if omitted)")
+            ->check(CLI::Range(0ul, 31ul))
             ->excludes("--density")
             ->needs("--submer-s");
         auto bfg = app.add_option_group("bloomfilter",
                                         "Parameters to setup bloom filter");
         bfg->add_option("--projected-element-count", cfg.bloom.projected_count,
-                        "Projected element count")
+                        "Projected element count (human-scale ~3e9 is fine; the "
+                        "filter prints its allocated size on startup)")
+            ->check(CLI::Range((int64_t)1, (int64_t)10000000000))
             ->capture_default_str();
         bfg->add_option("--false-positive-probability",
                         cfg.bloom.false_positive_rate,
@@ -92,9 +103,11 @@ public:
                                         "Parameters to setup graph cleaning");
         gcg->add_option("--iterations", cfg.graph_cleaning.iterations,
                         "Number of iterations of graph cleaning")
+            ->check(CLI::Range(0, 100))
             ->capture_default_str();
         gcg->add_option("--max-tip-length", cfg.graph_cleaning.max_tip_length,
                         "Maximum tip length to cut in terms of cores")
+            ->check(CLI::Range(0, 1000000))
             ->capture_default_str();
         gcg->add_option(
                "--min-bubble-depth-difference-ratio",
@@ -147,8 +160,10 @@ public:
         app.add_option("-l,--level", lcp_level, "LCP level to compute")
             ->required();
         app.add_option("-t,--threads", threads, "Number of threads")
+            ->check(CLI::Range(1, MAXIMUM_WORK_THREADS))
             ->capture_default_str();
         app.add_option("--density", density, "Density of selected k-mers")
+            ->check(CLI::Range(0.0, 1.0))
             ->required();
 
         std::map<std::string, SamReadTestingMode> SamReadTestingMode_map = {
@@ -167,8 +182,14 @@ public:
             ->transform(CLI::CheckedTransformer(SamReadTestingMode_map,
                                                 CLI::ignore_case));
         app.callback([this]() {
-            return run_sam_read_testing(input, threads, lcp_level, mode, job,
-                                        density);
+            // Propagate failures to the exit status: CLI11 callbacks return
+            // void, so a nonzero rc must be re-raised as a CLI error rather
+            // than discarded (which would exit 0 and pass CI silently).
+            if (int rc = run_sam_read_testing(input, threads, lcp_level, mode,
+                                              job, density);
+                rc != 0) {
+                throw CLI::RuntimeError("bamdoctor failed", rc);
+            }
         });
     }
     SamReadTesting(const SamReadTesting &) = delete;

@@ -87,6 +87,9 @@ struct assembler {
           bloom{cfg.bloom},
           seed{cfg.seed},
           syncmer_params{cfg.syncmer},
+          // The syncmer hash seed is 32-bit; cfg.seed is size_t only so the
+          // CLI can accept large values. Deliberate truncation — different
+          // seeds may alias mod 2^32, which is acceptable for a hash seed.
           syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)},
           dbg_lcmer_l{cfg.dbg_lcmer_l},
           olc_lcmer_l{cfg.olc_lcmer_l},
@@ -987,7 +990,7 @@ int run_assembly(const asm_config &cfg) {
                        "Count forward edges");
 
     if (cfg.print_precleanup_graph) {
-        const std::string raw_path = cfg.output + ".raw";
+        const std::string raw_path = cfg.output + ".raw.gfa";
         FILE *out = fopen(raw_path.c_str(), "w");
         if (!out) {
             fprintf(stderr, "Cannot open output: %s\n", raw_path.c_str());
@@ -1004,9 +1007,9 @@ int run_assembly(const asm_config &cfg) {
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph cleaning");
 
 
-    // Dump pre-layout unitig graph
-    {
-        const std::string pre_path = cfg.output + ".pre_layout";
+    // Dump pre-layout (bidirected) unitig graph, gated on --print-bi-dbg.
+    if (cfg.print_prelayout_graph) {
+        const std::string pre_path = cfg.output + ".bi.gfa";
         FILE *pre = fopen(pre_path.c_str(), "w");
         if (!pre) {
             fprintf(stderr, "Cannot open output: %s\n", pre_path.c_str());
@@ -1016,7 +1019,6 @@ int run_assembly(const asm_config &cfg) {
         fclose(pre);
     }
 
-    // Later stages commented out for profiling graph building
     {
         FILE *out = fopen(cfg.output.c_str(), "w");
         if (!out) {
@@ -1836,4 +1838,78 @@ TEST_CASE("GraphCleaning::simplify_simple_paths leaves degenerate boundary "
         CHECK(m->second.redirected());
     }
     CHECK(redirect_deleted.find(109)->second == 101);
+}
+
+// ── Fix 9: MinCode syncmer rule arithmetic ──────────────────────────────
+// Uses the Identity hash so the "minimum-hash" submer is just the minimum
+// integer submer, making expected results hand-computable. k=4, s=2 ⇒ three
+// 2-base (4-bit, mask 0xF) windows at bit offsets 0,2,4. For a k-mer `val`:
+//   w0 = val & 0xF,  w1 = (val>>2) & 0xF,  w2 = (val>>4) & 0xF
+// min_index = argmin(w0,w1,w2) (first on ties). Closed ⇒ min_index in {0, k-s=2};
+// Open(t) ⇒ min_index == t.
+TEST_CASE("MinCode syncmer rule: closed/open window arithmetic") {
+    using Rule = syncmer::GenericSyncmerRule<uint32_t, syncmer::Identity>;
+
+    // val=0x1B=0b00011011: w0=11, w1=6, w2=1 ⇒ min at index 2
+    // val=0x8F=0b10001111: w0=15, w1=3, w2=8 ⇒ min at index 1
+    // val=0xF0=0b11110000: w0=0,  w1=12, w2=15 ⇒ min at index 0
+    SUBCASE("closed") {
+        decltype(asm_config::syncmer) p;
+        p.k = 4;
+        p.mincode.s = 2;  // closed: no t
+        Rule sr{p, 0};
+        CHECK(sr(0x1B));        // min index 2 == k-s ⇒ closed syncmer
+        CHECK_FALSE(sr(0x8F));  // min index 1 (interior) ⇒ not
+        CHECK(sr(0xF0));        // min index 0 ⇒ closed syncmer
+    }
+    SUBCASE("open t=1") {
+        decltype(asm_config::syncmer) p;
+        p.k = 4;
+        p.mincode.s = 2;
+        p.mincode.t = 1;
+        Rule sr{p, 0};
+        CHECK(sr(0x8F));        // min index 1 == t
+        CHECK_FALSE(sr(0x1B));  // min index 2 != 1
+        CHECK_FALSE(sr(0xF0));  // min index 0 != 1
+    }
+    SUBCASE("open t=0 matches window 0 (first base)") {
+        decltype(asm_config::syncmer) p;
+        p.k = 4;
+        p.mincode.s = 2;
+        p.mincode.t = 0;
+        Rule sr{p, 0};
+        CHECK(sr(0xF0));        // min index 0 == t
+        CHECK_FALSE(sr(0x8F));  // min index 1 != 0
+    }
+    // The last window (index k-s) must actually be examined: a k-mer whose
+    // unique minimum submer sits in the final window is a closed syncmer.
+    SUBCASE("last window is examined") {
+        decltype(asm_config::syncmer) p;
+        p.k = 4;
+        p.mincode.s = 2;
+        Rule sr{p, 0};
+        CHECK(sr(0x1B));  // min submer (=1) is window 2, the last one
+    }
+}
+
+// ── Fix 10: bloom projected_count widening (H13) ────────────────────────
+// A human-scale projected count (n > INT32_MAX) previously narrowed to a
+// negative int, so ComputeNumBits produced a negative-then-wrapped bit count
+// and make_unique threw bad_alloc — the filter could not even be constructed.
+// With int64_t n it constructs cleanly and sizes correctly. A high eps keeps
+// the test allocation to a few MB while still exercising the >INT32_MAX path.
+TEST_CASE("BlockedAtomicBloomFilter handles n > INT32_MAX without narrowing") {
+    const int64_t n = 3'000'000'000LL;  // > INT32_MAX (2.147e9)
+    bloom_ext::BlockedAtomicBloomFilter<> bf(n, 0.99f);  // eps→small m (~8 MB)
+    CHECK(bf.n == n);            // full value retained, not narrowed
+    CHECK(bf.m > 10'000'000ULL); // large positive bit count from the full n
+    CHECK(bf.num_words > 0);
+}
+
+// The clamp keeps a pathological n from requesting a petabyte allocation or
+// tripping the double->uint64 cast; ComputeNumBits saturates at the ceiling.
+TEST_CASE("BlockedAtomicBloomFilter clamps an absurd projected count") {
+    bloom_ext::BlockedAtomicBloomFilter<> bf(1, 0.99f);
+    bf.n = 1'000'000'000'000'000LL;  // 1e15
+    CHECK(bf.ComputeNumBits() == static_cast<uint64_t>(1e13));  // clamped
 }

@@ -128,7 +128,6 @@ target_link_libraries(lasm_tests PRIVATE
                       $<$<PLATFORM_ID:Linux>:rt>)
 target_compile_definitions(lasm_tests PRIVATE
     __STDC_FORMAT_MACROS=1
-    SYNCMER_RULE=DensitySyncmerRule
 )
 add_test(NAME unit COMMAND lasm_tests)
 
@@ -149,7 +148,6 @@ add_custom_target(debug
 # lcmer.cpp) from the production binary; the tests are built into lasm_tests.
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     __STDC_FORMAT_MACROS=1
-    SYNCMER_RULE=DensitySyncmerRule
     DOCTEST_CONFIG_DISABLE
 )
 
