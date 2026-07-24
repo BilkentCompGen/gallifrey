@@ -41,6 +41,9 @@ set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "-pg -no-pie")
 # MinSizeRel flags
 set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG")
 
+#We are not providing a public ABI, no need to fix this
+add_compile_options($<$<CXX_COMPILER_ID:GNU>:-Wno-interference-size>)
+
 # Optimize for the host CPU only when explicitly requested (non-portable;
 # default off so distributed binaries run on other machines).
 if(LASM_NATIVE)
