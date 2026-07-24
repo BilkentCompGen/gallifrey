@@ -1,6 +1,7 @@
 #ifndef _SYNCMER_H_
 #define _SYNCMER_H_
 
+#include <algorithm>
 #include <cassert>
 #include <concepts>
 #include <cstdint>
@@ -8,6 +9,7 @@
 
 #include "asm.h"
 #include "gtl/vector.hpp"
+#include "kmer_bits.h"
 #define KOMIHASH_NS_CUSTOM komihash
 #include <komihash.h>
 namespace syncmer {
@@ -97,33 +99,12 @@ struct Identity {
     Identity(unsigned seed) : seed{seed} {}
     unsigned operator()(unsigned value) const { return value; }
 };
+// Builds a LuT for the given submer rule; works fine for K <= 11, 12.
+// Dispatches all three submer rules (Edgar 2021 terminology): a mincode submer
+// (code < H/c) and closed/open syncmers (selected by the position of the
+// smallest s-mer µ(κ,s)).
 template <class INT_TYPE, HashFunction<INT_TYPE> HASH_FUNCTION>
-struct DensitySyncmerRule {
-    using int_type = INT_TYPE;
-    syncmer_params cfg;
-    int_type seed;
-    HASH_FUNCTION hf;
-    int_type mask;
-    constexpr int_type k() const { return cfg.k; }
-    constexpr double density() const { return cfg.density.value(); }
-    constexpr int_type threshold() const {
-        return density() * std::numeric_limits<int_type>::max();
-    }
-    DensitySyncmerRule(const syncmer_params &cfg, int_type seed)
-        : cfg{cfg},
-          seed{seed},
-          hf{seed},
-          mask{(int_type)cfg.compute_spaced_mask()} {}
-    DensitySyncmerRule(int_type k, double density, INT_TYPE seed, INT_TYPE mask)
-        : cfg{.k = k, .density = density}, seed{seed}, hf{seed}, mask{mask} {}
-    constexpr bool operator()(int_type val) const {
-        return hf(val & mask) < threshold();
-    }
-};
-
-// Builds a LuT for the given syncmer rule should work fine for K <= 11, 12
-template <class INT_TYPE, HashFunction<INT_TYPE> HASH_FUNCTION>
-struct GenericSyncmerRule {
+struct GenericSubmerRule {
     static constexpr double pure_lcp_density_threshold = 0.5;
     using int_type = INT_TYPE;
     syncmer_params cfg;
@@ -135,9 +116,11 @@ struct GenericSyncmerRule {
     bool pure_lcp;
     gtl::vector<bool> table;
 
+    bool canonical;
+
     constexpr int_type k() const { return cfg.k; }
-    constexpr int_type s() const { return cfg.mincode.s.value(); }
-    constexpr int_type t() const { return cfg.mincode.t.value(); }
+    constexpr int_type s() const { return cfg.smer.s.value(); }
+    constexpr int_type t() const { return cfg.smer.t.value(); }
     constexpr double density() const { return cfg.density.value(); }
     constexpr int_type threshold() const {
         return density() * std::numeric_limits<int_type>::max();
@@ -145,39 +128,50 @@ struct GenericSyncmerRule {
     constexpr auto type() const -> syncmer_params::typeenum {
         return cfg.type();
     }
-    GenericSyncmerRule(const syncmer_params &cfg, int_type seed)
+    GenericSubmerRule(const syncmer_params &cfg, int_type seed)
         : cfg{cfg},
           seed{seed},
           hf{seed},
           k_mask{(INT_TYPE)cfg.compute_spaced_mask()},
           table_size{2 << (2 * k() - 1)},
           pure_lcp(false),
-          table(table_size, 0) {
-        if (cfg.mincode.s.has_value()) {
-            // s bases packed 2 bits each ⇒ the submer occupies 2*s low bits.
+          table(table_size, 0),
+          canonical(cfg.canonical) {
+        if (cfg.smer.s.has_value()) {
+            // s bases packed 2 bits each ⇒ the s-mer occupies 2*s low bits.
             s_mask = (int_type)((1ULL << (2 * s())) - 1ULL);
         } else {
             s_mask = -1;
         }
         size_t tc = 0;
         for (int i = 0; i < table_size; ++i) {
-            table[i] = is_syncmer(i & k_mask);
+            table[i] = is_submer(i & k_mask);
             tc += table[i];
         }
-        fprintf(stderr, "Real K-mer density: %lf\n", (double)tc / table_size);
+        fprintf(stderr, "Real submer density: %lf\n", (double)tc / table_size);
         if ((double)tc / table_size > pure_lcp_density_threshold) {
             fprintf(stderr, "Density of %lf > %lf, switching to pure LCP!\n",
                     (double)tc / table_size, pure_lcp_density_threshold);
             pure_lcp = true;
         }
     }
-    constexpr bool operator()(int_type val) const { return table[val]; }
-    constexpr bool is_syncmer(int_type val) const {
+    // Strand-canonical selection (opt-in): apply the rule to min(κ, rc(κ)) so a
+    // k-mer and its reverse complement are always co-selected. Default off ⇒
+    // the raw forward value is used (unchanged behavior).
+    constexpr bool operator()(int_type val) const {
+        if (canonical) {
+            val = std::min(val, reverse_complement_kmer<int_type>(val, k()));
+        }
+        return table[val];
+    }
+    // µ(κ,s) = smallest s-mer (first on ties). Closed syncmer: µ at the first or
+    // last s-mer; open syncmer: µ at offset t. Mincode submer: hashed code < H/c.
+    constexpr bool is_submer(int_type val) const {
         switch (type()) {
-            case syncmer_params::typeenum::MinCodeClosed:  // Intentional
+            case syncmer_params::typeenum::ClosedSyncmer:  // Intentional
                                                            // fallthrough
-            case syncmer_params::typeenum::MinCodeOpen: {
-                // There are k-s+1 submer windows in a k-mer; window i starts at
+            case syncmer_params::typeenum::OpenSyncmer: {
+                // There are k-s+1 s-mer windows in a k-mer; window i starts at
                 // base i, i.e. bit 2*i, and spans 2*s bits (s_mask).
                 int_type min_index = 0;
                 int_type min_val = std::numeric_limits<int_type>::max();
@@ -189,22 +183,22 @@ struct GenericSyncmerRule {
                         min_val = hashed_s;
                     }
                 }
-                if (type() == syncmer_params::typeenum::MinCodeClosed) {
-                    // Closed syncmer: minimal submer at either end (window 0 or
-                    // the last window, index k-s).
+                if (type() == syncmer_params::typeenum::ClosedSyncmer) {
+                    // Closed syncmer: µ at either end (window 0 or the last
+                    // window, index k-s).
                     return min_index == 0 || min_index == k() - s();
                 } else {
                     return t() == min_index;
                 }
             }
-            case syncmer_params::typeenum::Density: {
+            case syncmer_params::typeenum::MincodeSubmer: {
                 return hf(val & k_mask) < threshold();
             }
             case syncmer_params::typeenum::Invalid:
             default:
                 // Unreachable: syncmer_params::validate() rejects Invalid
                 // before any functor is constructed.
-                assert(false && "syncmer type validated before construction");
+                assert(false && "submer type validated before construction");
                 __builtin_unreachable();
         }
     }

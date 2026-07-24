@@ -76,18 +76,27 @@ public:
             ->check(CLI::Range(3u, 15u))
             ->capture_default_str();
         app.add_option("--density", cfg.syncmer.density,
-                       "Density of selected k-mers")
+                       "Mincode-submer selection (Edgar 2021): keep k-mers whose "
+                       "hashed code < H*density (compression c = 1/density). "
+                       "'density' is the resulting metric, not a syncmer.")
             ->check(CLI::Range(0.0, 1.0));
-        app.add_option("--submer-s", cfg.syncmer.mincode.s,
-                       "Size of submers for mincode syncmers")
+        app.add_option("--submer-s", cfg.syncmer.smer.s,
+                       "s-mer length s for syncmer selection. Without --submer-t "
+                       "this is a closed syncmer (smallest s-mer at the first or "
+                       "last position).")
             ->check(CLI::Range(1ul, 31ul))
             ->excludes("--density");
-        app.add_option("--submer-t", cfg.syncmer.mincode.t,
-                       "Position of submers for mincode syncmers (Closed "
-                       "syncmer if omitted)")
+        app.add_option("--submer-t", cfg.syncmer.smer.t,
+                       "Offset t of the smallest s-mer: selects an open syncmer "
+                       "(smallest s-mer at position t).")
             ->check(CLI::Range(0ul, 31ul))
             ->excludes("--density")
             ->needs("--submer-s");
+        app.add_flag("--canonical", cfg.syncmer.canonical,
+                     "Strand-canonical selection: apply the submer rule to "
+                     "min(kmer, reverse-complement) so a k-mer and its reverse "
+                     "complement are always co-selected.")
+            ->capture_default_str();
         auto bfg = app.add_option_group("bloomfilter",
                                         "Parameters to setup bloom filter");
         bfg->add_option("--projected-element-count", cfg.bloom.projected_count,

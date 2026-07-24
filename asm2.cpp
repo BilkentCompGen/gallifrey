@@ -63,7 +63,7 @@ enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 
 struct assembler {
     using SYNCMER_HASHER = syncmer::MurMur;
-    using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
+    using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
 
     using dqt = moodycamel::BlockingConcurrentQueue<bam1_t *>;
     gtl::vector<string> inputs;
@@ -1043,7 +1043,7 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 
 TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
     using SYNCMER_HASHER = syncmer::MurMur;
-    using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
+    using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
     decltype(asm_config::syncmer) spara;
     spara.k = 8;
     spara.density = 0.05;
@@ -1847,8 +1847,8 @@ TEST_CASE("GraphCleaning::simplify_simple_paths leaves degenerate boundary "
 //   w0 = val & 0xF,  w1 = (val>>2) & 0xF,  w2 = (val>>4) & 0xF
 // min_index = argmin(w0,w1,w2) (first on ties). Closed ⇒ min_index in {0, k-s=2};
 // Open(t) ⇒ min_index == t.
-TEST_CASE("MinCode syncmer rule: closed/open window arithmetic") {
-    using Rule = syncmer::GenericSyncmerRule<uint32_t, syncmer::Identity>;
+TEST_CASE("Syncmer rule (closed/open): s-mer window arithmetic") {
+    using Rule = syncmer::GenericSubmerRule<uint32_t, syncmer::Identity>;
 
     // val=0x1B=0b00011011: w0=11, w1=6, w2=1 ⇒ min at index 2
     // val=0x8F=0b10001111: w0=15, w1=3, w2=8 ⇒ min at index 1
@@ -1856,7 +1856,7 @@ TEST_CASE("MinCode syncmer rule: closed/open window arithmetic") {
     SUBCASE("closed") {
         decltype(asm_config::syncmer) p;
         p.k = 4;
-        p.mincode.s = 2;  // closed: no t
+        p.smer.s = 2;  // closed: no t
         Rule sr{p, 0};
         CHECK(sr(0x1B));        // min index 2 == k-s ⇒ closed syncmer
         CHECK_FALSE(sr(0x8F));  // min index 1 (interior) ⇒ not
@@ -1865,8 +1865,8 @@ TEST_CASE("MinCode syncmer rule: closed/open window arithmetic") {
     SUBCASE("open t=1") {
         decltype(asm_config::syncmer) p;
         p.k = 4;
-        p.mincode.s = 2;
-        p.mincode.t = 1;
+        p.smer.s = 2;
+        p.smer.t = 1;
         Rule sr{p, 0};
         CHECK(sr(0x8F));        // min index 1 == t
         CHECK_FALSE(sr(0x1B));  // min index 2 != 1
@@ -1875,8 +1875,8 @@ TEST_CASE("MinCode syncmer rule: closed/open window arithmetic") {
     SUBCASE("open t=0 matches window 0 (first base)") {
         decltype(asm_config::syncmer) p;
         p.k = 4;
-        p.mincode.s = 2;
-        p.mincode.t = 0;
+        p.smer.s = 2;
+        p.smer.t = 0;
         Rule sr{p, 0};
         CHECK(sr(0xF0));        // min index 0 == t
         CHECK_FALSE(sr(0x8F));  // min index 1 != 0
@@ -1886,10 +1886,33 @@ TEST_CASE("MinCode syncmer rule: closed/open window arithmetic") {
     SUBCASE("last window is examined") {
         decltype(asm_config::syncmer) p;
         p.k = 4;
-        p.mincode.s = 2;
+        p.smer.s = 2;
         Rule sr{p, 0};
         CHECK(sr(0x1B));  // min submer (=1) is window 2, the last one
     }
+}
+
+// --canonical: applying the rule to min(kmer, reverse-complement) must make a
+// k-mer and its reverse complement always agree, and the flag must actually
+// change behavior vs the default (directional) rule.
+TEST_CASE("Strand-canonical selection co-selects a k-mer and its rev-comp") {
+    using Rule = syncmer::GenericSubmerRule<uint32_t, syncmer::MurMur>;
+    const int k = 8;
+    decltype(asm_config::syncmer) p;
+    p.k = k;
+    p.smer.s = 3;  // closed syncmer
+    p.canonical = true;
+    Rule canon{p, 42};
+    p.canonical = false;
+    Rule direct{p, 42};
+
+    bool saw_directional_diff = false;
+    for (uint32_t x = 0; x < (1u << (2 * k)); ++x) {
+        uint32_t rc = reverse_complement_kmer<uint32_t>(x, k);
+        CHECK(canon(x) == canon(rc));  // co-selected under --canonical
+        if (direct(x) != direct(rc)) saw_directional_diff = true;
+    }
+    CHECK(saw_directional_diff);  // the flag genuinely changes selection
 }
 
 // ── Fix 10: bloom projected_count widening (H13) ────────────────────────

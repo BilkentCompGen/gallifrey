@@ -11,27 +11,38 @@
 #include <optional>
 #include <string>
 #include <vector>
+// Submer selection parameters (terminology per Edgar 2021, "Syncmers are more
+// sensitive than minimizers…"). A "submer" is a k-mer selected by a submer
+// rule. The rules here are: a mincode submer (density-based: select if the
+// hashed code < H/c), and syncmers (select by the position of the smallest
+// s-mer µ(κ,s) — closed = first or last s-mer, open = the s-mer at offset t).
 struct syncmer_params {
-    enum class typeenum { Density, MinCodeOpen, MinCodeClosed, Invalid };
+    enum class typeenum { MincodeSubmer, OpenSyncmer, ClosedSyncmer, Invalid };
     constexpr typeenum type() const {
         if (density.has_value()) {
-            return typeenum::Density;
+            return typeenum::MincodeSubmer;
         }
-        if (mincode.s.has_value()) {
-            if (mincode.t.has_value()) {
-                return typeenum::MinCodeOpen;
+        if (smer.s.has_value()) {
+            if (smer.t.has_value()) {
+                return typeenum::OpenSyncmer;
             } else {
-                return typeenum::MinCodeClosed;
+                return typeenum::ClosedSyncmer;
             }
         }
         return typeenum::Invalid;
     }
     unsigned k = 8;
+    // Mincode-submer parameter: target density d (compression factor c = 1/d).
     std::optional<double> density;
+    // Syncmer parameters: s-mer length s and (open syncmer) offset t.
     struct {
         std::optional<unsigned long> s;
         std::optional<unsigned long> t;
-    } mincode;
+    } smer;
+    // Apply the rule to the strand-canonical k-mer (min of the k-mer and its
+    // reverse complement) so a k-mer and its reverse complement are always
+    // co-selected. Opt-in; default off preserves the directional behavior.
+    bool canonical = false;
     std::string spaced_seed_mask = "11111111111111111111111111111111";
 
     // Validating mask builder: returns the packed mask or an error message.
@@ -105,17 +116,17 @@ struct syncmer_params {
                 "--density must be > 0 (0 selects no k-mers -> empty "
                 "assembly)"));
         }
-        if (mincode.s.has_value()) {
-            if (*mincode.s >= k) {
+        if (smer.s.has_value()) {
+            if (*smer.s >= k) {
                 return std::unexpected(
-                    "--submer-s (" + std::to_string(*mincode.s) +
+                    "--submer-s (" + std::to_string(*smer.s) +
                     ") must be < --syncmer-k (" + std::to_string(k) + ")");
             }
-            if (mincode.t.has_value() && *mincode.t >= k - *mincode.s + 1) {
+            if (smer.t.has_value() && *smer.t >= k - *smer.s + 1) {
                 return std::unexpected(
-                    "--submer-t (" + std::to_string(*mincode.t) +
+                    "--submer-t (" + std::to_string(*smer.t) +
                     ") must be < k - s + 1 (" +
-                    std::to_string(k - *mincode.s + 1) + ")");
+                    std::to_string(k - *smer.s + 1) + ")");
             }
         }
         return {};
@@ -124,20 +135,21 @@ struct syncmer_params {
         fprintf(f, "spaced-seed-mask: \"%s\"\n", spaced_seed_mask.c_str());
         fprintf(f, "k: %d\n", k);
         if (density.has_value()) {
-            fprintf(f, "kmer-selection: \"density\"\n");
-            fprintf(f, "Density: %f\n", *density);
-        } else if (mincode.s.has_value()) {
-            if (mincode.t.has_value()) {
-                fprintf(f, "kmer-selection: \"open-syncmers\"\n");
-                fprintf(f, "syncmer-s:%lu\nsyncmer-t:%lu\n", *mincode.s,
-                        *mincode.t);
+            fprintf(f, "submer-rule: \"mincode-submer\"\n");
+            fprintf(f, "density: %f\n", *density);
+        } else if (smer.s.has_value()) {
+            if (smer.t.has_value()) {
+                fprintf(f, "submer-rule: \"open-syncmer\"\n");
+                fprintf(f, "syncmer-s: %lu\nsyncmer-t: %lu\n", *smer.s,
+                        *smer.t);
             } else {
-                fprintf(f, "kmer-selection: \"closed-syncmers\"\n");
-                fprintf(f, "syncmer-s: %lu\n", *mincode.s);
+                fprintf(f, "submer-rule: \"closed-syncmer\"\n");
+                fprintf(f, "syncmer-s: %lu\n", *smer.s);
             }
         } else {
-            fprintf(f, "kmer-selection: \"none\"\n");
+            fprintf(f, "submer-rule: \"none\"\n");
         }
+        fprintf(f, "canonical: %s\n", canonical ? "true" : "false");
     }
 };
 struct asm_config {

@@ -81,12 +81,12 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     // One slot per worker; sized by the (CLI-clamped) thread count instead of a
     // fixed 1024 so a large -t can never index out of bounds.
     std::vector<int> counts(threads, 0);
-    // Use the same rule the assembly pipeline uses (GenericSyncmerRule) so the
+    // Use the same rule the assembly pipeline uses (GenericSubmerRule) so the
     // diagnostic counts measure what production computes (H8).
     syncmer_params sr_params;
     sr_params.k = 8;
     sr_params.density = density;
-    syncmer::GenericSyncmerRule<uint32_t, syncmer::MurMur> sr{sr_params, 423};
+    syncmer::GenericSubmerRule<uint32_t, syncmer::MurMur> sr{sr_params, 423};
     // Per-worker scratch (charsi/pos_scratch) is passed in as arguments rather
     // than captured, so the single shared `job` closure stays race-free.
     auto job = [&]() -> std::function<int(bam1_t *, lps *, charsi &, pos_scratch &)> {

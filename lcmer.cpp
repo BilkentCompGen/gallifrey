@@ -380,7 +380,7 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
         lps str2 = {0, 0, 0, nullptr};
         using SYNCMER_HASHER = syncmer::MurMur;
         using SyncmerType =
-            syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
+            syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
         decltype(asm_config::syncmer) spara;
         spara.k = 8;
         spara.density = 0.05;
@@ -457,7 +457,7 @@ TEST_CASE("BAM and crumbled parsers agree on homopolymer-rich sequence") {
         }
     }
 
-    using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, syncmer::MurMur>;
+    using SyncmerType = syncmer::GenericSubmerRule<uint32_t, syncmer::MurMur>;
     decltype(asm_config::syncmer) spara;
     spara.k = 6;          // small k so homopolymer windows are frequent
     spara.density = 0.3;  // select a good fraction of windows

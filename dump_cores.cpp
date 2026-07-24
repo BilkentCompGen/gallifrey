@@ -66,11 +66,11 @@ static int run_dump_cores(const std::string &input_path,
                           uint64_t seed) {
     syncmer_params spara;
     spara.k = syncmer_k;
-    spara.mincode.s = submer_s;
-    spara.mincode.t = submer_t;
+    spara.smer.s = submer_s;
+    spara.smer.t = submer_t;
 
     using SYNCMER_HASHER = syncmer::MurMur;
-    using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
+    using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
     SyncmerType syncmer_functor(spara, static_cast<unsigned int>(seed));
 
     FILE *out = fopen(output_path.c_str(), "w");
@@ -124,10 +124,10 @@ DumpCoresProgram::DumpCoresProgram(CLI::App &parent) {
     app.add_option("--syncmer-k", syncmer_k, "K-mer length")
         ->capture_default_str();
     app.add_option("--submer-s", submer_s,
-                   "Size of submers for mincode syncmers")
+                   "s-mer length s for syncmer selection")
         ->capture_default_str();
     app.add_option("--submer-t", submer_t,
-                   "Position of submers for mincode syncmers")
+                   "Offset t of the smallest s-mer (open syncmer)")
         ->capture_default_str();
     app.add_option("-l,--level", lcp_level, "LCP level to compute")
         ->capture_default_str();
