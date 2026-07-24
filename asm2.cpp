@@ -1773,13 +1773,13 @@ TEST_CASE("GraphCleaning::simplify_simple_paths terminates on self-loops (C1b)"
 
     auto a = dbgi.dbg.find(100);
     REQUIRE(a != dbgi.dbg.end());
-    for (u64 p : a->second.prev) {
+    for ([[maybe_unused]] u64 p : a->second.prev) {
         CHECK(p != 100);  // no self-reference survives the rewrite
     }
     CHECK(a->second.prev.empty());  // its only edge was the self-edge
     CHECK(a->second.forward_edge_count == 0);  // bookkeeping stays consistent
 
-    auto a0 = dbgi.dbg.find(200);
+    [[maybe_unused]] auto a0 = dbgi.dbg.find(200);
     REQUIRE(a0 != dbgi.dbg.end());
     CHECK(a0->second.prev.size() == 2);  // untouched
     CHECK(dbgi.dbg.find(300) != dbgi.dbg.end());
@@ -1819,7 +1819,7 @@ TEST_CASE("GraphCleaning::simplify_simple_paths leaves degenerate boundary "
                                          dbgi.active_set, 4);
 
     // Degenerate boundary seed S: completely untouched.
-    auto s = dbgi.dbg.find(S);
+    [[maybe_unused]] auto s = dbgi.dbg.find(S);
     REQUIRE(s != dbgi.dbg.end());
     CHECK(s->second.forward_edge_count == 2);
     CHECK(s->second.counts.core_count == 100);
@@ -1828,12 +1828,12 @@ TEST_CASE("GraphCleaning::simplify_simple_paths leaves degenerate boundary "
     CHECK(!s->second.redirected());
 
     // Reader chain merged into its representative (node 101, next to S).
-    auto rep = dbgi.dbg.find(101);
+    [[maybe_unused]] auto rep = dbgi.dbg.find(101);
     REQUIRE(rep != dbgi.dbg.end());
     CHECK(rep->second.forward_edge_count == 2);      // inherited seed's fec
     CHECK(rep->second.counts.core_count == 400);     // 100 + 3 merged nodes
     for (u64 merged : {102, 103, 109}) {
-        auto m = dbgi.dbg.find(merged);
+        [[maybe_unused]] auto m = dbgi.dbg.find(merged);
         REQUIRE(m != dbgi.dbg.end());
         CHECK(m->second.redirected());
     }
@@ -1906,7 +1906,7 @@ TEST_CASE("Strand-canonical selection co-selects a k-mer and its rev-comp") {
     p.canonical = false;
     Rule direct{p, 42};
 
-    bool saw_directional_diff = false;
+    [[maybe_unused]] bool saw_directional_diff = false;
     for (uint32_t x = 0; x < (1u << (2 * k)); ++x) {
         uint32_t rc = reverse_complement_kmer<uint32_t>(x, k);
         CHECK(canon(x) == canon(rc));  // co-selected under --canonical
