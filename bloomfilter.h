@@ -93,7 +93,12 @@ template <int BLOCK_BYTES = hardware_constructive_interference_size>
 struct BlockedBloomFilter {
     static constexpr int block_bytes = BLOCK_BYTES;
     static constexpr int block_bits = block_bytes * 8;
-    using block_type = unsigned __int128;
+    // Storage word only -- every access goes through the byte pointer handed
+    // out by GetBlock(), so this type just sizes and aligns the allocation.
+    // Matches the sibling filters below (no 128-bit extension type needed).
+    using block_type = unsigned long long;
+    static_assert(block_bytes % sizeof(block_type) == 0,
+                  "block must be a whole number of storage words");
     BlockedBloomFilter(int n, float eps) : n(n), epsilon(eps) {
         m = ComputeNumBits();
         k = ComputeNumHashFns();

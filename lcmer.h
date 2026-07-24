@@ -105,7 +105,7 @@ struct sv {
 struct lcp_read {
     gtl::vector<uint32_t> cores;
     gtl::vector<std::pair<uint32_t, uint32_t>> pos;
-    const uint8_t *data;
+    const uint8_t *data = nullptr;
     void reserve(size_t size) {
         cores.reserve(size);
         pos.reserve(size);
