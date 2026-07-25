@@ -132,8 +132,10 @@ inline constexpr size_t DEFAULT_POST_LAYOUT_MAX_TIP_LEN = 50000;
 // max(olc_lcmer_l * BOUNDARY_FUZZ_LCMER_MULT, span / BOUNDARY_FUZZ_SPAN_DIV).
 inline constexpr i64 BOUNDARY_FUZZ_LCMER_MULT = 2;
 inline constexpr i64 BOUNDARY_FUZZ_SPAN_DIV = 20;
-// Number of 'N' bases emitted for a zero-length gap sentinel between components.
-inline constexpr size_t N_GAP_LEN = 64;
+// (Retired: N_GAP_LEN. Disconnected SCD components used to be concatenated with
+// a fabricated 64-'N' gap — root cause R7, docs/layout-graph-improvement-plan.md
+// — asserting an adjacency the data does not support. They are now emitted as
+// separate contigs; a real join needs P3.3's oriented, validated DBG-edge path.)
 
 // Reverse-complement a sequence-fragment vector: reverse fragment order and
 // reverse-complement each fragment (so the whole sequence is reverse-complemented).
@@ -350,6 +352,63 @@ inline void build_scd_graph(
     }
 }
 
+// DISABLED EXPERIMENT — not compiled into the default build. Enable with
+// -DLASM_LAYOUT_RESOLVE_OVERLAP to trial it on a full genome.
+//
+// Drops any SCD component overlapping a heavier one by >50% of the shorter
+// interval, keeping the heavier. It does clear the M79 duplication, but it is
+// NOT trustworthy as a general rule:
+//   * the 50% threshold is a magic constant with no principled basis;
+//   * it acts on layout_from/layout_to (matching-phase coordinates), which are
+//     a proxy for duplicated sequence, not proof — on other data it could drop
+//     genuinely distinct sequence;
+//   * it was derived from, and "validated" on, a single occurrence (layout 79
+//     was the only multi-component layout in the whole l5 chr22 run).
+// The underlying defect is R7 (docs/layout-graph-improvement-plan.md:37): the
+// layout fabricated adjacency between disconnected components. That fabrication
+// is removed at the emission site instead; see collect_path_sequences.
+inline void resolve_overlapping_components(gtl::vector<comp_path> &comp_paths) {
+    if (comp_paths.size() < 2) return;
+
+    // Greedy weighted-interval selection: consider components heaviest-first,
+    // accept one unless it duplicates (>50% of the shorter interval overlaps)
+    // a component already accepted.
+    gtl::vector<uint32_t> order(comp_paths.size());
+    for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        if (comp_paths[a].total_weight != comp_paths[b].total_weight)
+            return comp_paths[a].total_weight > comp_paths[b].total_weight;
+        return a < b;  // stable tie-break
+    });
+
+    gtl::vector<uint32_t> kept_idx;
+    for (uint32_t idx : order) {
+        const auto &cand = comp_paths[idx];
+        const i64 cand_len = std::max<i64>(1, cand.layout_to - cand.layout_from);
+        bool dup = false;
+        for (uint32_t ki : kept_idx) {
+            const auto &k = comp_paths[ki];
+            const i64 lo = std::max(cand.layout_from, k.layout_from);
+            const i64 hi = std::min(cand.layout_to, k.layout_to);
+            const i64 ov = hi > lo ? hi - lo : 0;
+            const i64 k_len = std::max<i64>(1, k.layout_to - k.layout_from);
+            if (ov * 2 > std::min(cand_len, k_len)) { dup = true; break; }
+        }
+        if (!dup) kept_idx.push_back(idx);
+    }
+
+    if (kept_idx.size() == comp_paths.size()) return;  // nothing dropped
+
+    // Re-emit the survivors in layout order (moving to avoid copying paths).
+    std::sort(kept_idx.begin(), kept_idx.end(), [&](uint32_t a, uint32_t b) {
+        return comp_paths[a].layout_from < comp_paths[b].layout_from;
+    });
+    gtl::vector<comp_path> kept;
+    kept.reserve(kept_idx.size());
+    for (uint32_t idx : kept_idx) kept.push_back(std::move(comp_paths[idx]));
+    comp_paths = std::move(kept);
+}
+
 // ── Phase 2: Find heaviest path per connected component ─────────────
 // Single longest-weight DP with an implicit virtual source (wired to every
 // in-degree-0 node) and virtual sink (wired from every out-degree-0 node):
@@ -488,22 +547,60 @@ inline gtl::vector<comp_path> find_heaviest_paths(
               [](const auto &a, const auto &b) {
                   return a.layout_from < b.layout_from;
               });
+#ifdef LASM_LAYOUT_RESOLVE_OVERLAP
+    // Off by default; see the note on resolve_overlapping_components.
+    resolve_overlapping_components(comp_paths);
+#endif
+
+    // Per-layout component diagnostic (R3/R4 root-cause work): a layout whose
+    // nodes fail to chain into ONE seed-chain path is the condition that used to
+    // trigger the fabricated N-gap join. Overlapping spans additionally mean the
+    // same region was reconstructed twice.
+    if (comp_paths.size() > 1 && getenv("LASM_DEBUG_COMPSPANS")) {
+        bool any_overlap = false;
+        for (size_t i = 0; i + 1 < comp_paths.size() && !any_overlap; ++i)
+            for (size_t j = i + 1; j < comp_paths.size(); ++j)
+                if (std::min(comp_paths[i].layout_to, comp_paths[j].layout_to) >
+                    std::max(comp_paths[i].layout_from,
+                             comp_paths[j].layout_from)) {
+                    any_overlap = true;
+                    break;
+                }
+        for (size_t i = 0; i < comp_paths.size(); ++i)
+            std::fprintf(stderr,
+                         "[layout-dag] layout=%" PRIu64 " ncomp=%zu comp=%zu "
+                         "from=%" PRId64 " to=%" PRId64 " weight=%" PRId64
+                         " overlapping=%s\n",
+                         static_cast<uint64_t>(layout_idx), comp_paths.size(), i,
+                         static_cast<int64_t>(comp_paths[i].layout_from),
+                         static_cast<int64_t>(comp_paths[i].layout_to),
+                         static_cast<int64_t>(comp_paths[i].total_weight),
+                         any_overlap ? "yes" : "no");
+    }
     return comp_paths;
 }
 
 // ── Phase 3: Collect output sequences from heaviest paths ───────────
-inline gtl::vector<SequenceContainerType> collect_path_sequences(
+// Returns ONE sequence group per SCD component. Components are weakly
+// disconnected in the seed-chain DAG, so there is no evidence for their
+// adjacency, order, or separation: they must not be concatenated. (Previously
+// they were joined with a fabricated 64-N gap — root cause R7,
+// docs/layout-graph-improvement-plan.md:37 — which asserted an adjacency the
+// data does not support and produced the M79 tandem duplication.) The caller
+// emits each group as its own contig; a real join needs the oriented, validated
+// DBG-edge approach of P3.3, not a synthetic gap.
+inline gtl::vector<gtl::vector<SequenceContainerType>> collect_path_sequences(
     const gtl::vector<comp_path> &paths,
     const gtl::vector<gtl::vector<std::pair<size_t, size_t>>> &node_contigs,
     gtl::flat_hash_map<size_t, gtl::vector<SequenceContainerType>> &contig_core_seqs,
     size_t n_nodes)
 {
-    gtl::vector<SequenceContainerType> merged_seqs;
-    merged_seqs.reserve(n_nodes);
+    gtl::vector<gtl::vector<SequenceContainerType>> comp_seqs;
+    comp_seqs.reserve(paths.size());
 
     for (size_t ci = 0; ci < paths.size(); ++ci) {
-        if (ci > 0 && !merged_seqs.empty())
-            merged_seqs.emplace_back(0, 0);
+        gtl::vector<SequenceContainerType> merged_seqs;
+        merged_seqs.reserve(n_nodes);
 
         const auto &path = paths[ci].path;
         size_t emit_contig = SIZE_MAX;
@@ -573,13 +670,17 @@ inline gtl::vector<SequenceContainerType> collect_path_sequences(
                     merged_seqs.push_back(std::move(core_seq));
             }
         }
+        if (!merged_seqs.empty()) comp_seqs.push_back(std::move(merged_seqs));
     }
-    return merged_seqs;
+    return comp_seqs;
 }
 
 // ── Main entry: build layout sequence from positioned nodes ─────────
 template <class AssemblerT>
-inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
+// Returns one sequence group per SCD component (see collect_path_sequences):
+// disconnected components are never concatenated.
+inline gtl::vector<gtl::vector<SequenceContainerType>>
+build_layout_sequence_from_nodes(
     [[maybe_unused]] AssemblerT &as, dbg_index &dbg,
     const gtl::vector<ultra_layout_node_info> &lnodes,
     [[maybe_unused]] int hash_combine_len, u64 layout_idx = 0) {
@@ -624,13 +725,18 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
             size_t pick = (fw_len >= rv_len && fi != SIZE_MAX) ? fi : ri;
             if (pick == SIZE_MAX) return {};
 
-            if (!nodes[pick].is_forward_lane)
-                return reverse_complement_seqs(*nodes[pick].raw_seqs);
+            gtl::vector<gtl::vector<SequenceContainerType>> out;
+            out.reserve(1);
+            if (!nodes[pick].is_forward_lane) {
+                out.push_back(reverse_complement_seqs(*nodes[pick].raw_seqs));
+                return out;
+            }
             const auto &raw = *nodes[pick].raw_seqs;
             gtl::vector<SequenceContainerType> result;
             result.reserve(1);
             result.emplace_back(raw.begin(), raw.end());
-            return result;
+            out.push_back(std::move(result));
+            return out;
         }
     }
 
@@ -709,7 +815,10 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
     return result;
 }
 
-using layout_seq_t = gtl::vector<SequenceContainerType>;
+// One SCD component's sequences …
+using layout_comp_seqs_t = gtl::vector<SequenceContainerType>;
+// … and all components of one layout (emitted as separate contigs).
+using layout_seq_t = gtl::vector<layout_comp_seqs_t>;
 
 template <class AssemblerT>
 inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
@@ -1247,8 +1356,7 @@ inline void write_gfa(const supernode_vec &supernodes,
                     const auto &sn_seqs = sn.seqs();
                     std::string &dst = super_line_strs[i];
                     size_t total_len = 0;
-                    for (const auto &s : sn_seqs)
-                        total_len += (s.len == 0) ? N_GAP_LEN : s.len;
+                    for (const auto &s : sn_seqs) total_len += s.len;
 
                     dst.reserve(total_len + sn.name.size() + 48);
                     dst.append("S\t");
@@ -1257,10 +1365,10 @@ inline void write_gfa(const supernode_vec &supernodes,
 
                     const size_t seq_start = dst.size();
                     for (const auto &s : sn_seqs) {
-                        if (s.len == 0) {
-                            dst.append(N_GAP_LEN, 'N');
-                            continue;
-                        }
+                        // No gap fabrication: disconnected components are
+                        // emitted as separate contigs (R7), so a zero-length
+                        // entry contributes nothing rather than a run of 'N'.
+                        if (s.len == 0) continue;
                         local_chs.require(s.len + 32);
                         s.convert_to_ascii((char *)local_chs.data);
                         dst.append((const char *)local_chs.data, s.len);
@@ -1367,12 +1475,24 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     TIME_CHECKPOINT(LayoutEmit, stderr, "Build layout sequences");
     for (size_t i = 0; i < layout_jobs.size(); ++i) {
         const auto &job = layout_jobs[i];
-        const u64 sid = supernodes.size();
-        supernodes.push_back({"M" + std::to_string(job.layout_idx),
-                              std::move(layout_seqs[i]), nullptr, true,
-                              job.layout_idx});
+        auto &comps = layout_seqs[i];
+        if (comps.empty()) continue;
+        // One contig per SCD component: components are disconnected in the
+        // seed-chain DAG, so no adjacency between them may be asserted (R7).
+        // The first component keeps the plain "M<idx>" name; any further
+        // component gets an "_<c>" suffix to keep GFA segment names unique.
+        const u64 primary_sid = supernodes.size();
+        for (size_t c = 0; c < comps.size(); ++c) {
+            std::string name = "M" + std::to_string(job.layout_idx);
+            if (c) name += "_" + std::to_string(c);
+            supernodes.push_back({std::move(name), std::move(comps[c]), nullptr,
+                                  true, job.layout_idx});
+        }
+        // Edges are aggregated per node; map every node of the job to the
+        // primary component, exactly as when the job produced a single contig.
+        // Secondary components carry no claimed adjacency.
         for (const auto &n : job.lnodes) {
-            node_to_super[n.id] = sid;
+            node_to_super[n.id] = primary_sid;
         }
     }
 

@@ -1453,26 +1453,32 @@ TEST_CASE("layout_graph_emit::collect_path_sequences concatenates with gaps") {
         gtl::vector<comp_path> paths;
         paths.push_back({0, 100, 2, gtl::vector<uint32_t>{0u, 1u}});
 
-        auto merged = collect_path_sequences(paths, node_contigs,
-                                             contig_core_seqs, 3);
-        REQUIRE_EQ(merged.size(), 2u);
-        CHECK_EQ(merged[0].len, 4u);
-        CHECK_EQ(merged[1].len, 4u);
+        auto comps = collect_path_sequences(paths, node_contigs,
+                                            contig_core_seqs, 3);
+        REQUIRE_EQ(comps.size(), 1u);
+        REQUIRE_EQ(comps[0].size(), 2u);
+        CHECK_EQ(comps[0][0].len, 4u);
+        CHECK_EQ(comps[0][1].len, 4u);
     }
 
-    SUBCASE("two components separated by a zero-length gap") {
+    SUBCASE("two components stay separate — never gap-joined (R7)") {
         gtl::vector<comp_path> paths;
         paths.push_back({0, 100, 2, gtl::vector<uint32_t>{0u, 1u}});
         paths.push_back({200, 300, 1, gtl::vector<uint32_t>{2u}});
 
-        auto merged = collect_path_sequences(paths, node_contigs,
-                                             contig_core_seqs, 3);
-        // seqA, seqB, GAP, seqC
-        REQUIRE_EQ(merged.size(), 4u);
-        CHECK_EQ(merged[0].len, 4u);
-        CHECK_EQ(merged[1].len, 4u);
-        CHECK_EQ(merged[2].len, 0u);   // gap sentinel between components
-        CHECK_EQ(merged[3].len, 6u);
+        auto comps = collect_path_sequences(paths, node_contigs,
+                                            contig_core_seqs, 3);
+        // Two independent groups, emitted as two contigs. No sentinel, no
+        // fabricated adjacency between disconnected components.
+        REQUIRE_EQ(comps.size(), 2u);
+        REQUIRE_EQ(comps[0].size(), 2u);
+        CHECK_EQ(comps[0][0].len, 4u);
+        CHECK_EQ(comps[0][1].len, 4u);
+        REQUIRE_EQ(comps[1].size(), 1u);
+        CHECK_EQ(comps[1][0].len, 6u);
+        for (const auto &comp : comps)
+            for ([[maybe_unused]] const auto &s : comp)
+                CHECK(s.len > 0);  // no zero-length gap sentinels remain
     }
 
     SUBCASE("fallback picks longest representative, not arbitrary first (C12)") {
@@ -1489,9 +1495,60 @@ TEST_CASE("layout_graph_emit::collect_path_sequences concatenates with gaps") {
         gtl::vector<comp_path> paths;
         paths.push_back({0, 100, 1, gtl::vector<uint32_t>{0u}});
 
-        auto merged = collect_path_sequences(paths, nc, ccs, 1);
-        REQUIRE_EQ(merged.size(), 1u);
-        CHECK_EQ(merged[0].len, 6u);  // longest, not nc[0]'s len 2
+        auto comps = collect_path_sequences(paths, nc, ccs, 1);
+        REQUIRE_EQ(comps.size(), 1u);
+        REQUIRE_EQ(comps[0].size(), 1u);
+        CHECK_EQ(comps[0][0].len, 6u);  // longest, not nc[0]'s len 2
+    }
+}
+
+TEST_CASE("layout_graph_emit::resolve_overlapping_components drops duplicates") {
+    using namespace layout_graph_emit;
+    auto P = [](i64 from, i64 to, int64_t w) {
+        return comp_path{from, to, w, gtl::vector<uint32_t>{}};
+    };
+
+    SUBCASE("nested lighter component dropped, heavier kept (M79 class)") {
+        // Real M79 spans: comp0 [0,86] w153 fully contains comp1 [1,15] w17.
+        gtl::vector<comp_path> cps{P(0, 86, 153), P(1, 15, 17)};
+        resolve_overlapping_components(cps);
+        REQUIRE_EQ(cps.size(), 1u);
+        CHECK_EQ(cps[0].layout_from, 0);
+        CHECK_EQ(cps[0].total_weight, 153);
+    }
+
+    SUBCASE("disjoint components both kept (no-op on the pre-sorted input)") {
+        // find_heaviest_paths sorts by layout_from before calling this; the
+        // no-drop path preserves that order.
+        gtl::vector<comp_path> cps{P(0, 100, 2), P(200, 300, 1)};
+        resolve_overlapping_components(cps);
+        REQUIRE_EQ(cps.size(), 2u);
+        CHECK_EQ(cps[0].layout_from, 0);
+        CHECK_EQ(cps[1].layout_from, 200);
+    }
+
+    SUBCASE("small overlap (<=50% of shorter) keeps both") {
+        // shorter interval len 100; overlap [90,100] = 10 <= 50 ⇒ both kept.
+        gtl::vector<comp_path> cps{P(0, 100, 5), P(90, 190, 4)};
+        resolve_overlapping_components(cps);
+        CHECK_EQ(cps.size(), 2u);
+    }
+
+    SUBCASE("major overlap (>50% of shorter) keeps the heavier one") {
+        // shorter interval len 100; overlap [10,100] = 90 > 50 ⇒ drop lighter.
+        gtl::vector<comp_path> cps{P(0, 100, 4), P(10, 200, 9)};
+        resolve_overlapping_components(cps);
+        REQUIRE_EQ(cps.size(), 1u);
+        CHECK_EQ(cps[0].total_weight, 9);   // heavier survives regardless of order
+    }
+
+    SUBCASE("no-op when nothing overlaps or fewer than two") {
+        gtl::vector<comp_path> one{P(0, 100, 1)};
+        resolve_overlapping_components(one);
+        CHECK_EQ(one.size(), 1u);
+        gtl::vector<comp_path> none;
+        resolve_overlapping_components(none);
+        CHECK_EQ(none.size(), 0u);
     }
 }
 
