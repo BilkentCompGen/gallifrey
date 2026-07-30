@@ -1972,6 +1972,145 @@ TEST_CASE("Strand-canonical selection co-selects a k-mer and its rev-comp") {
     CHECK(saw_directional_diff);  // the flag genuinely changes selection
 }
 
+// ── Spaced-seed compaction: '0' positions are non-existent in selection ───
+// Mask "11011" (k=5) removes field 2 (bits 4-5; the middle position), so
+// selection runs on the dense 4-mer of kept fields:
+//   compact(v) = f0 | f1<<2 | f3<<4 | f4<<6      (f_i = (v >> 2i) & 3)
+// With Identity hash and s=2 there are k_eff-s+1 = 3 s-windows over the
+// compacted value; closed ⇒ min at window 0 or 2.
+TEST_CASE("Spaced-seed compaction: masked positions are non-existent") {
+    using Rule = syncmer::GenericSubmerRule<uint32_t, syncmer::Identity>;
+    decltype(asm_config::syncmer) p;
+    p.k = 5;
+    p.smer.s = 2;
+    p.spaced_seed_mask = "11011";
+
+    SUBCASE("compact() gathers kept fields in order") {
+        Rule sr{p, 0};
+        CHECK(sr.k_eff == 4);
+        CHECK(sr.compact(0x7B) == 0x1B);   // f0=3 f1=2 f2=3 f3=1 f4=0
+        CHECK(sr.compact(0x3FF) == 0xFF);  // all fields 3
+    }
+    SUBCASE("closed syncmer windows live in compacted space") {
+        Rule sr{p, 0};
+        CHECK(sr(0x7B));         // compact 0x1B: min submer at last window
+        CHECK_FALSE(sr(0x20F));  // compact 0x8F: min at interior window 1
+        CHECK(sr(0x3C0));        // compact 0xF0: min at window 0
+    }
+    SUBCASE("k-mers differing only at the masked position co-select") {
+        Rule sr{p, 0};
+        // Same kept fields as 0x7B, with the masked field 2 set to 0/1/2.
+        CHECK(sr(0x4B) == sr(0x7B));
+        CHECK(sr(0x5B) == sr(0x7B));
+        CHECK(sr(0x6B) == sr(0x7B));
+    }
+    SUBCASE("open syncmer t indexes compacted windows") {
+        decltype(asm_config::syncmer) po = p;
+        po.smer.t = 1;
+        Rule sr{po, 0};
+        CHECK(sr(0x20F));        // compact 0x8F: min at window 1 == t
+        CHECK_FALSE(sr(0x3C0));  // compact 0xF0: min at window 0 != t
+        po.smer.t = 0;
+        Rule sr0{po, 0};
+        CHECK(sr0(0x3C0));
+        CHECK_FALSE(sr0(0x20F));
+    }
+    SUBCASE("'2'/'3' keep their position but still bit-mask") {
+        decltype(asm_config::syncmer) p2 = p;
+        p2.spaced_seed_mask = "11121";  // field 2 keeps only its high bit
+        Rule sr{p2, 0};
+        CHECK(sr.k_eff == 5);              // nothing removed
+        CHECK(sr.compact(0x1AB) == 0x1AB); // no '0' ⇒ compaction is identity
+        // field 2 = 0b10 vs 0b11 both bit-mask to 0b10 ⇒ co-selected.
+        CHECK(sr(0x61) == sr(0x71));
+    }
+}
+
+// --canonical with a removing mask: a k-mer and its reverse complement must
+// still always agree (canonicalization runs on the raw k-mer, compaction is
+// baked into the LuT).
+TEST_CASE("Spaced-seed compaction with --canonical co-selects rev-comps") {
+    using Rule = syncmer::GenericSubmerRule<uint32_t, syncmer::MurMur>;
+    const int k = 5;
+    decltype(asm_config::syncmer) p;
+    p.k = k;
+    p.smer.s = 2;
+    p.canonical = true;
+    p.spaced_seed_mask = "11011";
+    Rule canon{p, 42};
+    for (uint32_t x = 0; x < (1u << (2 * k)); ++x) {
+        [[maybe_unused]] uint32_t rc = reverse_complement_kmer<uint32_t>(x, k);
+        CHECK(canon(x) == canon(rc));
+    }
+}
+
+// Mincode submer with compaction: the density threshold applies to the hash
+// of the compacted value. ScaleHash (v << 26) makes the threshold exact:
+// density 0.5 ⇒ threshold 2^31 ⇒ selected iff compact(v) < 32 (no wrap for
+// compact values < 64).
+TEST_CASE("Spaced-seed compaction: mincode hashes the compacted value") {
+    struct ScaleHash {
+        unsigned seed;
+        ScaleHash(unsigned s) : seed{s} {}
+        unsigned operator()(unsigned v) const { return v << 26; }
+    };
+    using Rule = syncmer::GenericSubmerRule<uint32_t, ScaleHash>;
+    decltype(asm_config::syncmer) p;
+    p.k = 5;
+    p.density = 0.5;
+    p.spaced_seed_mask = "11011";
+    Rule sr{p, 0};
+    CHECK(sr(0x4F));        // compact 31 < 32
+    CHECK(sr(0x7F));        // same compact (masked field 2) ⇒ co-selected
+    CHECK_FALSE(sr(0x80));  // compact 32
+    CHECK_FALSE(sr(0xB0));  // same compact 32
+}
+
+// Validation must reject s/t bounds against the EFFECTIVE k (k minus the
+// removed positions), and reject masks that remove every position.
+TEST_CASE("Syncmer validation uses effective k after compaction") {
+    decltype(asm_config::syncmer) p;
+    p.k = 5;
+    p.smer.s = 2;
+    p.spaced_seed_mask = "11011";  // k_eff = 4
+
+    auto ek = p.effective_k_checked();
+    REQUIRE(ek.has_value());
+    CHECK(*ek == 4);
+
+    SUBCASE("t bounded by effective-k - s + 1") {
+        p.smer.t = 2;  // == k_eff - s ⇒ last valid window
+        CHECK(p.validate().has_value());
+        p.smer.t = 3;  // == k_eff - s + 1 ⇒ out of range
+        CHECK_FALSE(p.validate().has_value());
+    }
+    SUBCASE("s bounded by effective k") {
+        p.smer.s = 3;
+        CHECK(p.validate().has_value());
+        p.smer.s = 4;  // == k_eff
+        CHECK_FALSE(p.validate().has_value());
+    }
+    SUBCASE("mask removing every position is rejected") {
+        p.spaced_seed_mask = "00000";
+        CHECK_FALSE(p.validate().has_value());
+    }
+    SUBCASE("short mask leaves leading positions kept") {
+        p.spaced_seed_mask = "101";  // removes field 1 only; fields 3,4 kept
+        auto ek2 = p.effective_k_checked();
+        REQUIRE(ek2.has_value());
+        CHECK(*ek2 == 4);
+        CHECK(p.validate().has_value());  // s=2 < 4
+    }
+    SUBCASE("mask without '0' keeps full k") {
+        p.spaced_seed_mask = "11121";
+        auto ek3 = p.effective_k_checked();
+        REQUIRE(ek3.has_value());
+        CHECK(*ek3 == 5);
+        p.smer.s = 4;
+        CHECK(p.validate().has_value());  // s=4 < 5 (old check used k)
+    }
+}
+
 // ── Fix 10: bloom projected_count widening (H13) ────────────────────────
 // A human-scale projected count (n > INT32_MAX) previously narrowed to a
 // negative int, so ComputeNumBits produced a negative-then-wrapped bit count

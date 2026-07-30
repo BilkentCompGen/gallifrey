@@ -112,6 +112,12 @@ struct GenericSubmerRule {
     HASH_FUNCTION hf;
     int_type s_mask;
     int_type k_mask;
+    // Spaced-seed compaction: mask char '0' removes its position entirely, so
+    // selection runs on the dense (k - m)-mer of kept positions ('1'/'2'/'3'
+    // all keep their position; '2'/'3' still bit-mask via k_mask). keep_mask
+    // bit i (field at bits 2i) is set when the position is kept; k_eff = k-m.
+    uint64_t keep_mask;
+    int_type k_eff;
     int64_t table_size;
     bool pure_lcp;
     gtl::vector<bool> table;
@@ -128,12 +134,41 @@ struct GenericSubmerRule {
     constexpr auto type() const -> syncmer_params::typeenum {
         return cfg.type();
     }
+    static constexpr uint64_t build_keep_mask(int_type km, unsigned k) {
+        uint64_t keep = 0;
+        for (unsigned i = 0; i < k; ++i) {
+            if (((km >> (2 * i)) & 3) != 0) keep |= (1ULL << i);
+        }
+        return keep;
+    }
+    static constexpr int_type count_kept(uint64_t keep, unsigned k) {
+        int_type c = 0;
+        for (unsigned i = 0; i < k; ++i) c += (keep >> i) & 1;
+        return c;
+    }
+    // Gather the kept 2-bit fields of v (ascending field order) into a dense
+    // k_eff-mer. Identity when no position is removed, so masks without '0'
+    // reproduce the previous AND-mask behavior bit-for-bit.
+    constexpr int_type compact(int_type v) const {
+        if (keep_mask == ((1ULL << k()) - 1ULL)) return v;
+        int_type out = 0;
+        unsigned o = 0;
+        for (unsigned i = 0; i < k(); ++i) {
+            if ((keep_mask >> i) & 1) {
+                out |= (int_type)(((v >> (2 * i)) & 3) << (2 * o));
+                ++o;
+            }
+        }
+        return out;
+    }
     GenericSubmerRule(const syncmer_params &cfg, int_type seed)
         : cfg{cfg},
           seed{seed},
           hf{seed},
           k_mask{(INT_TYPE)cfg.compute_spaced_mask()},
-          table_size{2 << (2 * k() - 1)},
+          keep_mask{build_keep_mask(k_mask, cfg.k)},
+          k_eff{count_kept(keep_mask, cfg.k)},
+          table_size{2 << (2 * k_eff - 1)},
           pure_lcp(false),
           table(table_size, 0),
           canonical(cfg.canonical) {
@@ -145,7 +180,9 @@ struct GenericSubmerRule {
         }
         size_t tc = 0;
         for (int i = 0; i < table_size; ++i) {
-            table[i] = is_submer(i & k_mask);
+            // i IS the compacted k_eff-mer (the LuT lives in compacted space,
+            // so it only needs 4^k_eff entries); queries compact into it.
+            table[i] = is_submer(i);
             tc += table[i];
         }
         fprintf(stderr, "Real submer density: %lf\n", (double)tc / table_size);
@@ -157,25 +194,28 @@ struct GenericSubmerRule {
     }
     // Strand-canonical selection (opt-in): apply the rule to min(κ, rc(κ)) so a
     // k-mer and its reverse complement are always co-selected. Default off ⇒
-    // the raw forward value is used (unchanged behavior).
+    // the raw forward value is used (unchanged behavior). The query value is
+    // bit-masked and compacted into LuT space; with no '0' mask chars this is
+    // `table[val & k_mask]`, bit-identical to the pre-compaction behavior.
     constexpr bool operator()(int_type val) const {
         if (canonical) {
             val = std::min(val, reverse_complement_kmer<int_type>(val, k()));
         }
-        return table[val];
+        return table[compact(val & k_mask)];
     }
     // µ(κ,s) = smallest s-mer (first on ties). Closed syncmer: µ at the first or
     // last s-mer; open syncmer: µ at offset t. Mincode submer: hashed code < H/c.
+    // `val` is the COMPACTED k_eff-mer (masked positions already removed by
+    // compact()), so window indices and t live in compacted space: there are
+    // k_eff-s+1 s-mer windows; window i starts at compacted base i (bit 2*i).
     constexpr bool is_submer(int_type val) const {
         switch (type()) {
             case syncmer_params::typeenum::ClosedSyncmer:  // Intentional
                                                            // fallthrough
             case syncmer_params::typeenum::OpenSyncmer: {
-                // There are k-s+1 s-mer windows in a k-mer; window i starts at
-                // base i, i.e. bit 2*i, and spans 2*s bits (s_mask).
                 int_type min_index = 0;
                 int_type min_val = std::numeric_limits<int_type>::max();
-                for (int_type i = 0; i < k() - s() + 1; ++i) {
+                for (int_type i = 0; i < k_eff - s() + 1; ++i) {
                     int_type masked_s = (val >> (2 * i)) & s_mask;
                     int_type hashed_s = hf(masked_s);
                     if (hashed_s < min_val) {
@@ -185,14 +225,14 @@ struct GenericSubmerRule {
                 }
                 if (type() == syncmer_params::typeenum::ClosedSyncmer) {
                     // Closed syncmer: µ at either end (window 0 or the last
-                    // window, index k-s).
-                    return min_index == 0 || min_index == k() - s();
+                    // window, index k_eff-s).
+                    return min_index == 0 || min_index == k_eff - s();
                 } else {
                     return t() == min_index;
                 }
             }
             case syncmer_params::typeenum::MincodeSubmer: {
-                return hf(val & k_mask) < threshold();
+                return hf(val) < threshold();
             }
             case syncmer_params::typeenum::Invalid:
             default:

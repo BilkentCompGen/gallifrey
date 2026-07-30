@@ -96,6 +96,22 @@ struct syncmer_params {
         return *r;
     }
 
+    // Effective k after spaced-seed compaction: each '0' mask char removes
+    // its position, so selection runs on the dense (k - #zeros)-mer. Only
+    // positions within the k-mer window count (chars beyond k are shifted
+    // above the window and never apply). '2'/'3' keep their position.
+    std::expected<unsigned, std::string> effective_k_checked() const {
+        auto r = compute_spaced_mask_checked();
+        if (!r) {
+            return std::unexpected(r.error());
+        }
+        unsigned kept = 0;
+        for (unsigned i = 0; i < k; ++i) {
+            kept += ((*r >> (2 * i)) & 3) != 0;
+        }
+        return kept;
+    }
+
     // Validate the whole syncmer configuration once, before any syncmer
     // functor is constructed. Lets callers surface a clean error instead of
     // exit()-ing from deep inside a constructor.
@@ -105,28 +121,39 @@ struct syncmer_params {
                 std::string("Provide a k-mer selection: either --density or "
                             "--submer-s (optionally with --submer-t)"));
         }
-        if (auto r = compute_spaced_mask_checked(); !r) {
-            return std::unexpected(r.error());
+        auto ek = effective_k_checked();
+        if (!ek) {
+            return std::unexpected(ek.error());
+        }
+        const unsigned k_eff = *ek;
+        if (k_eff == 0) {
+            return std::unexpected(
+                "--spaced-seed-mask removes every k-mer position (effective "
+                "k = 0)");
         }
         // Cross-field numeric checks: reject configurations that select no
-        // k-mers or index an s-window out of the k-mer before any functor is
-        // constructed (a per-option CLI::Range can't express these relations).
+        // k-mers or index an s-window out of the (compacted) k-mer before any
+        // functor is constructed (a per-option CLI::Range can't express these
+        // relations). s/t bounds are against the EFFECTIVE k: masked positions
+        // are non-existent in the selection computation.
         if (density.has_value() && *density == 0.0) {
             return std::unexpected(std::string(
                 "--density must be > 0 (0 selects no k-mers -> empty "
                 "assembly)"));
         }
         if (smer.s.has_value()) {
-            if (*smer.s >= k) {
+            if (*smer.s >= k_eff) {
                 return std::unexpected(
                     "--submer-s (" + std::to_string(*smer.s) +
-                    ") must be < --syncmer-k (" + std::to_string(k) + ")");
+                    ") must be < effective k (" + std::to_string(k_eff) +
+                    " = --syncmer-k " + std::to_string(k) + " minus " +
+                    std::to_string(k - k_eff) + " masked positions)");
             }
-            if (smer.t.has_value() && *smer.t >= k - *smer.s + 1) {
+            if (smer.t.has_value() && *smer.t >= k_eff - *smer.s + 1) {
                 return std::unexpected(
                     "--submer-t (" + std::to_string(*smer.t) +
-                    ") must be < k - s + 1 (" +
-                    std::to_string(k - *smer.s + 1) + ")");
+                    ") must be < effective-k - s + 1 (" +
+                    std::to_string(k_eff - *smer.s + 1) + ")");
             }
         }
         return {};
@@ -134,6 +161,10 @@ struct syncmer_params {
     void print_cfg(FILE *f) const {
         fprintf(f, "spaced-seed-mask: \"%s\"\n", spaced_seed_mask.c_str());
         fprintf(f, "k: %d\n", k);
+        if (auto ek = effective_k_checked(); ek && *ek != k) {
+            fprintf(f, "effective-k (after spaced-seed compaction): %u\n",
+                    *ek);
+        }
         if (density.has_value()) {
             fprintf(f, "submer-rule: \"mincode-submer\"\n");
             fprintf(f, "density: %f\n", *density);
@@ -180,6 +211,24 @@ struct asm_config {
         double min_bubble_depth_difference_percentage = 2;
         bool enable_loop_opening = false;
     } graph_cleaning;
+    struct {
+        // M-contig bridging through C nodes (see
+        // docs/contiguity-and-spaced-seed-plan.md, Task 1). 0 = off,
+        // 1 = thread (topology: unique through-path only),
+        // 2 = reads (topology + spanning-read evidence).
+        int mode = 0;
+        // Minimum EC (supporting DBG edges) on each bridge superedge.
+        size_t min_edge_support = 1;
+        // Max total superedges on the C node: exact 2 in mode 1; looser cap
+        // in mode 2 where read evidence arbitrates the tangle.
+        int max_c_degree = 2;
+        int max_c_degree_reads = 6;
+        // Reads that must span both junction anchors (mode 2).
+        int min_read_support = 2;
+        // Chaining iterations (M-C-M-C-... merges become possible after a
+        // merge rewires the supernode graph).
+        int max_passes = 4;
+    } bridge;
 
     void print_cfg(FILE *f) const {
         if (!inputs.empty()) {

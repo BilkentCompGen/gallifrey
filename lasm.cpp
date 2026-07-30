@@ -68,12 +68,15 @@ public:
         app.add_flag("--silent", cfg.silent, "Do not print progress to stderr")
             ->capture_default_str();
         app.add_option("--spaced-seed-mask", cfg.syncmer.spaced_seed_mask,
-                       "Mask for spaced seeding. (0->skip, 1->keep, 2->mask "
-                       "left bit, 3->mask right bit.")
+                       "Mask for spaced seeding. 0->remove the position from "
+                       "selection entirely (effective k = k - #zeros; syncmer "
+                       "s-windows span only kept positions), 1->keep, "
+                       "2->keep but mask left bit, 3->keep but mask right "
+                       "bit. With --rle, positions index RLE runs.")
             ->capture_default_str();
         app.add_option("--syncmer-k", cfg.syncmer.k,
                        "K-mer length (table is 4^k bits; k=15 ⇒ 128 MiB)")
-            ->check(CLI::Range(3u, 15u))
+            ->check(CLI::Range(3u, 32u))
             ->capture_default_str();
         app.add_option("--density", cfg.syncmer.density,
                        "Mincode-submer selection (Edgar 2021): keep k-mers whose "
