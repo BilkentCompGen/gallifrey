@@ -431,6 +431,8 @@ struct GraphCleaning {
         return est;
     }
 
+
+
     static auto attempt_simplify_one_path_lockless(dbg_map_t &dbg,
                                                    redir_map &redirect_deleted,
                                                    u64 id,
@@ -881,8 +883,6 @@ struct GraphCleaning {
             IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                "Initial Simplification");
             cut_low_support_edges(dbgi.dbg, active_set);
-            const auto initial_depth_stats =
-                collect_active_avg_core_count_stats(dbgi.dbg, active_set);
             for (int i = 1; i < cfg.iterations; ++i) {
                 fix_edges(dbgi.dbg);
                 cut_tips(dbgi.dbg, 3, cfg.max_tip_length, active_set);
@@ -890,10 +890,6 @@ struct GraphCleaning {
                 // pop_bubbles(dbgi.dbg, dbgi.lci,
                 //             cfg.min_bubble_depth_difference_percentage,
                 //             active_set);
-                if (cfg.enable_loop_opening) {
-                    open_simple_loopsv2(dbgi.dbg, active_set,
-                                        initial_depth_stats);
-                }
                 redirect_deleted.clear();
                 // erase_if(dbgi.lci, [](const auto &node) {  // MARK
                 //     return node.second.id == lci_type::max_id;

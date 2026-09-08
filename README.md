@@ -111,7 +111,6 @@ Graph cleaning:
 
 - `--iterations`: number of graph-cleaning passes
 - `--max-tip-length`: maximum tip length in cores
-- `--open-simple-loops`: enable simple loop opening
 
 Output and debugging:
 
