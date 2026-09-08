@@ -109,8 +109,10 @@ Parallelism:
 
 Graph cleaning:
 
-- `--iterations`: number of graph-cleaning passes
+- `--iterations`: number of graph-cleaning passes (default 6)
 - `--max-tip-length`: maximum tip length in cores
+- `--max-bubble-arm-length`: maximum arm length (cores) of a bubble arm to pop; `0` disables bubble popping
+- `--min-bubble-depth-difference-ratio`: pop the shallower arm when its depth ratio to the deeper arm is below this (default 2, i.e. depth is not a gate); `--min-bubble-length-difference`: maximum arm length ratio (default 2)
 
 Output and debugging:
 

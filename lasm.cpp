@@ -123,13 +123,21 @@ public:
         gcg->add_option(
                "--min-bubble-depth-difference-ratio",
                cfg.graph_cleaning.min_bubble_depth_difference_percentage,
-               "Minimum bubble length to pop in terms of cores")
+               "Pops the shallower bubble arm when min_depth(shallow) / "
+               "min_depth(deep) < arg; arg >= 1 pops regardless of depth.")
             ->capture_default_str();
         gcg->add_option(
                "--min-bubble-length-difference",
                cfg.graph_cleaning.min_bubble_length_difference,
-               "Minimum difference between the two ends of the bubbles to "
-               "pop. if depth(P1) * arg > depth(P2) then pop();")
+               "Maximum length ratio between bubble arms to pop: pops when "
+               "longer_arm <= shorter_arm * arg; more divergent arms are kept.")
+            ->capture_default_str();
+        gcg->add_option(
+               "--max-bubble-arm-length",
+               cfg.graph_cleaning.max_bubble_arm_length,
+               "Maximum arm length (in cores) of a bubble arm to pop; "
+               "longer arms are treated as real copy divergence and kept.")
+            ->check(CLI::Range(0, 1000000))
             ->capture_default_str();
         app.callback([this]() {
             // Validate the syncmer configuration (selection mode + mask) up

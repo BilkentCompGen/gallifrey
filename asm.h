@@ -199,9 +199,10 @@ struct asm_config {
         double false_positive_rate = 0.001;
     } bloom;
     struct {
-        int iterations = 2;
+        int iterations = 6;
         int max_tip_length = 8 * 2;
-        int min_bubble_length_difference = 2;
+        double min_bubble_length_difference = 2;
+        size_t max_bubble_arm_length = 128;
         double min_bubble_depth_difference_percentage = 2;
     } graph_cleaning;
 
@@ -231,10 +232,12 @@ struct asm_config {
                 bloom.projected_count, bloom.false_positive_rate);
         fprintf(f,
                 "Graph Cleaning Parameters: \n\tIterations: %d\n\tMax Tip "
-                "Length: %d\n\tMin Bubble Length Difference: %d\n\tMin Bubble "
-                "Depth Difference Rate: %.2f\n",
+                "Length: %d\n\tMin Bubble Length Difference: %.2f\n\tMax "
+                "Bubble Arm Length: %zu\n\tMin Bubble Depth Difference "
+                "Rate: %.2f\n",
                 graph_cleaning.iterations, graph_cleaning.max_tip_length,
                 graph_cleaning.min_bubble_length_difference,
+                graph_cleaning.max_bubble_arm_length,
                 graph_cleaning.min_bubble_depth_difference_percentage);
     }
 };
