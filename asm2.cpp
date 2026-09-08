@@ -48,14 +48,6 @@ enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 #define OLC_SKIP_LAST(l) ((l) / 2)
 #endif
 
-// Prototype: also keep one-directional (non-reciprocal) overlaps. When A finds
-// B but B never finds A, the reverse overlap normally gets dropped. Enabling
-// this synthesizes an approximate reverse span so those extra nodes can still
-// join a layout. Off by default; build with -DOLC_NONRECIPROCAL=1 to measure.
-#ifndef OLC_NONRECIPROCAL
-#define OLC_NONRECIPROCAL 0
-#endif
-
 struct assembler {
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
@@ -175,11 +167,10 @@ struct assembler {
     }
     static auto find_lcmer_ranges(const lcp_read &lr, const dbg_index &dbgi,
                                   int lcmer_l) {
-        // Cores skipped at each node end before overlap-anchoring (see the
-        // OLC_SKIP_* macros). Node ends are boundary-noisy, so a small skip
-        // avoids false anchors.
-        long skip_first = OLC_SKIP_FIRST(lcmer_l);
-        long skip_last = OLC_SKIP_LAST(lcmer_l);
+        // Cores skipped at each node end before overlap-anchoring (OLC_SKIP_*
+        // macros).
+        const long skip_first = OLC_SKIP_FIRST(lcmer_l);
+        const long skip_last = OLC_SKIP_LAST(lcmer_l);
         // Need enough cores to form at least one valid lcmer after skipping
         if (lr.cores.size() <
             static_cast<size_t>(lcmer_l + skip_first + skip_last)) {
@@ -745,17 +736,18 @@ struct assembler {
     auto fold_dbg_graph(dbg_index &dbgi) {
         fprintf(stderr, "dbg_size: %zu\n", dbgi.dbg.size());
 
-        // Discard a reciprocal match that spans less than this fraction (1/N) of
-        // the query node's cores — too short to be a reliable overlap.
+        // Discard a match whose overlap spans less than 1/N of the SHORTER
+        // node's cores. Enforced at the reciprocity stage where both spans
+        // are known.
         constexpr size_t MIN_OVERLAP_CORE_FRACTION_DIV = 20;
 
         std::atomic<int> all_n{0};
         std::atomic<int> hits{0};
         std::atomic<int> bad{0};
-        // Phase-0 matching diagnostics: why do good nodes fail to match?
+        // Phase-0 matching diagnostics.
         std::atomic<int> too_short{0};   // < 4*olc_lcmer_l cores → no ranges (#4)
         std::atomic<int> no_ranges{0};   // long enough but 0 lcmer hits
-        std::atomic<int> frac_drop{0};   // overlap < 5% of cores, filtered (#6)
+        std::atomic<int> frac_drop{0};   // reciprocal but < 5% of shorter node
         gtl::parallel_flat_hash_map_d<u64, gtl::vector<SelfMatch>, HT_SHARD_BC,
                                       std::mutex>
             matched;
@@ -809,11 +801,6 @@ struct assembler {
                 for (const auto &[id, from_core, to_core, from_lcmer,
                                   to_lcmer] : found_ranges) {
                     if (id != 0) {
-                        if (to_core - from_core <
-                            lr.pos.size() / MIN_OVERLAP_CORE_FRACTION_DIV) {
-                            frac_drop.fetch_add(1);
-                            continue;
-                        }
                         any_hit = true;
                         hits.fetch_add(1);
 
@@ -856,6 +843,9 @@ struct assembler {
 
         gtl::btree_multimap<u64, Overlap> reciprocal;
         int non_recip = 0, recip_kept = 0;
+        // Absolute overlap-span floor in cores: half an lcmer window; below
+        // this an overlap is treated as noise.
+        const u64 span_floor = std::max<u64>(2, (u64)olc_lcmer_l / 2);
         for (const auto &[k, v] : matched) {
             for (const auto &match : v) {
                 // Keep the overlap only if the partner records the reverse one
@@ -870,21 +860,24 @@ struct assembler {
                                              })
                               : gtl::vector<SelfMatch>::const_iterator{};
                 if (it != matched.end() && ff != it->second.end()) {
+                    // Span-symmetric fraction gate: overlap extent must be >=
+                    // 1/MIN_OVERLAP_CORE_FRACTION_DIV of the SHORTER node's
+                    // total cores and >= span_floor cores in absolute terms.
+                    const u64 span_a = match.self.to - match.self.from;
+                    const u64 span_b = ff->self.to - ff->self.from;
+                    const u64 shorter_total =
+                        std::min(match.self.len, ff->self.len);
+                    if (std::min(span_a, span_b) <
+                        std::max(shorter_total / MIN_OVERLAP_CORE_FRACTION_DIV,
+                                 span_floor)) {
+                        frac_drop.fetch_add(1);
+                        continue;
+                    }
                     reciprocal.emplace(k,
                                        Overlap{match.other, match.self, ff->self});
                     ++recip_kept;
                 } else {
-                    ++non_recip;  // one-directional match (#7)
-#if OLC_NONRECIPROCAL
-                    // Prototype: keep it anyway. We only know k's span
-                    // (match.self); approximate the partner's span as the same
-                    // shape (self-symmetric) so connected_comp_plus_layout can
-                    // still position the partner. Coarse — it measures whether
-                    // wiring these extra nodes in helps before we compute the
-                    // partner's real overlap interval.
-                    reciprocal.emplace(
-                        k, Overlap{match.other, match.self, match.self});
-#endif
+                    ++non_recip;
                 }
             }
         }
@@ -893,11 +886,10 @@ struct assembler {
         fprintf(stderr,
                 "[match-diag] too_short:%d no_ranges:%d frac_drop:%d "
                 "recip_kept:%d non_recip:%d\n",
-                too_short.load(), no_ranges.load(), frac_drop.load(), recip_kept,
-                non_recip);
+                too_short.load(), no_ranges.load(), frac_drop.load(),
+                recip_kept, non_recip);
         auto layouts =
             layout_graph_algo::connected_comp_plus_layout(reciprocal);
-
         return std::make_pair(reciprocal, layouts);
     }
 };
