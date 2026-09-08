@@ -31,10 +31,9 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
     std::queue<std::pair<u64, typename RecigMapT::mapped_type>> q;
     gtl::flat_hash_set<u64> visited;
 
-    // Precompute node → length once (was an O(N) scan of `recig` per node).
-    // Mirrors the original precedence: a node's length is the `query.len` of the
-    // first overlap keyed by that node (when > 0); otherwise the `target_span.len`
-    // of the first overlap (in iteration order) that references it as a target.
+    // Precompute node → length. A node's length is the query.len of the first
+    // overlap keyed by that node (when > 0); otherwise the target_span.len of
+    // the first overlap (iteration order) that references it as a target.
     gtl::flat_hash_map<u64, i64> first_qry_len;  // key node → its first query.len
     gtl::flat_hash_map<u64, i64> first_tgt_len;  // target node → first tgt len>0
     for (const auto &kv : recig) {
@@ -51,10 +50,7 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
         auto tit = first_tgt_len.find(id);
         if (tit != first_tgt_len.end()) return tit->second;
         // Invariant I1: every participating node carries a core-span length
-        // (CoreSpan.len ≥ 1). fold_dbg_graph only admits nodes with
-        // cores.size() ≥ olc_lcmer_l+1, so this branch is unreachable on real
-        // input (C11-verified: zero hits on chr22). Warn rather than silently
-        // emitting a zero-length node if the invariant is ever violated.
+        // (CoreSpan.len ≥ 1). Warn if violated; treat as 0.
         std::fprintf(stderr,
                      "[layout] WARNING: node %" PRIu64 " carries no core length "
                      "(invariant I1 violated); treating as 0\n",
@@ -123,7 +119,7 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
 
 namespace layout_graph_emit {
 
-// ── Tunable constants (were scattered magic numbers) ────────────────
+// ── Tunable constants ───────────────────────────────────────────────
 // Reserve hint: expected seed-chain-DAG nodes (cores) per contig.
 inline constexpr size_t SCD_CORES_PER_CONTIG_HINT = 64;
 // Default max length (bp) of a post-layout C-node tip to prune.
@@ -132,10 +128,6 @@ inline constexpr size_t DEFAULT_POST_LAYOUT_MAX_TIP_LEN = 50000;
 // max(olc_lcmer_l * BOUNDARY_FUZZ_LCMER_MULT, span / BOUNDARY_FUZZ_SPAN_DIV).
 inline constexpr i64 BOUNDARY_FUZZ_LCMER_MULT = 2;
 inline constexpr i64 BOUNDARY_FUZZ_SPAN_DIV = 20;
-// (Retired: N_GAP_LEN. Disconnected SCD components used to be concatenated with
-// a fabricated 64-'N' gap — root cause R7, docs/layout-graph-improvement-plan.md
-// — asserting an adjacency the data does not support. They are now emitted as
-// separate contigs; a real join needs P3.3's oriented, validated DBG-edge path.)
 
 // Reverse-complement a sequence-fragment vector: reverse fragment order and
 // reverse-complement each fragment (so the whole sequence is reverse-complemented).
@@ -352,21 +344,10 @@ inline void build_scd_graph(
     }
 }
 
-// DISABLED EXPERIMENT — not compiled into the default build. Enable with
-// -DLASM_LAYOUT_RESOLVE_OVERLAP to trial it on a full genome.
-//
-// Drops any SCD component overlapping a heavier one by >50% of the shorter
-// interval, keeping the heavier. It does clear the M79 duplication, but it is
-// NOT trustworthy as a general rule:
-//   * the 50% threshold is a magic constant with no principled basis;
-//   * it acts on layout_from/layout_to (matching-phase coordinates), which are
-//     a proxy for duplicated sequence, not proof — on other data it could drop
-//     genuinely distinct sequence;
-//   * it was derived from, and "validated" on, a single occurrence (layout 79
-//     was the only multi-component layout in the whole l5 chr22 run).
-// The underlying defect is R7 (docs/layout-graph-improvement-plan.md:37): the
-// layout fabricated adjacency between disconnected components. That fabrication
-// is removed at the emission site instead; see collect_path_sequences.
+// Compiled only under -DLASM_LAYOUT_RESOLVE_OVERLAP. Drops any SCD component
+// overlapping a heavier one by >50% of the shorter interval, keeping the
+// heavier. Off by default; disconnected components are instead emitted as
+// separate contigs (see collect_path_sequences).
 inline void resolve_overlapping_components(gtl::vector<comp_path> &comp_paths) {
     if (comp_paths.size() < 2) return;
 
@@ -413,7 +394,7 @@ inline void resolve_overlapping_components(gtl::vector<comp_path> &comp_paths) {
 // Single longest-weight DP with an implicit virtual source (wired to every
 // in-degree-0 node) and virtual sink (wired from every out-degree-0 node):
 // dp[] realizes the source side, best_end the sink side. One source→sink
-// traceback per component; no post-hoc span extension.
+// traceback per component.
 inline gtl::vector<comp_path> find_heaviest_paths(
     const gtl::vector<scd_node> &scd,
     const gtl::vector<scd_adj_t> &scd_fwd,
@@ -508,21 +489,14 @@ inline gtl::vector<comp_path> find_heaviest_paths(
         }
         if (best_end < 0) continue;
 
-        // Traceback the heaviest path ending at best_end. Because dp[] is the
-        // longest-weight path from a virtual source wired to every in-degree-0
-        // node, and best_end is the heaviest out-degree-0 node (a virtual sink
-        // wired from every real sink), this single traceback IS the heaviest
-        // virtual-source→virtual-sink path for the component. No post-hoc span
-        // extension exists (the old forward/backward heuristics — C13's bug
-        // class — are gone); the path is edge-connected by construction.
+        // Traceback the heaviest path ending at best_end.
         gtl::vector<uint32_t> path;
         for (int32_t cur = best_end; cur >= 0; cur = parent[cur])
             path.push_back(static_cast<uint32_t>(cur));
         std::reverse(path.begin(), path.end());
 
-        // Invariant I3: consecutive path nodes share an SCD edge. parent[] only
-        // ever points at a real predecessor, so this holds by construction —
-        // verify defensively since NDEBUG makes assert() a no-op on release.
+        // Invariant I3: consecutive path nodes share an SCD edge (parent[]
+        // points only at a real predecessor). Verified defensively.
         for (size_t pi = 1; pi < path.size(); ++pi) {
             bool linked = false;
             for (auto &[v, w] : scd_fwd[path[pi - 1]])
@@ -552,43 +526,12 @@ inline gtl::vector<comp_path> find_heaviest_paths(
     resolve_overlapping_components(comp_paths);
 #endif
 
-    // Per-layout component diagnostic (R3/R4 root-cause work): a layout whose
-    // nodes fail to chain into ONE seed-chain path is the condition that used to
-    // trigger the fabricated N-gap join. Overlapping spans additionally mean the
-    // same region was reconstructed twice.
-    if (comp_paths.size() > 1 && getenv("LASM_DEBUG_COMPSPANS")) {
-        bool any_overlap = false;
-        for (size_t i = 0; i + 1 < comp_paths.size() && !any_overlap; ++i)
-            for (size_t j = i + 1; j < comp_paths.size(); ++j)
-                if (std::min(comp_paths[i].layout_to, comp_paths[j].layout_to) >
-                    std::max(comp_paths[i].layout_from,
-                             comp_paths[j].layout_from)) {
-                    any_overlap = true;
-                    break;
-                }
-        for (size_t i = 0; i < comp_paths.size(); ++i)
-            std::fprintf(stderr,
-                         "[layout-dag] layout=%" PRIu64 " ncomp=%zu comp=%zu "
-                         "from=%" PRId64 " to=%" PRId64 " weight=%" PRId64
-                         " overlapping=%s\n",
-                         static_cast<uint64_t>(layout_idx), comp_paths.size(), i,
-                         static_cast<int64_t>(comp_paths[i].layout_from),
-                         static_cast<int64_t>(comp_paths[i].layout_to),
-                         static_cast<int64_t>(comp_paths[i].total_weight),
-                         any_overlap ? "yes" : "no");
-    }
     return comp_paths;
 }
 
 // ── Phase 3: Collect output sequences from heaviest paths ───────────
-// Returns ONE sequence group per SCD component. Components are weakly
-// disconnected in the seed-chain DAG, so there is no evidence for their
-// adjacency, order, or separation: they must not be concatenated. (Previously
-// they were joined with a fabricated 64-N gap — root cause R7,
-// docs/layout-graph-improvement-plan.md:37 — which asserted an adjacency the
-// data does not support and produced the M79 tandem duplication.) The caller
-// emits each group as its own contig; a real join needs the oriented, validated
-// DBG-edge approach of P3.3, not a synthetic gap.
+// Returns one sequence group per SCD component; groups are never concatenated.
+// The caller emits each as its own contig.
 inline gtl::vector<gtl::vector<SequenceContainerType>> collect_path_sequences(
     const gtl::vector<comp_path> &paths,
     const gtl::vector<gtl::vector<std::pair<size_t, size_t>>> &node_contigs,
@@ -623,11 +566,8 @@ inline gtl::vector<gtl::vector<SequenceContainerType>> collect_path_sequences(
 
             if (use_contig == SIZE_MAX) {
                 // Prefer a contig shared with the next node so consecutive
-                // path nodes stay on the same contig (real read adjacency);
-                // otherwise pick the longest available core sequence — the most
-                // complete representative — instead of an arbitrary first contig.
-                // (No fallback logging: it also fires legitimately at every path
-                // start, so it would be noise rather than signal.)
+                // path nodes stay on the same contig; otherwise pick the
+                // longest available core sequence.
                 auto pick_contig = [&]() -> std::pair<size_t, size_t> {
                     if (pi + 1 < path.size()) {
                         const auto &nc_next = node_contigs[path[pi + 1]];
@@ -902,8 +842,6 @@ using supernode_vec = gtl::vector<supernode_out>;
 using edge_map = std::map<edge_key, edge_agg>;
 
 // ── Post-layout graph cleaning ──────────────────────────────────────
-// Mirrors GraphCleaning in graph.h: separate struct with individual
-// cleaning functions operating on the supernode/superedge graph.
 struct PostLayoutCleaning {
     struct adj_entry {
         u64 neighbor;  // supernode id
@@ -934,13 +872,10 @@ struct PostLayoutCleaning {
                   lst.end());
     }
 
-    // Remove short C-node tips: C-nodes with no successors (or no predecessors)
-    // and sequence length below max_tip_len.
-    //
-    // Each pass decides all removals from a *consistent snapshot* of `adj`
-    // (matching the previous full-rebuild-between-passes behavior), then applies
-    // them while patching neighbor adjacency incrementally — avoiding an
-    // O(edges) rebuild per pass (measured serial hotspot).
+    // Remove short C-node tips: C-nodes with no successors (or no
+    // predecessors) and sequence length below max_tip_len. Each pass decides
+    // removals from a frozen snapshot of `adj`, then applies them while
+    // patching neighbor adjacency incrementally.
     static size_t cut_tips(supernode_vec &supernodes, edge_map &merged_edges,
                            adj_map &adj, size_t max_tip_len) {
         size_t removed = 0;
@@ -1030,14 +965,10 @@ struct PostLayoutCleaning {
 };
 
 // ── Orientation resolution ──────────────────────────────────────────
-// Each layout assigns every DBG node it contains an orientation (+/-). Under the
-// current pipeline a node belongs to exactly one layout (connected_comp_plus_
-// layout uses a single shared `visited` set), so there is normally nothing to
-// resolve. A conflict — the same node claimed by two layouts with opposite
-// orientation — can only arise if that single-owner invariant is relaxed (e.g.
-// future repeat handling that shares a node across layouts). This function makes
-// the resolution explicit and deterministic instead of the old arbitrary
-// last-write-wins, and `*out_conflicts` surfaces any violation of the invariant.
+// Each layout assigns every DBG node an orientation (+/-). Normally a node
+// belongs to exactly one layout, so nothing needs resolving. `*out_conflicts`
+// counts any node claimed by two layouts with opposite orientation (a
+// violation of the single-owner invariant).
 enum class orientation_policy {
     first_wins,     // first layout (in `layouts` order) to claim the node wins
     majority_vote,  // orientation backed by the most layouts wins (tie → '+')
@@ -1137,8 +1068,7 @@ inline void build_layout_jobs(
 // ── Phase: find C-node components fully contained inside layouts ─────────
 // Populates `candidate_set` with the non-layout ("C") nodes, then returns the
 // subset whose connected component (over C-nodes) never touches a layout
-// boundary or an external non-layout node — i.e. their sequence is already
-// represented inside a layout, so they can be dropped.
+// boundary or an external non-layout node.
 inline gtl::flat_hash_set<u64> find_contained_cnodes(
     dbg_index &dbg, const gtl::flat_hash_set<u64> &nodes_in_layouts,
     const gtl::flat_hash_map<u64, uint8_t> &node_boundary_mask,
@@ -1223,14 +1153,9 @@ inline gtl::flat_hash_set<u64> find_contained_cnodes(
             }
         }
 
-        // A component is contained only if it HAS external adjacency and none
-        // of it reaches a layout boundary — i.e. it hangs off layout
-        // interiors, so its sequence is already represented inside a layout.
-        // A component with NO external adjacency is standalone (isolated
-        // node, or a closed circular component whose neighbors are all
-        // internal): nothing else represents its sequence, so it must be
-        // kept. Previously the vacuous "no boundary neighbor" case dropped
-        // such components (and e.g. plasmids) from the assembly.
+        // Contained: has external adjacency and none reaches a layout
+        // boundary (hangs off layout interiors). A component with no external
+        // adjacency is standalone and must be kept.
         if (!has_boundary_neighbor && has_external_edge) {
             for (u64 nid : component) contained_nodes.insert(nid);
         } else if (!has_external_edge && !component.empty()) {
@@ -1334,8 +1259,7 @@ inline edge_map aggregate_superedges(
 inline void write_gfa(const supernode_vec &supernodes,
                       const edge_map &merged_edges, int nthreads, FILE *out) {
     // Each worker converts a supernode's sequences to ASCII and builds the
-    // complete `S` line (prefix + sequence + tags). Doing the whole line here
-    // keeps the megabase `%s` formatting off the serial write path below.
+    // complete `S` line (prefix + sequence + tags) off the serial write path.
     const size_t n_super = supernodes.size();
     gtl::vector<std::string> super_line_strs(n_super);
     {
@@ -1365,9 +1289,8 @@ inline void write_gfa(const supernode_vec &supernodes,
 
                     const size_t seq_start = dst.size();
                     for (const auto &s : sn_seqs) {
-                        // No gap fabrication: disconnected components are
-                        // emitted as separate contigs (R7), so a zero-length
-                        // entry contributes nothing rather than a run of 'N'.
+                        // No gap fabrication: skip zero-length entries rather
+                        // than emitting a run of 'N'.
                         if (s.len == 0) continue;
                         local_chs.require(s.len + 32);
                         s.convert_to_ascii((char *)local_chs.data);
@@ -1388,9 +1311,8 @@ inline void write_gfa(const supernode_vec &supernodes,
         for (auto &w : workers) w.join();
     }
 
-    // Accumulate output into a 4 MiB buffer and flush in large fwrites to
-    // minimize write() syscalls. Oversized lines (megabase S-lines) bypass the
-    // buffer with a direct write.
+    // Accumulate output into a 4 MiB buffer, flushing in large fwrites.
+    // Oversized lines (megabase S-lines) bypass the buffer with a direct write.
     constexpr size_t FLUSH_AT = size_t{1} << 22;  // 4 MiB
     std::string wbuf;
     wbuf.reserve(FLUSH_AT + 4096);
@@ -1449,10 +1371,8 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     node_to_super.reserve(dbg.active_set.size() + 8);
     nodes_in_layouts.reserve(dbg.active_set.size() + 8);
 
-    // Resolve per-node orientation up front (deterministic; see
-    // resolve_layout_orientations). Normally each node is in exactly one layout,
-    // so there are no conflicts; a nonzero count means the single-owner invariant
-    // was violated upstream.
+    // Resolve per-node orientation up front (see resolve_layout_orientations).
+    // A nonzero conflict count means the single-owner invariant was violated.
     size_t ori_conflicts = 0;
     auto node_layout_ori = resolve_layout_orientations(
         layouts, orientation_policy::first_wins, &ori_conflicts);
@@ -1489,8 +1409,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
                                   true, job.layout_idx});
         }
         // Edges are aggregated per node; map every node of the job to the
-        // primary component, exactly as when the job produced a single contig.
-        // Secondary components carry no claimed adjacency.
+        // primary component. Secondary components carry no claimed adjacency.
         for (const auto &n : job.lnodes) {
             node_to_super[n.id] = primary_sid;
         }

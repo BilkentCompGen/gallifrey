@@ -13,10 +13,9 @@
 using std::string;
 
 // Each subcommand is a command object that owns its parsed parameters and
-// registers itself with the parent CLI::App on construction. The objects live
-// for the duration of main (which encloses CLI11_PARSE), so the options bound
-// to their members and the callbacks capturing `this` stay valid through
-// parsing. Copy/move is deleted so a registered `this` can never dangle.
+// registers itself with the parent CLI::App on construction. The objects
+// live for all of main (enclosing CLI11_PARSE), so bound options and the
+// `this`-capturing callbacks stay valid. Copy/move is deleted.
 
 class AsmProgram {
     asm_config cfg;
@@ -139,15 +138,13 @@ public:
             ->capture_default_str();
         app.callback([this]() {
             // Validate the syncmer configuration (selection mode + mask) up
-            // front. Throwing a CLI error makes CLI11 print the message and
-            // exit with a non-zero status.
+            // front; a CLI error makes CLI11 print the message and exit nonzero.
             if (auto v = cfg.syncmer.validate(); !v) {
                 throw CLI::ValidationError(v.error());
             }
             cfg.parallel_file_reading = (file_reading_mode == "parallel");
-            // Propagate assembly failures to the process exit status: CLI11
-            // callbacks return void, so surface a nonzero result as a
-            // CLI::RuntimeError, which CLI11_PARSE prints and exits with.
+            // CLI11 callbacks return void; surface a nonzero rc as a
+            // CLI::RuntimeError so the failure reaches the process exit status.
             if (int rc = run_assembly(cfg); rc != 0) {
                 throw CLI::RuntimeError("assembly failed", rc);
             }
@@ -194,9 +191,8 @@ public:
             ->transform(CLI::CheckedTransformer(SamReadTestingMode_map,
                                                 CLI::ignore_case));
         app.callback([this]() {
-            // Propagate failures to the exit status: CLI11 callbacks return
-            // void, so a nonzero rc must be re-raised as a CLI error rather
-            // than discarded (which would exit 0 and pass CI silently).
+            // CLI11 callbacks return void; re-raise a nonzero rc as a CLI error
+            // so it reaches the process exit status.
             if (int rc = run_sam_read_testing(input, threads, lcp_level, mode,
                                               job, density);
                 rc != 0) {

@@ -82,17 +82,10 @@ struct dbg_index_base {
               seq{}, prev{prev} {}
 
         bool redirected_flag;
-        // forward_edge_count is deliberately OUTSIDE the redirect_to union
-        // (see RC_REVIEW.md RC1). Adjacent simple-path chains share their
-        // boundary node: one chain reads the boundary's forward_edge_count
-        // while the neighbouring chain (which owns that node as its seed)
-        // redirects it. Keeping fec out of the union means mark_redirected's
-        // redirect_to write never aliases the fec a concurrent walker reads,
-        // and fec itself is only ever written on representatives — never on a
-        // fec!=1 boundary node. It occupies the padding that already followed
-        // redirected_flag, so this costs zero extra bytes per node. core_count
-        // stays unioned with redirect_to because it is only ever touched by a
-        // node's own (single) owning chain, so it cannot race.
+        // forward_edge_count stays outside the redirect_to union: a
+        // neighbouring chain may read it while this node is being redirected.
+        // fec is written only on representatives; core_count stays unioned
+        // since only the node's own chain touches it.
         unsigned forward_edge_count;
         union {
             counts_t counts;
@@ -122,12 +115,9 @@ struct dbg_index_base {
         }
 
         constexpr double avg_core_count() const {
-            // Precondition: live (non-consumed) node. seq.empty() ⟺ the node
-            // was absorbed by another during simplification (see
-            // mark_redirected) and must be skipped via redirected() before
-            // calling this. The assert catches a broken invariant in debug/
-            // tests; the release path degrades to 0.0 rather than letting inf
-            // propagate into depth comparisons.
+            // Precondition: live node. seq.empty() means the node was absorbed
+            // during simplification (mark_redirected); skip via redirected()
+            // first.
             assert(!seq.empty());
             return seq.empty() ? 0.0 : (double)counts.core_count / seq.size();
         }
@@ -353,31 +343,6 @@ struct GraphCleaning {
         stats.baseline = median_of_sorted(pool);
         return stats;
     }
-    static void dump_initial_clean_contig_stats(
-        const dbg_map_t &dbg, const gtl::btree_set<u64> &active_set,
-        const std::string &out_tsv_path) {
-        FILE *out = std::fopen(out_tsv_path.c_str(), "w");
-        if (out == nullptr) {
-            std::fprintf(stderr,
-                         "WARN: failed to write initial clean contig stats to "
-                         "%s\n",
-                         out_tsv_path.c_str());
-            return;
-        }
-        std::fprintf(out, "contig_id\tcontig_len_proxy\tavg_core_count\n");
-        for (u64 node_id : active_set) {
-            auto it = dbg.find(node_id);
-            if (it == dbg.end()) continue;
-            const auto &node = it->second;
-            if (node.redirected() || node.seq.empty()) continue;
-            const size_t len_proxy = node.seq.size();
-            const double avg_cc = node.avg_core_count();
-            std::fprintf(out, "%" PRIu64 "\t%zu\t%.6f\n", node_id, len_proxy,
-                         avg_cc);
-        }
-        std::fclose(out);
-    }
-
     struct loop_copy_estimate {
         double base_cn = 1.0;
         int base_cn_rounded = 1;
@@ -486,9 +451,8 @@ struct GraphCleaning {
         gtl::vector<dbg_map_t::iterator> merged;
         unsigned cc_sum = 0;
         while (prev_it != dbg.end() && current->second.prev.size() == 1 &&
-               prev_it->first != current->first &&  // never step onto a self-
-                                                    // loop (would merge the
-                                                    // node into itself forever)
+               prev_it->first != current->first &&  // never step onto a
+                                                    // self-loop
                prev_it->second.forward_edge_count == 1) {
             if (prev_it != dbg.end()) {
                 cc_sum += current->second.counts.core_count;
@@ -506,11 +470,9 @@ struct GraphCleaning {
             }
         }
         if (!simplified) {
-            // Degenerate: nothing was merged (merged empty, cc_sum == 0,
-            // current == seed). Mutating the seed here would be a
-            // value-identical self-store that races neighbor chains'
-            // stop-condition reads of forward_edge_count (CONFIRMATION_C1.md)
-            // — the only write that could cross chain boundaries. Skip it.
+            // Degenerate: nothing merged (current == seed). Skip the seed
+            // write: it is value-identical but would race a neighbour chain's
+            // read of forward_edge_count.
             return false;
         }
         // simplified implies the walk moved, i.e. current != seed.
@@ -555,13 +517,10 @@ struct GraphCleaning {
                         auto prev_hash = dbg.hash(prev_id);
 
                         auto prev_it = dbg.find(prev_id, prev_hash, no_lock);
-                        // Seed only fec==1 predecessors here. A fec!=1
-                        // predecessor is already a type-1 seed (above), so
-                        // seeding it again would have two threads walk the
-                        // same chain -> RC1 race + double merge. With this
-                        // guard, type-1 (fec!=1) and type-2 (fec==1) seeds are
-                        // disjoint and every chain is owned by one thread.
-                        // (See RC_REVIEW.md RC1.)
+                        // Seed only fec==1 predecessors; fec!=1 predecessors
+                        // are already type-1 seeds (above). This keeps type-1
+                        // and type-2 seeds disjoint so each chain is owned by
+                        // one thread.
                         if (prev_it != dbg.end() &&
                             prev_it->second.prev.size() == 1 &&
                             prev_it->second.forward_edge_count == 1) {
@@ -580,16 +539,10 @@ struct GraphCleaning {
             gtl::vector<std::pair<u64, dbg_index::dbg_map_t::iterator>>>
             &to_simplify,
         redir_map &redirect_deleted, auto &active_set) {
-        // Chains are node-disjoint (see simplify_simple_parallel_mark's seed
-        // guard), so each thread mutates only the nodes of its own chains with
-        // no synchronization. forward_edge_count in particular is written only
-        // on representatives strictly inside the writer's own chain: the
-        // degenerate-path gate in attempt_simplify_one_path_lockless (the C1
-        // fix) removed the one cross-chain self-store, so the sweep is
-        // data-race free under the disjointness invariant (CONFIRMATION_C1.md).
-        // The shared redirect_deleted is a mutexed parallel map; active_set is
-        // pruned after the join (below) rather than via a per-node id list.
-        // (See RC_REVIEW.md RC1.)
+        // Chains are node-disjoint (see the seed guard in
+        // simplify_simple_parallel_mark), so each thread mutates only its own
+        // chain's nodes without synchronization. redirect_deleted is a mutexed
+        // parallel map; active_set is pruned after the join.
         gtl::vector<std::thread> threads;
         for (size_t i = 0; i < to_simplify.size(); ++i) {
             threads.emplace_back(
@@ -606,9 +559,8 @@ struct GraphCleaning {
             thread.join();
         }
 
-        // Prune absorbed nodes from active_set by state, not by a stored id
-        // list: every node merged into a representative was marked
-        // redirected() during the sweep, and nodes no longer in dbg are gone.
+        // Prune absorbed nodes: a merged node is redirected() and a consumed
+        // node is gone from dbg.
         for (auto it = active_set.begin(); it != active_set.end();) {
             auto nit = dbg.find(*it);
             if (nit == dbg.end() || nit->second.redirected()) {
@@ -626,11 +578,9 @@ struct GraphCleaning {
                     p = it->second;
                 }
                 if (p == node.first) {
-                    // Cycle collapse: the redirect rewrite turned this prev
-                    // entry into a self-reference. The self-edge is spurious
-                    // bookkeeping (the collapsed cycle edge) — drop it and
-                    // keep in/out bookkeeping consistent. (At most one such
-                    // entry can exist: emplace_prev dedups.)
+                    // Cycle collapse: the redirect rewrite made this prev entry
+                    // a self-reference. Drop the spurious self-edge
+                    // (emplace_prev dedups, so at most one exists).
                     if (node.second.forward_edge_count > 0) {
                         node.second.forward_edge_count--;
                     }
@@ -643,8 +593,7 @@ struct GraphCleaning {
     // Unified simple-path simplification: discover node-disjoint chains in
     // parallel (mark), then merge them lock-free (sweep). Used for both the
     // initial pass and every cleaning iteration; threads==1 just means a single
-    // partition. Replaces the old divergent single-threaded simplify_simple_paths
-    // and the dead attempt_simplify_one_path. (See RC_REVIEW.md RC1.)
+    // partition.
     static void simplify_simple_paths(dbg_index::dbg_map_t &dbg,
                                       redir_map &redirect_deleted,
                                       auto &active_set, int threads) {
@@ -899,9 +848,7 @@ struct GraphCleaning {
             dbg.erase(node);
         }
     }
-    static void fix_edges(dbg_map_t &dbg,
-                          [[maybe_unused]] const auto &active_set) {
-        // Fix edges
+    static void fix_edges(dbg_map_t &dbg) {
         for (auto &node : dbg) {
             if (node.second.redirected()) continue;
             auto &pvec = node.second.prev;
@@ -919,8 +866,7 @@ struct GraphCleaning {
                        pvec.end());
         }
     }
-    static void run(dbg_index &dbgi, const asm_config &acfg,
-                    bool once = false) {
+    static void run(dbg_index &dbgi, const asm_config &acfg) {
         auto cfg = acfg.graph_cleaning;
         INIT_TIMERS(GraphCleaning);
         redir_map redirect_deleted;
@@ -935,14 +881,10 @@ struct GraphCleaning {
             IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                "Initial Simplification");
             cut_low_support_edges(dbgi.dbg, active_set);
-            // dump_initial_clean_contig_stats(
-            //     dbgi.dbg, active_set,
-            //     acfg.output + ".initial_clean_contig_stats.tsv");
             const auto initial_depth_stats =
                 collect_active_avg_core_count_stats(dbgi.dbg, active_set);
-            for (int i = 1; i < (once ? 2 : cfg.iterations); ++i) {
-                fix_edges(dbgi.dbg, active_set);
-
+            for (int i = 1; i < cfg.iterations; ++i) {
+                fix_edges(dbgi.dbg);
                 cut_tips(dbgi.dbg, 3, cfg.max_tip_length, active_set);
                 // TODO FIX pop_bubbles sequence problem fix
                 // pop_bubbles(dbgi.dbg, dbgi.lci,
@@ -956,16 +898,13 @@ struct GraphCleaning {
                 // erase_if(dbgi.lci, [](const auto &node) {  // MARK
                 //     return node.second.id == lci_type::max_id;
                 // });
-                // Iterations run the simplify serially (single partition) --
-                // the committed behavior. Parallelizing them is a future perf
-                // win once RC3 (a residual cross-chain fec race in the parallel
-                // sweep -- see RC_REVIEW.md) is resolved. The initial pass above
-                // keeps the committed parallelism (threads.work).
+                // Iterations run simplify serially (single partition): the
+                // parallel sweep has a cross-chain forward_edge_count race.
                 simplify_simple_paths(dbgi.dbg, redirect_deleted, active_set, 1);
                 IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                    "Iteration %d done.", i);
             }
-            fix_edges(dbgi.dbg, active_set);
+            fix_edges(dbgi.dbg);
         }
     }
 };
@@ -1016,8 +955,8 @@ inline void print_dbg_seqs(FILE *out, const dbg_index &dbgi, int nthreads = 0) {
     std::atomic<bool> work_done{false};
     std::atomic<int> active_workers{nthreads};
     // ── Worker thread pool ──────────────────────────────────────────
-    // Each worker dequeues nodes, converts sequences to ASCII, formats
-    // the full S-line + L-lines into a vector<char>, then enqueues it.
+    // Each worker dequeues nodes, formats the S-line + L-lines into a
+    // vector<char>, then enqueues it.
     // Format one node (S-line + L-lines) into line_buf.
     auto format_node = [&](std::vector<char> &line_buf, const WorkItem &item) {
         const auto &edges = *item.edges;

@@ -38,14 +38,9 @@ using std::string;
 enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 
 // OLC end-skip policy: cores skipped at each end of a DBG node before
-// overlap-anchoring (see find_lcmer_ranges). Written as function-like macros of
-// the OLC lcmer length `l` so they scale with --olc-lcmer-l and can be retuned
-// at compile time without editing source, e.g.:
-//   cmake -DCMAKE_CXX_FLAGS='-DOLC_SKIP_FIRST(l)=0 -DOLC_SKIP_LAST(l)=((l))'
-// The old (l, 2l) required >=4*l cores and forced ~29% of good nodes (chr22)
-// into singletons; the (1, l/2) default drops singleton contigs 87.0%->84.5%
-// and lifts N50 +13% with no extra misassemblies. A node needs
-// (l + OLC_SKIP_FIRST(l) + OLC_SKIP_LAST(l)) cores to anchor any overlap.
+// overlap-anchoring (see find_lcmer_ranges). Function-like macros of the OLC
+// lcmer length `l`. A node needs (l + OLC_SKIP_FIRST(l) + OLC_SKIP_LAST(l))
+// cores to anchor any overlap.
 #ifndef OLC_SKIP_FIRST
 #define OLC_SKIP_FIRST(l) (1)
 #endif
@@ -196,8 +191,7 @@ struct assembler {
 
         dbg_index::lci_type lval = dbgi.get(l);
         llr.emplace_back(lval.id, skip_first, skip_first, l, l);
-        // Fix: ensure we don't go out of bounds when accessing i +
-        // runtime_lcmer_l
+        // Loop bound keeps i + lcmer_l in range.
         for (long long i = skip_first + 1;
              i < ((long long)lr.cores.size() - lcmer_l - skip_last); ++i) {
             uint32_t in_core = lr.cores[i + lcmer_l - 1];
@@ -247,13 +241,9 @@ struct assembler {
     static void process_cores_for_basespace(
         const lcp_read &lr, dbg_index &dbgi, [[maybe_unused]] int thread_id,
         [[maybe_unused]] uint64_t &lcmer_index, int lcmer_l) {
-        // Keep the DBG node sequences in BASE space (actual substrings), but do
-        // NOT convert overlap/layout coordinates to base space during
-        // layouting/merging.
-        //
-        // Layouting will be done in core-index space. Only at the final
-        // emission step will we scale core-space layout positions into base
-        // offsets.
+        // DBG node sequences stay in BASE space (actual substrings);
+        // overlap/layout coordinates stay in core-index space and scale to
+        // base offsets only at final emission.
         LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
 
         uint64_t val = dbgi.get(l).id;
@@ -314,8 +304,7 @@ struct assembler {
             parse_cores_from_bam_record(bam_get_seq(data_p),
                                         data_p->core.l_qseq, lcp_level, &str,
                                         syncmer_functor, chs, lr, pos_buf);
-            // Reads with too few cores are skipped, but the record is always
-            // recycled afterwards.
+            // Skip reads with too few cores; the record is recycled regardless.
             if (lr.cores.size() >= static_cast<size_t>(lcmer_l + 2)) {
                 ++processed_read_count;
                 Process_Func(lr, dbgi, thread_id, lcmer_index, lcmer_l);
@@ -367,8 +356,7 @@ struct assembler {
         return true;
     }
 
-    // Populates the caller-owned dbgi. The dbg_index lives in the caller's
-    // storage (see run_assembly) so it is not heap-allocated here.
+    // Populates the caller-owned dbgi (storage lives in run_assembly).
     std::expected<void, std::string> construct_dbg(dbg_index &dbgi) {
         dqt data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
         dqt recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
@@ -512,26 +500,25 @@ struct assembler {
         }
         return sum;
     }
-    // One documented coordinate space for overlaps: inclusive core indices on a
-    // node's (reverse-complemented) core sequence. `len` is the node's core-span
-    // length in *steps* (cores - 1), carried so downstream never re-derives it.
+    // Overlap coordinate space: inclusive core indices on a node's
+    // (reverse-complemented) core sequence. `len` is the core-span length in
+    // steps (cores - 1).
     struct CoreSpan {
         u64 from;
         u64 to;
         u64 len;
     };
 
-    // Phase-A record: on some key node, an overlap with `other` covers `self`
-    // (coordinates on the key node itself). Only the key node's own span is
-    // known at this stage; the partner's span is joined in phase B.
+    // Phase-A record: on the key node, an overlap with `other` covers `self`
+    // (coordinates on the key node). The partner's span is joined in phase B.
     struct SelfMatch {
         u64 other;
         CoreSpan self;
     };
 
-    // Phase-B record (a reciprocal overlap), keyed by the query node: `target`
-    // is the partner node id; `query`/`target_span` are each node's core span in
-    // the shared overlap. No reinterpreted fields — names match meaning.
+    // Phase-B record (reciprocal overlap), keyed by the query node: `target`
+    // is the partner id; `query`/`target_span` are each node's core span in
+    // the shared overlap.
     struct Overlap {
         u64 target;
         CoreSpan query;
@@ -809,12 +796,9 @@ struct assembler {
                     free_lps(&str);
                     return;
                 }
-                // Keep everything in CORE-INDEX space for layouting.
-                // `find_lcmer_ranges()` already returns [from_core,to_core] in
-                // core indices (inclusive), which is the correct coordinate
-                // system for connected_comp_plus_layout().
-                // Matching diagnostic: bucket why a good node yields no match.
-                // Mirrors find_lcmer_ranges' gate via the same OLC_SKIP_* macros.
+                // Layout works in core-index space; find_lcmer_ranges returns
+                // inclusive [from_core,to_core]. Diagnostic below mirrors its
+                // gate via OLC_SKIP_*.
                 if (lr.cores.size() <
                     static_cast<size_t>(olc_lcmer_l + OLC_SKIP_FIRST(olc_lcmer_l) +
                                         OLC_SKIP_LAST(olc_lcmer_l))) {
@@ -834,9 +818,8 @@ struct assembler {
                         hits.fetch_add(1);
 
                         // Store the overlap on THIS node in CORE indices
-                        // (inclusive; see CoreSpan). Base-space scaling happens
-                        // only at emission time. Core-space length is the number
-                        // of steps between endpoints: (cores.size() - 1).
+                        // (inclusive; see CoreSpan). Core-space length is
+                        // (cores.size() - 1) steps.
                         const u64 core_len_steps =
                             (lr.cores.size() > 0)
                                 ? static_cast<u64>(lr.cores.size() - 1)
@@ -876,9 +859,8 @@ struct assembler {
         for (const auto &[k, v] : matched) {
             for (const auto &match : v) {
                 // Keep the overlap only if the partner records the reverse one
-                // too (a reciprocal match). `match.self` is k's core span in the
-                // overlap; `ff->self` is the partner's. Both are core-index
-                // spans (see CoreSpan); base-space scaling happens at emission.
+                // too. `match.self` is k's core span; `ff->self` is the
+                // partner's.
                 auto it = matched.find(match.other);
                 auto ff = (it != matched.end())
                               ? std::find_if(it->second.begin(),
@@ -973,9 +955,6 @@ int run_assembly(const asm_config &cfg) {
     INIT_TIMERS(HIFI_ASSEMBLY);
 
     assembler as(cfg);
-    // The DBG index lives for the whole program; it is held in stack-resident
-    // inline storage and its (expensive) destructor is intentionally skipped at
-    // exit. See no_destructor.h.
     NoDestructor<dbg_index> dbg_storage(cfg.bloom.false_positive_rate,
                                         cfg.bloom.projected_count, cfg.seed);
     dbg_index &dbg = *dbg_storage;
@@ -1025,7 +1004,6 @@ int run_assembly(const asm_config &cfg) {
             fprintf(stderr, "Cannot open output: %s\n", cfg.output.c_str());
             return 1;
         }
-        // print_dbg_seqs(out, dbg);
         layout_graph_emit::emit_ultra_merged_graph(as, dbg, out);
         fclose(out);
     }
@@ -1040,6 +1018,7 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
         node.second.seq.emplace_back();
     }
 }
+
 
 TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
     using SYNCMER_HASHER = syncmer::MurMur;
@@ -1341,11 +1320,6 @@ TEST_CASE(
 }
 
 // ── Characterization tests: layout_graph_emit core algorithms ──────────
-// These pin down the observable behavior of the seed-chain DAG pipeline
-// (build_scd_graph → find_heaviest_paths → collect_path_sequences) so the
-// planned complexity/quality refactors (docs/layout-graph-plan.md) can be
-// proven behavior-preserving. They exercise the pure struct-based functions
-// in isolation, without the assembler.
 TEST_CASE("layout_graph_emit::build_scd_graph merges shared cores") {
     using namespace layout_graph_emit;
 
@@ -1461,15 +1435,14 @@ TEST_CASE("layout_graph_emit::collect_path_sequences concatenates with gaps") {
         CHECK_EQ(comps[0][1].len, 4u);
     }
 
-    SUBCASE("two components stay separate — never gap-joined (R7)") {
+    SUBCASE("two components stay separate — never gap-joined") {
         gtl::vector<comp_path> paths;
         paths.push_back({0, 100, 2, gtl::vector<uint32_t>{0u, 1u}});
         paths.push_back({200, 300, 1, gtl::vector<uint32_t>{2u}});
 
         auto comps = collect_path_sequences(paths, node_contigs,
                                             contig_core_seqs, 3);
-        // Two independent groups, emitted as two contigs. No sentinel, no
-        // fabricated adjacency between disconnected components.
+        // Two independent groups emit as two separate contigs.
         REQUIRE_EQ(comps.size(), 2u);
         REQUIRE_EQ(comps[0].size(), 2u);
         CHECK_EQ(comps[0][0].len, 4u);
@@ -1481,10 +1454,9 @@ TEST_CASE("layout_graph_emit::collect_path_sequences concatenates with gaps") {
                 CHECK(s.len > 0);  // no zero-length gap sentinels remain
     }
 
-    SUBCASE("fallback picks longest representative, not arbitrary first (C12)") {
-        // A single-node path whose node has two candidate contigs and no
-        // continuity hint. The fallback must pick the longer core sequence
-        // (contig 3, len 6), not the first-listed one (contig 5, len 2).
+    SUBCASE("fallback picks longest representative, not arbitrary first") {
+        // Node has two candidate contigs (5 len 2 first-listed, 3 len 6);
+        // the fallback picks the longer one.
         gtl::vector<gtl::vector<std::pair<size_t, size_t>>> nc(1);
         nc[0] = {{5, 0}, {3, 0}};  // first-listed (5) is the SHORT one
 
@@ -1508,8 +1480,8 @@ TEST_CASE("layout_graph_emit::resolve_overlapping_components drops duplicates") 
         return comp_path{from, to, w, gtl::vector<uint32_t>{}};
     };
 
-    SUBCASE("nested lighter component dropped, heavier kept (M79 class)") {
-        // Real M79 spans: comp0 [0,86] w153 fully contains comp1 [1,15] w17.
+    SUBCASE("nested lighter component dropped, heavier kept") {
+        // comp0 [0,86] w153 fully contains comp1 [1,15] w17.
         gtl::vector<comp_path> cps{P(0, 86, 153), P(1, 15, 17)};
         resolve_overlapping_components(cps);
         REQUIRE_EQ(cps.size(), 1u);
@@ -1518,8 +1490,7 @@ TEST_CASE("layout_graph_emit::resolve_overlapping_components drops duplicates") 
     }
 
     SUBCASE("disjoint components both kept (no-op on the pre-sorted input)") {
-        // find_heaviest_paths sorts by layout_from before calling this; the
-        // no-drop path preserves that order.
+        // Pre-sorted by layout_from; order preserved.
         gtl::vector<comp_path> cps{P(0, 100, 2), P(200, 300, 1)};
         resolve_overlapping_components(cps);
         REQUIRE_EQ(cps.size(), 2u);
@@ -1608,15 +1579,12 @@ TEST_CASE("layout_graph_emit::PostLayoutCleaning::cut_tips peels short tips") {
 }
 
 TEST_CASE("layout_graph_emit::find_heaviest_paths emits only the connected "
-          "heaviest chain, never a disconnected prefix (R1)") {
+          "heaviest chain, never a disconnected prefix") {
     using namespace layout_graph_emit;
 
-    // Main heaviest path A(0)→B(1)→C(2). An earlier source D(3) branches to a
-    // heavy dead-end E(4) and also to A. Under the old span-extension heuristics
-    // (C13) a greedy backward walk from D could try to splice D/E onto the front;
-    // R1 removed all extensions, so the result is purely the virtual-source→sink
-    // heaviest path — the connected chain [0,1,2]. D(3) and E(4) are never
-    // prepended because they are not on that traceback.
+    // Main heaviest path A(0)→B(1)→C(2). Source D(3) branches to a heavy
+    // dead-end E(4) and to A. The result is the connected chain [0,1,2];
+    // D and E are not prepended.
     gtl::vector<lane_node> nodes(5);
     nodes[0] = {0, 10, 20, true, nullptr};  // A
     nodes[1] = {1, 20, 30, true, nullptr};  // B
@@ -1644,9 +1612,7 @@ TEST_CASE("layout_graph_emit::find_heaviest_paths emits only the connected "
 
     auto paths = find_heaviest_paths(scd, scd_fwd, nodes, /*layout_idx*/ 0);
 
-    // The result must be exactly the connected chain [0,1,2] — D(3),E(4) are
-    // NOT prepended, since with extensions removed the emitted path is just the
-    // heaviest edge-connected traceback (0→1 and 1→2 are the only edges here).
+    // Result is exactly the connected chain [0,1,2]; D(3),E(4) not prepended.
     REQUIRE_EQ(paths.size(), 1u);
     REQUIRE_EQ(paths[0].path.size(), 3u);
     CHECK_EQ(paths[0].path[0], 0u);
@@ -1655,16 +1621,12 @@ TEST_CASE("layout_graph_emit::find_heaviest_paths emits only the connected "
 }
 
 TEST_CASE("layout_graph_emit::find_heaviest_paths does not forward-extend to a "
-          "wider-span lighter sink (R1)") {
+          "wider-span lighter sink") {
     using namespace layout_graph_emit;
 
-    // Heaviest chain A(0)→B(1)→C(2) (C is heavy). B also branches to D(3), a
-    // sink whose `to` (50) is wider than the whole main path (max_to 30) but
-    // whose path weight is lower. The OLD forward extension spliced D on after
-    // B — emitting [0,1,2,3] to grab the extra span. R1 removed extensions, so
-    // the result is exactly the heaviest edge-connected chain [0,1,2]; the
-    // wider-but-lighter D is dropped. This is the behavior R1 deliberately
-    // changes (verify with QUAST that dropping such span does not regress).
+    // Heaviest chain A(0)→B(1)→C(2). B also branches to D(3), whose `to` (50)
+    // is wider than the main path (max_to 30) but lighter. Result is [0,1,2];
+    // the wider-but-lighter D is dropped.
     gtl::vector<lane_node> nodes(4);
     nodes[0] = {0, 0, 10, true, nullptr};   // A
     nodes[1] = {1, 10, 20, true, nullptr};  // B
@@ -1697,7 +1659,7 @@ TEST_CASE("layout_graph_emit::find_heaviest_paths does not forward-extend to a "
     CHECK_EQ(paths[0].total_weight, 4);
 }
 
-TEST_CASE("layout_graph_emit::resolve_layout_orientations policies (C10)") {
+TEST_CASE("layout_graph_emit::resolve_layout_orientations policies") {
     using namespace layout_graph_emit;
     using layout_graph_algo::layout_result_t;
 
@@ -1751,7 +1713,7 @@ TEST_CASE("layout_graph_emit::resolve_layout_orientations policies (C10)") {
 }
 
 TEST_CASE("layout_graph_emit::find_contained_cnodes keeps standalone/circular "
-          "components (C3)") {
+          "components") {
     using namespace layout_graph_emit;
 
     // Component zoo (expected outcome):
@@ -1797,20 +1759,17 @@ TEST_CASE("layout_graph_emit::find_contained_cnodes keeps standalone/circular "
     CHECK(candidate_set.size() == 6);  // all active non-layout nodes
     CHECK(contained.size() == 1);
     CHECK(contained.contains(30));   // only the interior-adjacent component
-    CHECK(!contained.contains(10));  // isolated: kept (was dropped pre-C3-fix)
-    CHECK(!contained.contains(20));  // closed circular pair: kept (was dropped)
+    CHECK(!contained.contains(10));  // isolated: kept
+    CHECK(!contained.contains(20));  // closed circular pair: kept
     CHECK(!contained.contains(21));
     CHECK(!contained.contains(40));  // boundary-adjacent: kept
     CHECK(!contained.contains(50));  // non-layout-adjacent: kept
 }
 
-TEST_CASE("GraphCleaning::simplify_simple_paths terminates on self-loops (C1b)"
+TEST_CASE("GraphCleaning::simplify_simple_paths terminates on self-loops"
           * doctest::timeout(10)) {
-    // A self-loop node with fec==1 used to send the backward walk into an
-    // infinite merge-itself loop (worker spun inside
-    // attempt_simplify_one_path_lockless growing `merged`; main parked in
-    // join). The walk must now skip self steps, and the post-sweep redirect
-    // rewrite must drop self-references.
+    // A self-loop node with fec==1 must not hang the backward walk: the walk
+    // skips self steps and the redirect rewrite drops self-references.
     dbg_index dbgi(0.001, 1024, 7);
     auto add_node = [&](u64 id, std::initializer_list<u64> prevs,
                         unsigned fec) {
@@ -1843,13 +1802,10 @@ TEST_CASE("GraphCleaning::simplify_simple_paths terminates on self-loops (C1b)"
 }
 
 TEST_CASE("GraphCleaning::simplify_simple_paths leaves degenerate boundary "
-          "seeds untouched (C1)") {
-    // Configuration: boundary node S (fec=2, prev={T}, T.fec=2) is a type-1
-    // seed whose backward walk is degenerate (merges nothing), while a
-    // reader chain stops at S. The degenerate path must be a pure no-op:
-    // mutating S would race the reader chain's stop-condition read of S.fec
-    // (see CONFIRMATION_C1.md). Under a TSan build this doubles as the race
-    // regression test (pre-fix it reports graph.h read/write on S.fec).
+          "seeds untouched") {
+    // Boundary node S (fec=2, prev={T}, T.fec=2) is a type-1 seed whose
+    // backward walk is degenerate (merges nothing) while a reader chain stops
+    // at S. The degenerate path is a pure no-op: S is left untouched.
     dbg_index dbgi(0.001, 1024, 42);
     auto add_node = [&](u64 id, std::initializer_list<u64> prevs,
                         unsigned fec) {
@@ -1897,13 +1853,12 @@ TEST_CASE("GraphCleaning::simplify_simple_paths leaves degenerate boundary "
     CHECK(redirect_deleted.find(109)->second == 101);
 }
 
-// ── Fix 9: MinCode syncmer rule arithmetic ──────────────────────────────
-// Uses the Identity hash so the "minimum-hash" submer is just the minimum
-// integer submer, making expected results hand-computable. k=4, s=2 ⇒ three
-// 2-base (4-bit, mask 0xF) windows at bit offsets 0,2,4. For a k-mer `val`:
+// ── MinCode syncmer rule arithmetic ──────────────────────────────────────
+// Identity hash ⇒ min-hash submer is the min integer submer. k=4, s=2 ⇒
+// three 2-base (mask 0xF) windows at bit offsets 0,2,4. For a k-mer `val`:
 //   w0 = val & 0xF,  w1 = (val>>2) & 0xF,  w2 = (val>>4) & 0xF
-// min_index = argmin(w0,w1,w2) (first on ties). Closed ⇒ min_index in {0, k-s=2};
-// Open(t) ⇒ min_index == t.
+// min_index = argmin(w0,w1,w2) (first on ties). Closed ⇒ min_index in
+// {0, k-s=2}; Open(t) ⇒ min_index == t.
 TEST_CASE("Syncmer rule (closed/open): s-mer window arithmetic") {
     using Rule = syncmer::GenericSubmerRule<uint32_t, syncmer::Identity>;
 
@@ -1949,9 +1904,9 @@ TEST_CASE("Syncmer rule (closed/open): s-mer window arithmetic") {
     }
 }
 
-// --canonical: applying the rule to min(kmer, reverse-complement) must make a
-// k-mer and its reverse complement always agree, and the flag must actually
-// change behavior vs the default (directional) rule.
+// --canonical applies the rule to min(kmer, rc), so a k-mer and its reverse
+// complement always agree; the flag must change behavior vs the directional
+// default.
 TEST_CASE("Strand-canonical selection co-selects a k-mer and its rev-comp") {
     using Rule = syncmer::GenericSubmerRule<uint32_t, syncmer::MurMur>;
     const int k = 8;
@@ -2107,16 +2062,12 @@ TEST_CASE("Syncmer validation uses effective k after compaction") {
         REQUIRE(ek3.has_value());
         CHECK(*ek3 == 5);
         p.smer.s = 4;
-        CHECK(p.validate().has_value());  // s=4 < 5 (old check used k)
+        CHECK(p.validate().has_value());  // s=4 < 5
     }
 }
 
-// ── Fix 10: bloom projected_count widening (H13) ────────────────────────
-// A human-scale projected count (n > INT32_MAX) previously narrowed to a
-// negative int, so ComputeNumBits produced a negative-then-wrapped bit count
-// and make_unique threw bad_alloc — the filter could not even be constructed.
-// With int64_t n it constructs cleanly and sizes correctly. A high eps keeps
-// the test allocation to a few MB while still exercising the >INT32_MAX path.
+// ── bloom projected_count widening ───────────────────────────────────────
+// n > INT32_MAX must survive as int64_t, not narrow to a negative int.
 TEST_CASE("BlockedAtomicBloomFilter handles n > INT32_MAX without narrowing") {
     const int64_t n = 3'000'000'000LL;  // > INT32_MAX (2.147e9)
     bloom_ext::BlockedAtomicBloomFilter<> bf(n, 0.99f);  // eps→small m (~8 MB)
@@ -2125,8 +2076,7 @@ TEST_CASE("BlockedAtomicBloomFilter handles n > INT32_MAX without narrowing") {
     CHECK(bf.num_words > 0);
 }
 
-// The clamp keeps a pathological n from requesting a petabyte allocation or
-// tripping the double->uint64 cast; ComputeNumBits saturates at the ceiling.
+// ComputeNumBits saturates a pathological n at the ceiling.
 TEST_CASE("BlockedAtomicBloomFilter clamps an absurd projected count") {
     bloom_ext::BlockedAtomicBloomFilter<> bf(1, 0.99f);
     bf.n = 1'000'000'000'000'000LL;  // 1e15

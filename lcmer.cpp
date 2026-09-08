@@ -182,8 +182,8 @@ void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len,
         __m128i lo = _mm_shuffle_epi8(tbl, _mm_and_si128(v, mask));
         __m128i hi = _mm_shuffle_epi8(tbl,
             _mm_and_si128(_mm_srli_epi16(v, 4), mask));
-        // Interleave: lo nibble (complement) first, then hi nibble (complement)
-        // Note: reverse order (lo, hi) because we're complementing
+        // Interleave lo nibble first, then hi nibble (reversed order for the
+        // complement).
         __m128i interleaved_lo = _mm_unpacklo_epi8(lo, hi);
         __m128i interleaved_hi = _mm_unpackhi_epi8(lo, hi);
         // Reverse both 16-byte vectors
@@ -404,10 +404,8 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
 
         lcp_read lr2;
         init_lps_crumbled(&str2, ss, fnctr);
-        // Deepen to the SAME level as the BAM path (parse_cores_from_bam_record
-        // deepens internally): comparing different levels is meaningless —
-        // deeper levels merge more cores. (The pre-fix version compared
-        // level 3 vs level 2 counts only: 167 vs 386.)
+        // Deepen to the same level as the BAM path (parse_cores_from_bam_record
+        // deepens internally); comparing different levels is meaningless.
         lps_deepen(&str2, LCP_LEVEL);
         for (int i = 0; i < str2.size; ++i) {
             lr2.cores.emplace_back(str2.cores[i].label);
@@ -431,9 +429,6 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
 }
 
 TEST_CASE("BAM and crumbled parsers agree on homopolymer-rich sequence") {
-    // Homopolymer runs stress the RLE windowing and the si/ei span
-    // convention: windows ending inside multi-base runs are exactly where
-    // the old convention slid the span past the real k-mer.
     std::string bases;
     {
         const char *runs[] = {"AAAAAAA",  "CC",     "GGGGGGGGGG", "T",

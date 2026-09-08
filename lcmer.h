@@ -441,9 +441,7 @@ struct KmerViewOnCrumbs64 {
         int_type it = move_get_rle(data_words, skip_first_n, cap);
         // k-1 more insertions (k total incl. the initial one), so the first
         // window checked by the caller is runs[0..k-1] — the same window
-        // parse1_bam_syncmers checks first. (Was i < k, which inserted k+1
-        // values and silently skipped the first window; see the parser
-        // comparison test in lcmer.cpp.)
+        // parse1_bam_syncmers checks first.
         for (i = 0; i < k - 1 && it < cap; i++) {
             it = move_get_rle(data_words, it, cap);
         }
@@ -656,18 +654,11 @@ inline int64_t rle_compact(const uint8_t *data, int64_t len, uint8_t *rle_data,
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 // Binary reduction: compact 16 one-hot bytes into contiguous packed output.
-//
-// Each input byte is either 0 (dead/unchanged) or (lane_idx << 4) |
-// one_hot_value. One-hot values {1,2,4,8} fit in the low nibble; lane index
-// 0-15 in the high nibble.
-//
-// The reduction merges adjacent pairs in 3 rounds (16→8→4→2), packing kept
-// bytes contiguously using widen + variable-shift + OR. Because one-hot values
-// occupy distinct bit positions within their nibble, OR never causes collision.
-//
-// After 3 rounds: two uint64 values, each holding up to 8 packed bytes from the
-// LSB. Unpack: extract index (>>4) and value (&0xF), decode one-hot→2-bit,
-// store via NEON.
+// Each byte is 0 (unchanged) or (lane_idx << 4) | one_hot_value, one-hot
+// {1,2,4,8} in the low nibble, lane 0-15 in the high nibble. Merge adjacent
+// pairs in 3 rounds (16→8→4→2) via widen + variable-shift + OR, yielding two
+// uint64 of up to 8 packed bytes each; unpack index (>>4) and value (&0xF),
+// decode one-hot→2-bit, store via NEON.
 static inline int compact16_emit(
     uint8x16_t data_vec,             // 16 one-hot bytes (BAM nibble values)
     uint8x16_t neq_vec,              // 0xFF where changed, 0x00 where same
@@ -758,9 +749,8 @@ static inline int compact16_emit(
     return n_total;
 }
 #elif defined(__SSSE3__)
-// SSE version: use movemask to get a bitmask of changed lanes, then scalar
-// extract loop with table-lookup decode. Simpler and faster than the NEON
-// binary-reduction approach on x86.
+// SSE version: movemask to get a bitmask of changed lanes, then a scalar
+// extract loop with table-lookup decode.
 static inline int compact16_emit_sse(
     __m128i data_vec,           // 16 one-hot bytes (BAM nibble values)
     __m128i neq_vec,            // 0xFF where changed, 0x00 where same
@@ -1048,10 +1038,7 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *rle_data,
         if (syncmer_functor(value)) {
             // True span of the RLE-space k-mer (runs [i-k, i-1]) in original
             // base coordinates: start of the window's first run up to the
-            // start of the next run (= one past the window's last base). The
-            // previous convention ([start-of-last-run + 1, +k)) slid the span
-            // past the real k-mer whenever the window ended in a multi-base
-            // homopolymer run ("TODO fix si, ei").
+            // start of the next run (= one past the window's last base).
             const uint32_t si = rle_pos[i - k];
             const uint32_t ei =
                 (i < rle_len) ? rle_pos[i] : static_cast<uint32_t>(seq_len);
@@ -1083,11 +1070,9 @@ inline uint64_t parse1_CrumbledSubSeqs_syncmers(
         return 0;
     }
     // Materialize the RLE stream of the concatenated fragments in original
-    // (l_so_far) coordinates, then window it with the exact same code as the
-    // BAM path so the two parsers can never diverge again (this fixes the
-    // first-window off-by-one and the si/ei drift the old streaming kmer-view
-    // had). A run is NOT restarted when the next fragment begins with the
-    // run's base — the same boundary carry-over the old kmer-view had.
+    // (l_so_far) coordinates, then window it with the same code as the BAM
+    // path. A run is NOT restarted when the next fragment begins with the
+    // run's base.
     size_t total_len = 0;
     for (const auto &s : sseqs) total_len += s.len;
     gtl::vector<uint8_t> rle_data;
@@ -1118,9 +1103,6 @@ inline uint64_t parse1_CrumbledSubSeqs_syncmers(
 
 uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores);
 
-/// @brief Initializes an lps struct with a given sequence in the bam compressed
-// void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len);
-//
 inline void prepare_lps(lps *lps_ptr, size_t len) {
     lps_ptr->level = 1;
     const size_t needed = (size_t)(len / CONSTANT_FACTOR);

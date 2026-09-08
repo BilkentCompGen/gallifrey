@@ -11,11 +11,10 @@
 #include <optional>
 #include <string>
 #include <vector>
-// Submer selection parameters (terminology per Edgar 2021, "Syncmers are more
-// sensitive than minimizers…"). A "submer" is a k-mer selected by a submer
-// rule. The rules here are: a mincode submer (density-based: select if the
-// hashed code < H/c), and syncmers (select by the position of the smallest
-// s-mer µ(κ,s) — closed = first or last s-mer, open = the s-mer at offset t).
+// Submer selection parameters. A submer is a k-mer selected by a rule:
+// a mincode submer (select if the hashed code < H/c), or a syncmer
+// (select by the position of the smallest s-mer: closed = first or last
+// s-mer, open = the s-mer at offset t).
 struct syncmer_params {
     enum class typeenum { MincodeSubmer, OpenSyncmer, ClosedSyncmer, Invalid };
     constexpr typeenum type() const {
@@ -40,14 +39,13 @@ struct syncmer_params {
         std::optional<unsigned long> t;
     } smer;
     // Apply the rule to the strand-canonical k-mer (min of the k-mer and its
-    // reverse complement) so a k-mer and its reverse complement are always
-    // co-selected. Opt-in; default off preserves the directional behavior.
+    // reverse complement) so a k-mer and its reverse complement are co-selected.
     bool canonical = false;
     std::string spaced_seed_mask = "11111111111111111111111111111111";
 
     // Validating mask builder: returns the packed mask or an error message.
-    // This is the single source of truth for mask parsing; the total
-    // compute_spaced_mask() below delegates here.
+    // Single source of truth for mask parsing; compute_spaced_mask() delegates
+    // here.
     std::expected<uint64_t, std::string> compute_spaced_mask_checked() const {
         if (spaced_seed_mask.size() > 32) {
             return std::unexpected(
@@ -78,9 +76,8 @@ struct syncmer_params {
         return acc;
     }
 
-    // Total accessor for the hot construction paths (member-init lists). The
-    // config is validated once up front via validate(); reaching the error
-    // branch here means that contract was broken.
+    // Total accessor for member-init lists. The config is validated up front
+    // via validate(); the error branch here means that contract was broken.
     uint64_t compute_spaced_mask() const {
         auto r = compute_spaced_mask_checked();
         if (!r) {
@@ -113,8 +110,7 @@ struct syncmer_params {
     }
 
     // Validate the whole syncmer configuration once, before any syncmer
-    // functor is constructed. Lets callers surface a clean error instead of
-    // exit()-ing from deep inside a constructor.
+    // functor is constructed, so callers can surface a clean error.
     std::expected<void, std::string> validate() const {
         if (type() == typeenum::Invalid) {
             return std::unexpected(
@@ -131,11 +127,9 @@ struct syncmer_params {
                 "--spaced-seed-mask removes every k-mer position (effective "
                 "k = 0)");
         }
-        // Cross-field numeric checks: reject configurations that select no
-        // k-mers or index an s-window out of the (compacted) k-mer before any
-        // functor is constructed (a per-option CLI::Range can't express these
-        // relations). s/t bounds are against the EFFECTIVE k: masked positions
-        // are non-existent in the selection computation.
+        // Cross-field numeric checks: reject configs that select no k-mers or
+        // index an s-window out of the compacted k-mer. s/t bounds are against
+        // the effective k (masked positions do not exist in the selection).
         if (density.has_value() && *density == 0.0) {
             return std::unexpected(std::string(
                 "--density must be > 0 (0 selects no k-mers -> empty "
@@ -211,24 +205,6 @@ struct asm_config {
         double min_bubble_depth_difference_percentage = 2;
         bool enable_loop_opening = false;
     } graph_cleaning;
-    struct {
-        // M-contig bridging through C nodes (see
-        // docs/contiguity-and-spaced-seed-plan.md, Task 1). 0 = off,
-        // 1 = thread (topology: unique through-path only),
-        // 2 = reads (topology + spanning-read evidence).
-        int mode = 0;
-        // Minimum EC (supporting DBG edges) on each bridge superedge.
-        size_t min_edge_support = 1;
-        // Max total superedges on the C node: exact 2 in mode 1; looser cap
-        // in mode 2 where read evidence arbitrates the tangle.
-        int max_c_degree = 2;
-        int max_c_degree_reads = 6;
-        // Reads that must span both junction anchors (mode 2).
-        int min_read_support = 2;
-        // Chaining iterations (M-C-M-C-... merges become possible after a
-        // merge rewires the supernode graph).
-        int max_passes = 4;
-    } bridge;
 
     void print_cfg(FILE *f) const {
         if (!inputs.empty()) {

@@ -147,8 +147,7 @@ struct GenericSubmerRule {
         return c;
     }
     // Gather the kept 2-bit fields of v (ascending field order) into a dense
-    // k_eff-mer. Identity when no position is removed, so masks without '0'
-    // reproduce the previous AND-mask behavior bit-for-bit.
+    // k_eff-mer. Identity when no position is removed.
     constexpr int_type compact(int_type v) const {
         if (keep_mask == ((1ULL << k()) - 1ULL)) return v;
         int_type out = 0;
@@ -193,21 +192,19 @@ struct GenericSubmerRule {
         }
     }
     // Strand-canonical selection (opt-in): apply the rule to min(κ, rc(κ)) so a
-    // k-mer and its reverse complement are always co-selected. Default off ⇒
-    // the raw forward value is used (unchanged behavior). The query value is
-    // bit-masked and compacted into LuT space; with no '0' mask chars this is
-    // `table[val & k_mask]`, bit-identical to the pre-compaction behavior.
+    // k-mer and its reverse complement are co-selected. Default off ⇒ the raw
+    // forward value is used. The query value is bit-masked and compacted into
+    // LuT space; with no '0' mask chars this is `table[val & k_mask]`.
     constexpr bool operator()(int_type val) const {
         if (canonical) {
             val = std::min(val, reverse_complement_kmer<int_type>(val, k()));
         }
         return table[compact(val & k_mask)];
     }
-    // µ(κ,s) = smallest s-mer (first on ties). Closed syncmer: µ at the first or
-    // last s-mer; open syncmer: µ at offset t. Mincode submer: hashed code < H/c.
-    // `val` is the COMPACTED k_eff-mer (masked positions already removed by
-    // compact()), so window indices and t live in compacted space: there are
-    // k_eff-s+1 s-mer windows; window i starts at compacted base i (bit 2*i).
+    // µ(κ,s) = smallest s-mer (first on ties). Closed syncmer: µ at the first
+    // or last s-mer; open syncmer: µ at offset t. Mincode submer: hashed
+    // code < H/c. `val` is the COMPACTED k_eff-mer, so window indices and t
+    // live in compacted space: k_eff-s+1 windows, window i at bit 2*i.
     constexpr bool is_submer(int_type val) const {
         switch (type()) {
             case syncmer_params::typeenum::ClosedSyncmer:  // Intentional

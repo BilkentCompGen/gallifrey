@@ -24,7 +24,6 @@ enum class SamReadTestingMode {
 
 inline int run_sam_read_testing(const std::string &input, int threads, int lcp_level, SamReadTestingMode mode, const std::string &job_type, double density){
     INIT_TIMERS(BAM_READING);
-    //Explain the program nicely formatted brief
     printf("Input: %s\n", input.c_str());
     printf("Threads: %d\n", threads);
     printf("LCP level: %d\n", lcp_level);
@@ -78,17 +77,15 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     moodycamel::ConcurrentQueue<bam1_t *> recycle_queue {1024, 1, static_cast<size_t>(threads)};
     gtl::vector<std::thread> workers;
     std::atomic<bool> done{false};
-    // One slot per worker; sized by the (CLI-clamped) thread count instead of a
-    // fixed 1024 so a large -t can never index out of bounds.
+    // One slot per worker, sized by the thread count.
     std::vector<int> counts(threads, 0);
-    // Use the same rule the assembly pipeline uses (GenericSubmerRule) so the
-    // diagnostic counts measure what production computes (H8).
+    // Same rule the assembly pipeline uses (GenericSubmerRule).
     syncmer_params sr_params;
     sr_params.k = 8;
     sr_params.density = density;
     syncmer::GenericSubmerRule<uint32_t, syncmer::MurMur> sr{sr_params, 423};
-    // Per-worker scratch (charsi/pos_scratch) is passed in as arguments rather
-    // than captured, so the single shared `job` closure stays race-free.
+    // Per-worker scratch (charsi/pos_scratch) is passed as arguments, not
+    // captured, so the shared job closure stays race-free.
     auto job = [&]() -> std::function<int(bam1_t *, lps *, charsi &, pos_scratch &)> {
         if (job_type == "read_count"){
             return [](bam1_t *, lps *, charsi &, pos_scratch &) -> int {
@@ -124,9 +121,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
                     continue;
                 }
                 counts[i] += job(bamdata, &str, chs, pos_buf);
-                // Hand the buffer back for the producer to refill. Only the
-                // producer reads into it, and only after it has been recycled,
-                // so no worker is still touching it.
+                // Hand the buffer back for the producer to refill.
                 if(!recycle_queue.try_enqueue(bamdata)){
                     bam_destroy1(bamdata);
                 }
@@ -137,9 +132,8 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
         });
     }
 
-    // Fill `bamdata`, hand it off to a worker, then obtain the *next* buffer
-    // from the recycle queue (or allocate one). This is the correct direction:
-    // the producer never reuses a record a worker may still be reading (H3).
+    // Fill bamdata, hand it to a worker, then take the next buffer from the
+    // recycle queue (or allocate one).
     while(sam_read1(fp, hdr, bamdata) >= 0){
         while(!data_queue.try_enqueue(bamdata)){
             std::this_thread::sleep_for(std::chrono::nanoseconds(100));
@@ -156,10 +150,8 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     for(int i = 0; i < threads; ++i){
         count += counts[i];
     }
-    // Reclaim every buffer. After the joins no worker is running: data_queue is
-    // drained by the workers (loop condition keeps them going until empty), but
-    // destroy any straggler defensively; recycle_queue holds the buffers handed
-    // back; `bamdata` is the spare read buffer left over at EOF.
+    // Reclaim every buffer after the joins: drain data_queue and
+    // recycle_queue, then destroy the spare bamdata read buffer.
     bam1_t *item;
     while(data_queue.try_dequeue(item)){
         bam_destroy1(item);

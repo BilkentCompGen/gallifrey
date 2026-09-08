@@ -93,9 +93,8 @@ template <int BLOCK_BYTES = hardware_constructive_interference_size>
 struct BlockedBloomFilter {
     static constexpr int block_bytes = BLOCK_BYTES;
     static constexpr int block_bits = block_bytes * 8;
-    // Storage word only -- every access goes through the byte pointer handed
-    // out by GetBlock(), so this type just sizes and aligns the allocation.
-    // Matches the sibling filters below (no 128-bit extension type needed).
+    // Storage word only: every access goes through the byte pointer from
+    // GetBlock(), so this type just sizes and aligns the allocation.
     using block_type = unsigned long long;
     static_assert(block_bytes % sizeof(block_type) == 0,
                   "block must be a whole number of storage words");
@@ -237,13 +236,10 @@ struct BlockedLockedBloomFilter {
     std::unique_ptr<mutex_type[]> locks;
 };
 // Lock-free blocked Bloom filter. Same block geometry and sizing as
-// BlockedLockedBloomFilter, but the bit array is a flat array of atomic words:
-// Insert uses fetch_or, Query uses load (both relaxed -- nothing is published
-// *through* the filter, so no cross-location ordering is required). This removes
-// the data race between an unlocked Query and a locked Insert (RC_REVIEW.md RC2)
-// without a per-block mutex array (which, at one mutex per block, is as large as
-// the filter itself). atomic<block_type> is the same 8 bytes as the plain word,
-// so the bit vector costs the same and the lock array disappears entirely.
+// BlockedLockedBloomFilter, but the bit array is a flat array of atomic
+// words: Insert uses fetch_or, Query uses load (both relaxed; nothing is
+// published through the filter). No per-block mutex array is needed;
+// atomic<block_type> is the same 8 bytes as the plain word.
 template <int BLOCK_BYTES = hardware_constructive_interference_size>
 struct BlockedAtomicBloomFilter {
     static constexpr int block_bytes = BLOCK_BYTES;
@@ -270,10 +266,9 @@ struct BlockedAtomicBloomFilter {
     }
 
     uint64_t ComputeNumBits() {
-        // Keep the log math in double, then clamp so a very large n neither
-        // overflows the double->uint64 cast (UB) nor requests an absurd
-        // allocation. Ceiling ~1e13 bits ≈ 1.25 TB — far above any real run
-        // (n=1e10 @ eps=1e-3 ⇒ ~18 GB).
+        // Keep the log math in double, then clamp: a very large n must not
+        // overflow the double->uint64 cast (UB) nor request an absurd
+        // allocation. Ceiling ~1e13 bits.
         double bits = -1.44 * static_cast<double>(n) * std::log2(epsilon) + 0.5;
         if (bits < 1.0) bits = 1.0;
         constexpr double kMaxBits = 1e13;

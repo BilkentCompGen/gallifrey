@@ -3,9 +3,8 @@
 
 #include <cstdint>
 
-// Low-level 2-bit-packed k-mer bit tricks with no project/htslib dependencies,
-// so both nibble2base.hpp and syncmer.h can share them without an include cycle
-// (the project include graph is lcmer.h -> syncmer.h).
+// Low-level 2-bit-packed k-mer bit tricks with no project/htslib
+// dependencies, shareable by nibble2base.hpp and syncmer.h.
 
 // https://github.com/ruanjue/wtdbg2/blob/b77c5657c8095412317e4a20fe3668f5bde6b1ac/dna.h#L108
 template <class T>

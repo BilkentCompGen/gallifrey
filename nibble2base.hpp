@@ -107,7 +107,6 @@ inline void onehotto2bitDNA_vector(const uint8_t *__restrict data, size_t len,
     }
 #endif
 }
-// Uses naive conversions for now can be optimized later if necessary
 struct CrumbledSubSeq {
     size_t len : 62;
     uint8_t skip_first_n : 2;
