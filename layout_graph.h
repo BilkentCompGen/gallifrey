@@ -751,10 +751,10 @@ build_layout_sequence_from_nodes(
     auto result = collect_path_sequences(
         comp_paths, node_contigs, contig_core_seqs, scd.size());
 
+
     free_lps(&lps_buf);
     return result;
 }
-
 // One SCD component's sequences …
 using layout_comp_seqs_t = gtl::vector<SequenceContainerType>;
 // … and all components of one layout (emitted as separate contigs).
@@ -1360,7 +1360,7 @@ inline void write_gfa(const supernode_vec &supernodes,
 template <class AssemblerT>
 inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     INIT_TIMERS(LayoutEmit);
-    auto [recig, layouts] = as.fold_dbg_graph(dbg);
+    auto [recig, layouts, dropped_crumbs] = as.fold_dbg_graph(dbg);
     TIME_CHECKPOINT(LayoutEmit, stderr, "fold_dbg_graph (%zu layouts)",
                     layouts.size());
 
@@ -1397,10 +1397,9 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         const auto &job = layout_jobs[i];
         auto &comps = layout_seqs[i];
         if (comps.empty()) continue;
-        // One contig per SCD component: components are disconnected in the
-        // seed-chain DAG, so no adjacency between them may be asserted (R7).
-        // The first component keeps the plain "M<idx>" name; any further
-        // component gets an "_<c>" suffix to keep GFA segment names unique.
+        // One contig per SCD component. The first keeps the plain "M<idx>"
+        // name; any further component gets an "_<c>" suffix for a unique GFA
+        // segment name.
         const u64 primary_sid = supernodes.size();
         for (size_t c = 0; c < comps.size(); ++c) {
             std::string name = "M" + std::to_string(job.layout_idx);
@@ -1423,6 +1422,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
                               node_layout_ori, candidate_set);
     for (u64 node_id : candidate_set) {
         if (contained_nodes.contains(node_id)) continue;
+        if (dropped_crumbs.contains(node_id)) continue;
         auto it = dbg.dbg.find(node_id);
         if (it == dbg.dbg.end()) continue;
         const u64 sid = supernodes.size();

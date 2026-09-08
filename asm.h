@@ -193,6 +193,9 @@ struct asm_config {
     syncmer_params syncmer;
     bool print_precleanup_graph = false;
     bool print_prelayout_graph = false;
+    // Drop crumb nodes (fewer than olc_lcmer_l+1 cores) that continue into a
+    // longer node instead of emitting them as C segments.
+    bool drop_crumbs = true;
     bool silent = false;
     struct {
         uint64_t projected_count = 100'000'000;
@@ -230,6 +233,7 @@ struct asm_config {
                 "\n\tFalse Positive "
                 "Rate: %.3f\n",
                 bloom.projected_count, bloom.false_positive_rate);
+        fprintf(f, "Drop Crumbs: %s\n", drop_crumbs ? "true" : "false");
         fprintf(f,
                 "Graph Cleaning Parameters: \n\tIterations: %d\n\tMax Tip "
                 "Length: %d\n\tMin Bubble Length Difference: %.2f\n\tMax "

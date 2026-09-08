@@ -65,6 +65,7 @@ struct assembler {
     int dbg_lcmer_l;
     int olc_lcmer_l;
     bool parallel_file_reading;
+    bool drop_crumbs;
 
     assembler(const asm_config &cfg)
         : inputs{},
@@ -74,19 +75,16 @@ struct assembler {
           bloom{cfg.bloom},
           seed{cfg.seed},
           syncmer_params{cfg.syncmer},
-          // The syncmer hash seed is 32-bit; cfg.seed is size_t only so the
-          // CLI can accept large values. Deliberate truncation — different
-          // seeds may alias mod 2^32, which is acceptable for a hash seed.
+          // syncmer hash seed is 32-bit; truncate cfg.seed (size_t) to fit.
           syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)},
           dbg_lcmer_l{cfg.dbg_lcmer_l},
           olc_lcmer_l{cfg.olc_lcmer_l},
-          parallel_file_reading{cfg.parallel_file_reading} {
+          parallel_file_reading{cfg.parallel_file_reading},
+          drop_crumbs{cfg.drop_crumbs} {
         inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
-        // Overlap detection (fold_dbg_graph → find_lcmer_ranges) queries the
-        // DBG, which is keyed by length-`dbg_lcmer_l` lcmers. The litecmer hash
-        // is window-length dependent, so querying with a different length misses
-        // every key. The two lengths must therefore match for overlaps to be
-        // found; warn loudly rather than silently produce an empty graph.
+        // Overlap detection queries the DBG keyed by length-`dbg_lcmer_l`
+        // lcmers; the litecmer hash is window-length dependent, so olc_lcmer_l
+        // must match dbg_lcmer_l for any key to hit.
         if (olc_lcmer_l != dbg_lcmer_l) {
             fprintf(stderr,
                     "[config] WARNING: --olc-lcmer-l (%d) != --dbg-lcmer-l (%d). "
@@ -881,6 +879,7 @@ struct assembler {
                 }
             }
         }
+
         fprintf(stderr, "all:%d\ngood: %d nodes\nhits: %d\n", all_n.load(),
                 all_n.load() - bad.load(), hits.load());
         fprintf(stderr,
@@ -890,7 +889,77 @@ struct assembler {
                 recip_kept, non_recip);
         auto layouts =
             layout_graph_algo::connected_comp_plus_layout(reciprocal);
-        return std::make_pair(reciprocal, layouts);
+        gtl::flat_hash_set<u64> dropped;
+        if (drop_crumbs) dropped = find_droppable_crumbs(dbgi);
+        return std::make_tuple(std::move(reciprocal), std::move(layouts),
+                               std::move(dropped));
+    }
+
+    // Crumbs: nodes with fewer than olc_lcmer_l+1 cores, too short to form
+    // an lcmer and therefore invisible to overlap detection. A crumb with a
+    // single live predecessor that continues into a longer node is not
+    // emitted as its own C segment. Crumbs that sit between two long nodes
+    // (a hub) or whose only continuation is a collapsed repeat (depth above
+    // 3x the live median) are kept.
+    gtl::flat_hash_set<u64> find_droppable_crumbs(const dbg_index &dbgi) const {
+        const u64 min_cores = static_cast<u64>(olc_lcmer_l + 1);
+        gtl::vector<double> depths;
+        depths.reserve(dbgi.active_set.size());
+        for (u64 nid : dbgi.active_set) {
+            auto nit = dbgi.dbg.find(nid);
+            if (nit == dbgi.dbg.end() || nit->second.redirected() ||
+                nit->second.seq.empty()) {
+                continue;
+            }
+            depths.push_back(nit->second.avg_core_count());
+        }
+        double depth_median = 0.0;
+        if (!depths.empty()) {
+            std::sort(depths.begin(), depths.end());
+            depth_median = 0.5 * (depths[(depths.size() - 1) / 2] +
+                                  depths[depths.size() / 2]);
+        }
+        constexpr double kPileupMaxMult = 3.0;
+        const double pileup_cap = depth_median * kPileupMaxMult;
+        const auto fwds =
+            GraphCleaning::build_live_fwd(dbgi.dbg, dbgi.active_set);
+        auto live = [&](u64 nid) {
+            auto it = dbgi.dbg.find(nid);
+            return (it == dbgi.dbg.end() || it->second.redirected())
+                       ? dbgi.dbg.end()
+                       : it;
+        };
+
+        gtl::flat_hash_set<u64> dropped;
+        for (u64 id : dbgi.active_set) {
+            auto it = live(id);
+            if (it == dbgi.dbg.end()) continue;
+            const auto &node = it->second;
+            const u64 span = static_cast<u64>(node.seq.size());
+            if (span == 0 || span >= min_cores) continue;
+            if (node.prev.size() != 1 || live(node.prev[0]) == dbgi.dbg.end()) {
+                continue;
+            }
+            auto fit = fwds.find(id);
+            if (fit == fwds.end()) continue;
+            u64 long_succs = 0;
+            bool continues = false;
+            for (u64 q : fit->second) {
+                auto qit = live(q);
+                if (qit == dbgi.dbg.end() || qit->second.seq.empty()) continue;
+                if (static_cast<u64>(qit->second.seq.size()) >= min_cores) {
+                    ++long_succs;
+                }
+                if (pileup_cap <= 0.0 ||
+                    qit->second.avg_core_count() <= pileup_cap) {
+                    continues = true;
+                }
+            }
+            if (long_succs >= 2 || !continues) continue;
+            dropped.insert(id);
+        }
+        fprintf(stderr, "[crumbs] dropped %zu crumb nodes\n", dropped.size());
+        return dropped;
     }
 };
 

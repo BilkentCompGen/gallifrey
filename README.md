@@ -114,6 +114,10 @@ Graph cleaning:
 - `--max-bubble-arm-length`: maximum arm length (cores) of a bubble arm to pop; `0` disables bubble popping
 - `--min-bubble-depth-difference-ratio`: pop the shallower arm when its depth ratio to the deeper arm is below this (default 2, i.e. depth is not a gate); `--min-bubble-length-difference`: maximum arm length ratio (default 2)
 
+Layout:
+
+- `--drop-crumbs` / `--keep-crumbs`: drop crumb nodes (too short for overlap detection) that have a single predecessor and continue into a longer node, instead of emitting them as `C` segments (default on; halves the contig count at a small genome-fraction cost)
+
 Output and debugging:
 
 - `--print-raw-dbg`: write the pre-cleaning graph with `.raw.gfa` suffix

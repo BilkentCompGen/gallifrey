@@ -66,6 +66,13 @@ public:
             ->capture_default_str();
         app.add_flag("--silent", cfg.silent, "Do not print progress to stderr")
             ->capture_default_str();
+        app.add_flag("--drop-crumbs,!--keep-crumbs", cfg.drop_crumbs,
+                     "Drop crumb nodes (fewer than olc-lcmer-l+1 cores, so "
+                     "invisible to overlap detection) that have a single "
+                     "predecessor and continue into a longer node, instead of "
+                     "emitting them as C segments. Halves the contig count at "
+                     "a small genome-fraction cost.")
+            ->capture_default_str();
         app.add_option("--spaced-seed-mask", cfg.syncmer.spaced_seed_mask,
                        "Mask for spaced seeding. 0->remove the position from "
                        "selection entirely (effective k = k - #zeros; syncmer "
