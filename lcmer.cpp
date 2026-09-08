@@ -296,32 +296,39 @@ TEST_CASE("Character table on kmerview on bytes") {
     CHECK_EQ(kv::tab['Z'], 4);
 }
 
+#ifndef LASM_TEST_DATA_DIR
+#define LASM_TEST_DATA_DIR "tests"  // set by CMake for lasm_tests
+#endif
+// Single unmapped HiFi read (17.4 kb), no reference sequences in the header.
+[[maybe_unused]] static const char *const kTestSingleBam =
+    LASM_TEST_DATA_DIR "/test_single.bam";
+
 TEST_CASE("BAM Read Parsing") {
-    std::string input = "../tests/test_single.bam";
-    samFile *fp = sam_open(input.c_str(), "r");
-    if (fp == NULL) {
-        FAIL("Failed to open BAM file:", input);
-    }
+    samFile *fp = sam_open(kTestSingleBam, "r");
+    REQUIRE_MESSAGE(fp != NULL, "Failed to open BAM file: ", kTestSingleBam);
 
     bam_hdr_t *hdr = sam_hdr_read(fp);
+    REQUIRE(hdr != NULL);
     bam1_t *rec = bam_init1();
-    if (sam_read1(fp, hdr, rec) <= 0) {
-        FAIL("Failed to read BAM record");
-    }
+    REQUIRE(sam_read1(fp, hdr, rec) > 0);
+    CHECK((rec->core.flag & BAM_FUNMAP) != 0);
+    CHECK_EQ(rec->core.l_qseq, 17430);
 
-    char *seq_gt = (char *)malloc(rec->core.l_qseq + 1);
+    std::string seq_gt(rec->core.l_qseq, '\0');
     for (int i = 0; i < rec->core.l_qseq; ++i) {
         seq_gt[i] = seq_nt16_str[bam_seqi(bam_get_seq(rec), i)];
     }
-    seq_gt[rec->core.l_qseq] = '\0';
+    CHECK_EQ(seq_gt.find_first_not_of("ACGT"), std::string::npos);
+    CHECK_EQ(sam_read1(fp, hdr, rec), -1);  // exactly one record
+
+    bam_destroy1(rec);
+    bam_hdr_destroy(hdr);
+    sam_close(fp);
 }
 
 TEST_CASE("BAM Read Parsing With Crumbs") {
-    std::string input = "../tests/test_single.bam";
-    samFile *fp = sam_open(input.c_str(), "r");
-    if (fp == NULL) {
-        FAIL("Failed to open BAM file:", input);
-    }
+    samFile *fp = sam_open(kTestSingleBam, "r");
+    REQUIRE_MESSAGE(fp != NULL, "Failed to open BAM file: ", kTestSingleBam);
 
     bam_hdr_t *hdr = sam_hdr_read(fp);
     bam1_t *rec = bam_init1();
@@ -623,25 +630,9 @@ TEST_CASE("onehot_to_rle correctness") {
     }
 
     SUBCASE("Real BAM record") {
-        // Try multiple paths for test data
-        const char *paths[] = {
-            "../tests/test_single.bam",
-            "../../data/remth.bam",
-            "../../../data/remth.bam",
-            "/Users/fatihkaraoglanoglu/Workspace/data/remth.bam",
-            nullptr
-        };
-        samFile *fp = nullptr;
-        std::string input;
-        for (int p = 0; paths[p]; ++p) {
-            input = paths[p];
-            fp = sam_open(input.c_str(), "r");
-            if (fp) break;
-        }
-        if (fp == NULL) {
-            MESSAGE("Skipping real BAM test: no test BAM found");
-            return;
-        }
+        samFile *fp = sam_open(kTestSingleBam, "r");
+        REQUIRE_MESSAGE(fp != NULL, "Failed to open BAM file: ",
+                        kTestSingleBam);
         bam_hdr_t *hdr = sam_hdr_read(fp);
         bam1_t *rec = bam_init1();
         int count = 0;

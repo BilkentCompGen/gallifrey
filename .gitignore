@@ -17,3 +17,6 @@ target_compile_features.cmake
 build*/*
 *.idx
 .DS_STORE
+
+# Test fixtures
+!tests/test_single.bam

@@ -131,6 +131,7 @@ target_link_libraries(lasm_tests PRIVATE
                       $<$<PLATFORM_ID:Linux>:rt>)
 target_compile_definitions(lasm_tests PRIVATE
     __STDC_FORMAT_MACROS=1
+    LASM_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests"
 )
 add_test(NAME unit COMMAND lasm_tests)
 
