@@ -54,10 +54,17 @@ cmake --build build-prof -j
 
 ## Input
 
-`lasm hifi` accepts one or more positional HTS (prefer unmapped BAM, FASTX also works) inputs:
+`lasm hifi` accepts one or more read files. Supported formats:
+
+- BAM, CRAM, SAM (unmapped reads are fine; CRAM with mapped reads needs the reference available to htslib)
+- FASTA and FASTQ, plain or gzipped
+
+The format is detected from the file content, so any file name works. Read
+names and quality values are ignored; only sequences are used. Different
+formats can be mixed in one invocation.
 
 ```bash
-lasm hifi <input1.bam> [input2.bam ...] -o output.gfa -l <lcp_level> --density <kmer_density>
+lasm hifi <reads1> [reads2 ...] -o output.gfa -l <lcp_level> --density <kmer_density>
 ```
 
 ## Basic Usage
@@ -87,7 +94,7 @@ build/lasm hifi reads.bam \
 
 Required:
 
-- `input`: one or more input BAM files
+- `input`: one or more BAM/CRAM/SAM or FASTA/FASTQ(.gz) read files
 - `-o, --output`: output GFA path
 - `-l, --level`: LCP/core depth
 
@@ -104,7 +111,7 @@ Core assembly controls:
 Parallelism:
 
 - `-t, --threads`: worker thread count
-- `-@, --io-threads`: HTSlib decompression thread count per file reader
+- `-@, --io-threads`: decompression thread count per input file (BAM/CRAM/SAM and gzipped FASTA/FASTQ; no effect on uncompressed FASTA/FASTQ)
 - `--file-reading-mode`: `sequential` or `parallel`
 
 Graph cleaning:
