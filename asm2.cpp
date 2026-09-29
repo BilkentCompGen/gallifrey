@@ -19,6 +19,7 @@
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <iostream>
+#include <random>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -61,7 +62,6 @@ struct assembler {
     string output;
     decltype(asm_config::threads) threads;
     int lcp_level;
-    double density;
     decltype(asm_config::bloom) bloom;
     uint64_t seed;
     decltype(asm_config::syncmer) syncmer_params;
@@ -1045,7 +1045,7 @@ int run_assembly(const asm_config &cfg) {
     if (!validate_path(cfg.output)) return 1;
 
     // Validate the syncmer configuration once, up front, before any syncmer
-    // functor is constructed (the functor ctor assumes a valid mask/mode).
+    // functor is constructed (the functor ctor assumes a valid rule).
     if (auto v = cfg.syncmer.validate(); !v) {
         fprintf(stderr, "Error: %s\n", v.error().c_str());
         return 1;
@@ -1128,7 +1128,8 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
     using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
     decltype(asm_config::syncmer) spara;
     spara.k = 8;
-    spara.density = 0.05;
+    spara.smer.s = 3;
+    spara.smer.t = 2;
     SyncmerType syncmer_functor(spara, 42);
     int lcp_level = 3;
 
@@ -1956,7 +1957,7 @@ TEST_CASE("GraphCleaning::simplify_simple_paths leaves degenerate boundary "
     CHECK(redirect_deleted.find(109)->second == 101);
 }
 
-// ── MinCode syncmer rule arithmetic ──────────────────────────────────────
+// ── Syncmer rule arithmetic ──────────────────────────────────────────────
 // Identity hash ⇒ min-hash submer is the min integer submer. k=4, s=2 ⇒
 // three 2-base (mask 0xF) windows at bit offsets 0,2,4. For a k-mer `val`:
 //   w0 = val & 0xF,  w1 = (val>>2) & 0xF,  w2 = (val>>4) & 0xF
@@ -1973,9 +1974,9 @@ TEST_CASE("Syncmer rule (closed/open): s-mer window arithmetic") {
         p.k = 4;
         p.smer.s = 2;  // closed: no t
         Rule sr{p, 0};
-        CHECK(sr(0x1B));        // min index 2 == k-s ⇒ closed syncmer
-        CHECK_FALSE(sr(0x8F));  // min index 1 (interior) ⇒ not
-        CHECK(sr(0xF0));        // min index 0 ⇒ closed syncmer
+        CHECK(sr.is_submer(0x1B));        // min index 2 == k-s ⇒ closed syncmer
+        CHECK_FALSE(sr.is_submer(0x8F));  // min index 1 (interior) ⇒ not
+        CHECK(sr.is_submer(0xF0));        // min index 0 ⇒ closed syncmer
     }
     SUBCASE("open t=1") {
         decltype(asm_config::syncmer) p;
@@ -1983,9 +1984,9 @@ TEST_CASE("Syncmer rule (closed/open): s-mer window arithmetic") {
         p.smer.s = 2;
         p.smer.t = 1;
         Rule sr{p, 0};
-        CHECK(sr(0x8F));        // min index 1 == t
-        CHECK_FALSE(sr(0x1B));  // min index 2 != 1
-        CHECK_FALSE(sr(0xF0));  // min index 0 != 1
+        CHECK(sr.is_submer(0x8F));        // min index 1 == t
+        CHECK_FALSE(sr.is_submer(0x1B));  // min index 2 != 1
+        CHECK_FALSE(sr.is_submer(0xF0));  // min index 0 != 1
     }
     SUBCASE("open t=0 matches window 0 (first base)") {
         decltype(asm_config::syncmer) p;
@@ -1993,8 +1994,8 @@ TEST_CASE("Syncmer rule (closed/open): s-mer window arithmetic") {
         p.smer.s = 2;
         p.smer.t = 0;
         Rule sr{p, 0};
-        CHECK(sr(0xF0));        // min index 0 == t
-        CHECK_FALSE(sr(0x8F));  // min index 1 != 0
+        CHECK(sr.is_submer(0xF0));        // min index 0 == t
+        CHECK_FALSE(sr.is_submer(0x8F));  // min index 1 != 0
     }
     // The last window (index k-s) must actually be examined: a k-mer whose
     // unique minimum submer sits in the final window is a closed syncmer.
@@ -2003,169 +2004,121 @@ TEST_CASE("Syncmer rule (closed/open): s-mer window arithmetic") {
         p.k = 4;
         p.smer.s = 2;
         Rule sr{p, 0};
-        CHECK(sr(0x1B));  // min submer (=1) is window 2, the last one
+        CHECK(sr.is_submer(0x1B));  // min submer (=1) is window 2, the last one
     }
 }
 
-// --canonical applies the rule to min(kmer, rc), so a k-mer and its reverse
-// complement always agree; the flag must change behavior vs the directional
-// default.
-TEST_CASE("Strand-canonical selection co-selects a k-mer and its rev-comp") {
-    using Rule = syncmer::GenericSubmerRule<uint32_t, syncmer::MurMur>;
-    const int k = 8;
-    decltype(asm_config::syncmer) p;
-    p.k = k;
-    p.smer.s = 3;  // closed syncmer
-    p.canonical = true;
-    Rule canon{p, 42};
-    p.canonical = false;
-    Rule direct{p, 42};
-
-    [[maybe_unused]] bool saw_directional_diff = false;
-    for (uint32_t x = 0; x < (1u << (2 * k)); ++x) {
-        uint32_t rc = reverse_complement_kmer<uint32_t>(x, k);
-        CHECK(canon(x) == canon(rc));  // co-selected under --canonical
-        if (direct(x) != direct(rc)) saw_directional_diff = true;
-    }
-    CHECK(saw_directional_diff);  // the flag genuinely changes selection
-}
-
-// ── Spaced-seed compaction: '0' positions are non-existent in selection ───
-// Mask "11011" (k=5) removes field 2 (bits 4-5; the middle position), so
-// selection runs on the dense 4-mer of kept fields:
-//   compact(v) = f0 | f1<<2 | f3<<4 | f4<<6      (f_i = (v >> 2i) & 3)
-// With Identity hash and s=2 there are k_eff-s+1 = 3 s-windows over the
-// compacted value; closed ⇒ min at window 0 or 2.
-TEST_CASE("Spaced-seed compaction: masked positions are non-existent") {
-    using Rule = syncmer::GenericSubmerRule<uint32_t, syncmer::Identity>;
-    decltype(asm_config::syncmer) p;
-    p.k = 5;
-    p.smer.s = 2;
-    p.spaced_seed_mask = "11011";
-
-    SUBCASE("compact() gathers kept fields in order") {
-        Rule sr{p, 0};
-        CHECK(sr.k_eff == 4);
-        CHECK(sr.compact(0x7B) == 0x1B);   // f0=3 f1=2 f2=3 f3=1 f4=0
-        CHECK(sr.compact(0x3FF) == 0xFF);  // all fields 3
-    }
-    SUBCASE("closed syncmer windows live in compacted space") {
-        Rule sr{p, 0};
-        CHECK(sr(0x7B));         // compact 0x1B: min submer at last window
-        CHECK_FALSE(sr(0x20F));  // compact 0x8F: min at interior window 1
-        CHECK(sr(0x3C0));        // compact 0xF0: min at window 0
-    }
-    SUBCASE("k-mers differing only at the masked position co-select") {
-        Rule sr{p, 0};
-        // Same kept fields as 0x7B, with the masked field 2 set to 0/1/2.
-        CHECK(sr(0x4B) == sr(0x7B));
-        CHECK(sr(0x5B) == sr(0x7B));
-        CHECK(sr(0x6B) == sr(0x7B));
-    }
-    SUBCASE("open syncmer t indexes compacted windows") {
-        decltype(asm_config::syncmer) po = p;
-        po.smer.t = 1;
-        Rule sr{po, 0};
-        CHECK(sr(0x20F));        // compact 0x8F: min at window 1 == t
-        CHECK_FALSE(sr(0x3C0));  // compact 0xF0: min at window 0 != t
-        po.smer.t = 0;
-        Rule sr0{po, 0};
-        CHECK(sr0(0x3C0));
-        CHECK_FALSE(sr0(0x20F));
-    }
-    SUBCASE("'2'/'3' keep their position but still bit-mask") {
-        decltype(asm_config::syncmer) p2 = p;
-        p2.spaced_seed_mask = "11121";  // field 2 keeps only its high bit
-        Rule sr{p2, 0};
-        CHECK(sr.k_eff == 5);              // nothing removed
-        CHECK(sr.compact(0x1AB) == 0x1AB); // no '0' ⇒ compaction is identity
-        // field 2 = 0b10 vs 0b11 both bit-mask to 0b10 ⇒ co-selected.
-        CHECK(sr(0x61) == sr(0x71));
-    }
-}
-
-// --canonical with a removing mask: a k-mer and its reverse complement must
-// still always agree (canonicalization runs on the raw k-mer, compaction is
-// baked into the LuT).
-TEST_CASE("Spaced-seed compaction with --canonical co-selects rev-comps") {
-    using Rule = syncmer::GenericSubmerRule<uint32_t, syncmer::MurMur>;
-    const int k = 5;
-    decltype(asm_config::syncmer) p;
-    p.k = k;
-    p.smer.s = 2;
-    p.canonical = true;
-    p.spaced_seed_mask = "11011";
-    Rule canon{p, 42};
-    for (uint32_t x = 0; x < (1u << (2 * k)); ++x) {
-        [[maybe_unused]] uint32_t rc = reverse_complement_kmer<uint32_t>(x, k);
-        CHECK(canon(x) == canon(rc));
-    }
-}
-
-// Mincode submer with compaction: the density threshold applies to the hash
-// of the compacted value. ScaleHash (v << 26) makes the threshold exact:
-// density 0.5 ⇒ threshold 2^31 ⇒ selected iff compact(v) < 32 (no wrap for
-// compact values < 64).
-TEST_CASE("Spaced-seed compaction: mincode hashes the compacted value") {
-    struct ScaleHash {
-        unsigned seed;
-        ScaleHash(unsigned s) : seed{s} {}
-        unsigned operator()(unsigned v) const { return v << 26; }
+// Live syncmer selection in parse1_rle_syncmers must emit exactly
+// the windows the per-k-mer rule (is_submer) selects, with the same spans, for
+// open (every t, including both ends) and closed syncmers, on each s-mer key
+// path (byte ranks s <= 4, 16-bit ranks s <= 8, hashes s > 8). The Identity
+// hash makes equal s-mers tie, exercising the "smallest window index wins"
+// rule.
+TEST_CASE("Live syncmer selection matches the per-k-mer rule") {
+    auto check = [](auto hasher_tag, unsigned k, unsigned s,
+                    std::optional<unsigned long> t) {
+        using H = decltype(hasher_tag);
+        using Rule = syncmer::GenericSubmerRule<uint32_t, H>;
+        decltype(asm_config::syncmer) p;
+        p.k = k;
+        p.smer.s = s;
+        p.smer.t = t;
+        REQUIRE(p.validate().has_value());
+        Rule rule{p, 1453};
+        std::mt19937 rng(k * 131 + s * 17 + (t ? *t : 99));
+        // Random run-length stream (symbols 0..3) plus a low-entropy tail so
+        // repeated s-mers (hash ties) occur inside windows.
+        const int64_t n = 3000;
+        gtl::vector<uint8_t> rle(n);
+        gtl::vector<uint32_t> pos(n);
+        for (int64_t i = 0; i < n; ++i) {
+            rle[i] = (i < n / 2) ? rng() & 3 : ((i % 3) + (rng() % 7 == 0)) & 3;
+            pos[i] = static_cast<uint32_t>(2 * i);
+        }
+        const int64_t seq_len = 2 * n + 1;
+        lps str = {0, 0, 0, nullptr};
+        const uint64_t got =
+            parse1_rle_syncmers(rle.data(), pos.data(), n, seq_len, &str, rule);
+        uint64_t want = 0;
+        const uint64_t kmask = (1ULL << (2 * k)) - 1;
+        uint64_t v = 0;
+        for (int64_t e = 0; e < n; ++e) {
+            v = ((v << 2) | rle[e]) & kmask;
+            if (e < static_cast<int64_t>(k) - 1 ||
+                !rule.is_submer(static_cast<uint32_t>(v)))
+                continue;
+            REQUIRE(want < got);
+            const core &c = str.cores[want];
+            CHECK(c.label == v);
+            CHECK(c.start == pos[e - k + 1]);
+            CHECK(c.end == ((e + 1 < n) ? pos[e + 1] : seq_len));
+            ++want;
+        }
+        CHECK(got == want);
+        CHECK(want > 0);
+        free(str.cores);
     };
-    using Rule = syncmer::GenericSubmerRule<uint32_t, ScaleHash>;
-    decltype(asm_config::syncmer) p;
-    p.k = 5;
-    p.density = 0.5;
-    p.spaced_seed_mask = "11011";
-    Rule sr{p, 0};
-    CHECK(sr(0x4F));        // compact 31 < 32
-    CHECK(sr(0x7F));        // same compact (masked field 2) ⇒ co-selected
-    CHECK_FALSE(sr(0x80));  // compact 32
-    CHECK_FALSE(sr(0xB0));  // same compact 32
+    for (unsigned k : {5u, 8u, 11u, 16u}) {
+        for (unsigned s : {1u, 2u, 3u, 4u, 6u, 9u, 12u}) {
+            if (s >= k) continue;
+            const unsigned w = k - s + 1;
+            for (unsigned t : {0u, 1u, w / 2, w - 1}) {
+                check(syncmer::MurMur{0}, k, s, t);
+                check(syncmer::Identity{0}, k, s, t);
+            }
+            check(syncmer::MurMur{0}, k, s, std::nullopt);
+            check(syncmer::Identity{0}, k, s, std::nullopt);
+        }
+    }
 }
 
-// Validation must reject s/t bounds against the EFFECTIVE k (k minus the
-// removed positions), and reject masks that remove every position.
-TEST_CASE("Syncmer validation uses effective k after compaction") {
+// The CLI default applies only when neither s nor t is given, and validation
+// rejects every rule live selection cannot evaluate (k-mer codes are 32-bit).
+TEST_CASE("Syncmer defaults and validation") {
     decltype(asm_config::syncmer) p;
-    p.k = 5;
-    p.smer.s = 2;
-    p.spaced_seed_mask = "11011";  // k_eff = 4
+    p.k = 11;
 
-    auto ek = p.effective_k_checked();
-    REQUIRE(ek.has_value());
-    CHECK(*ek == 4);
-
-    SUBCASE("t bounded by effective-k - s + 1") {
-        p.smer.t = 2;  // == k_eff - s ⇒ last valid window
+    SUBCASE("no s and no t selects the default open syncmer") {
+        p.apply_default_rule();
+        REQUIRE(p.smer.s.has_value());
+        REQUIRE(p.smer.t.has_value());
+        CHECK(*p.smer.s == 4);
+        CHECK(*p.smer.t == 5);
         CHECK(p.validate().has_value());
-        p.smer.t = 3;  // == k_eff - s + 1 ⇒ out of range
-        CHECK_FALSE(p.validate().has_value());
     }
-    SUBCASE("s bounded by effective k") {
+    SUBCASE("an explicit s without t stays a closed syncmer") {
         p.smer.s = 3;
+        p.apply_default_rule();
+        CHECK_FALSE(p.smer.t.has_value());
+        CHECK(p.type() == syncmer_params::typeenum::ClosedSyncmer);
         CHECK(p.validate().has_value());
-        p.smer.s = 4;  // == k_eff
+    }
+    SUBCASE("a rule without s is rejected") {
+        CHECK_FALSE(p.validate().has_value());
+        p.smer.t = 2;
         CHECK_FALSE(p.validate().has_value());
     }
-    SUBCASE("mask removing every position is rejected") {
-        p.spaced_seed_mask = "00000";
-        CHECK_FALSE(p.validate().has_value());
-    }
-    SUBCASE("short mask leaves leading positions kept") {
-        p.spaced_seed_mask = "101";  // removes field 1 only; fields 3,4 kept
-        auto ek2 = p.effective_k_checked();
-        REQUIRE(ek2.has_value());
-        CHECK(*ek2 == 4);
-        CHECK(p.validate().has_value());  // s=2 < 4
-    }
-    SUBCASE("mask without '0' keeps full k") {
-        p.spaced_seed_mask = "11121";
-        auto ek3 = p.effective_k_checked();
-        REQUIRE(ek3.has_value());
-        CHECK(*ek3 == 5);
+    SUBCASE("k is bounded by max_k") {
         p.smer.s = 4;
-        CHECK(p.validate().has_value());  // s=4 < 5
+        p.k = syncmer_params::max_k;
+        CHECK(p.validate().has_value());
+        p.k = syncmer_params::max_k + 1;
+        CHECK_FALSE(p.validate().has_value());
+    }
+    SUBCASE("s must lie in [1, k)") {
+        p.smer.s = 10;
+        CHECK(p.validate().has_value());
+        p.smer.s = 11;
+        CHECK_FALSE(p.validate().has_value());
+        p.smer.s = 0;
+        CHECK_FALSE(p.validate().has_value());
+    }
+    SUBCASE("t must index one of the k - s + 1 windows") {
+        p.smer.s = 4;
+        p.smer.t = 7;  // last window
+        CHECK(p.validate().has_value());
+        p.smer.t = 8;
+        CHECK_FALSE(p.validate().has_value());
     }
 }
 

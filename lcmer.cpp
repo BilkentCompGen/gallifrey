@@ -343,7 +343,8 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
             syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
         decltype(asm_config::syncmer) spara;
         spara.k = 8;
-        spara.density = 0.05;
+        spara.smer.s = 3;
+        spara.smer.t = 2;
         SyncmerType fnctr(spara, 11);
         charsi chs;
         pos_scratch pos_buf;
@@ -414,8 +415,8 @@ TEST_CASE("BAM and crumbled parsers agree on homopolymer-rich sequence") {
 
     using SyncmerType = syncmer::GenericSubmerRule<uint32_t, syncmer::MurMur>;
     decltype(asm_config::syncmer) spara;
-    spara.k = 6;          // small k so homopolymer windows are frequent
-    spara.density = 0.3;  // select a good fraction of windows
+    spara.k = 6;       // small k so homopolymer windows are frequent
+    spara.smer.s = 2;  // closed syncmer: selects ~2/5 of the windows
     SyncmerType fnctr(spara, 7);
 
     lps str1 = {0, 0, 0, nullptr};
@@ -508,8 +509,14 @@ TEST_CASE("onehot_to_rle correctness") {
         auto bam_data = encode_bam(bases);
         int64_t len = bases.size();
 
-        gtl::vector<uint8_t> rle_ref(len), rle_test(len);
-        gtl::vector<uint32_t> pos_ref(len), pos_test(len);
+        // std::vector: its max_size() check bounds the size, so GCC does not
+        // warn about a size_t overflow in gtl::vector's fill
+        // (-Wstringop-overflow).
+        const size_t cap = bases.size() + kOnehotRlePad;
+        gtl::vector<uint8_t> rle_ref(bases.size());
+        gtl::vector<uint32_t> pos_ref(bases.size());
+        std::vector<uint8_t> rle_test(cap);
+        std::vector<uint32_t> pos_test(cap);
 
         int64_t n_ref  = reference_onehot_to_rle(bam_data.data(), len,
                                                   rle_ref.data(), pos_ref.data());
@@ -589,8 +596,8 @@ TEST_CASE("onehot_to_rle correctness") {
             int64_t len = rec->core.l_qseq;
             INFO("BAM record ", count, " len=", len);
 
-            gtl::vector<uint8_t> rle_ref(len), rle_test(len);
-            gtl::vector<uint32_t> pos_ref(len), pos_test(len);
+            gtl::vector<uint8_t> rle_ref(len), rle_test(len + kOnehotRlePad);
+            gtl::vector<uint32_t> pos_ref(len), pos_test(len + kOnehotRlePad);
 
             int64_t n_ref  = reference_onehot_to_rle(data, len,
                                 rle_ref.data(), pos_ref.data());
@@ -741,7 +748,8 @@ TEST_CASE("FASTX reader agrees with the htslib path") {
             syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
         syncmer_params spara;
         spara.k = 15;
-        spara.density = 0.05;
+        spara.smer.s = 5;
+        spara.smer.t = 5;
         SyncmerType fnctr(spara, 11);
 
         fastx_reader reader;

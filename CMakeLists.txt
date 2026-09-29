@@ -45,10 +45,16 @@ set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG")
 add_compile_options($<$<CXX_COMPILER_ID:GNU>:-Wno-interference-size>)
 
 # Optimize for the host CPU only when explicitly requested (non-portable;
-# default off so distributed binaries run on other machines).
+# default off so distributed binaries run on other machines). Portable x86-64
+# builds target x86-64-v2 (SSSE3/SSE4.2/POPCNT; every x86-64 CPU since ~2009)
+# so the SSSE3 SIMD paths are used instead of the scalar fallbacks. ARM64
+# always has NEON and needs no flag.
+option(LASM_X86_64_V2 "Portable x86-64 builds target x86-64-v2 (SSSE3/SSE4.2)" ON)
 if(LASM_NATIVE)
     add_compile_options($<$<CONFIG:Release,RelWithDebInfo>:-march=native>)
     add_compile_options($<$<CONFIG:RelWithDebInfo>:-mtune=native>)
+elseif(LASM_X86_64_V2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    add_compile_options(-march=x86-64-v2)
 endif()
 
 if(PGO_GENERATE)

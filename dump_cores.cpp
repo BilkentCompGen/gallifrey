@@ -30,6 +30,10 @@ static int run_dump_cores(const std::string &input_path,
     spara.k = syncmer_k;
     spara.smer.s = submer_s;
     spara.smer.t = submer_t;
+    if (auto v = spara.validate(); !v) {
+        fprintf(stderr, "Error: %s\n", v.error().c_str());
+        return 1;
+    }
 
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;

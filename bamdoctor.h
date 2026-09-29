@@ -22,7 +22,10 @@ enum class SamReadTestingMode {
     POOL,
 };
 
-inline int run_sam_read_testing(const std::string &input, int threads, int lcp_level, SamReadTestingMode mode, const std::string &job_type, double density){
+inline int run_sam_read_testing(const std::string &input, int threads,
+                                int lcp_level, SamReadTestingMode mode,
+                                const std::string &job_type,
+                                const syncmer_params &sr_params) {
     INIT_TIMERS(BAM_READING);
     printf("Input: %s\n", input.c_str());
     printf("Threads: %d\n", threads);
@@ -80,9 +83,6 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     // One slot per worker, sized by the thread count.
     std::vector<int> counts(threads, 0);
     // Same rule the assembly pipeline uses (GenericSubmerRule).
-    syncmer_params sr_params;
-    sr_params.k = 8;
-    sr_params.density = density;
     syncmer::GenericSubmerRule<uint32_t, syncmer::MurMur> sr{sr_params, 423};
     // Per-worker scratch (charsi/pos_scratch) is passed as arguments, not
     // captured, so the shared job closure stays race-free.

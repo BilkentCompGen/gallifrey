@@ -37,6 +37,10 @@ build directory so you can keep them side by side.
 
 ### Build options
 - `LASM_NATIVE` — add `-march=native`
+- `LASM_X86_64_V2` (default `ON`) — without `LASM_NATIVE`, x86-64 builds
+  target `-march=x86-64-v2` (SSSE3/SSE4.2/POPCNT, any x86-64 CPU from about
+  2009 on), so the SIMD paths are used. Turn it off only for older CPUs; the
+  scalar fallbacks are several times slower. ARM64 builds always use NEON.
 
 ```bash
 # Default build
@@ -64,30 +68,30 @@ names and quality values are ignored; only sequences are used. Different
 formats can be mixed in one invocation.
 
 ```bash
-lasm hifi <reads1> [reads2 ...] -o output.gfa -l <lcp_level> --density <kmer_density>
+lasm hifi <reads1> [reads2 ...] -o output.gfa -l <lcp_level> [--syncmer-k K --submer-s S --submer-t T]
 ```
 
 ## Basic Usage
 
-Minimal example:
+Minimal example (default syncmers: k=11, open syncmer with s=4, t=5):
 
 ```bash
-build/lasm hifi reads.bam -o assembly.gfa -l 4 --density 0.05
+build/lasm hifi reads.bam -o assembly.gfa -l 5
 ```
 
-Example that uses syncmer:
+Example with explicit syncmer and thread settings:
 
 ```bash
 build/lasm hifi reads.bam \
   -o assembly.gfa \
-  -l 3 \
-  -t 8 \
-  -@ 4 \
+  -l 5 \
+  -t 16 \
+  -@ 8 \
   --dbg-lcmer-l 8 \
   --syncmer-k 11 \
   --submer-s 4 \
   --submer-t 5 \
-  --iterations 2 
+  --iterations 2
 ```
 
 ## Main Parameters
@@ -101,12 +105,20 @@ Required:
 Core assembly controls:
 
 - `--dbg-lcmer-l`: rolling `lcmer` window length used for DBG construction
-- `--syncmer-k`: syncmer k-mer length
-- `--density`: density-based syncmer selection
-- `--submer-s`: submer size for mincode/open-syncmer rules
-- `--submer-t`: submer position for mincode/open-syncmer rules
-- `--spaced-seed-mask`: optional spaced-seed mask
 - `--random-seed`: hash/random seed
+
+Syncmer selection (Edgar 2021). A k-mer is selected by the position of its
+smallest s-mer; selection is computed on the fly from s-mer hashes, with no
+per-k-mer table. With `--rle` (default), k-mers and s-mers count run-length
+runs, not bases.
+
+- `--syncmer-k`: k-mer length, at most 16 (default 11)
+- `--submer-s`: s-mer length, 1 <= s < k. Without `--submer-t` this is a
+  closed syncmer (smallest s-mer at the first or last position)
+- `--submer-t`: offset of the smallest s-mer for an open syncmer,
+  0 <= t <= k - s (requires `--submer-s`)
+- With neither `--submer-s` nor `--submer-t`, an open syncmer with s=4, t=5
+  is used
 
 Parallelism:
 

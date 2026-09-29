@@ -77,39 +77,23 @@ public:
                      "emitting them as C segments. Halves the contig count at "
                      "a small genome-fraction cost.")
             ->capture_default_str();
-        app.add_option("--spaced-seed-mask", cfg.syncmer.spaced_seed_mask,
-                       "Mask for spaced seeding. 0->remove the position from "
-                       "selection entirely (effective k = k - #zeros; syncmer "
-                       "s-windows span only kept positions), 1->keep, "
-                       "2->keep but mask left bit, 3->keep but mask right "
-                       "bit. With --rle, positions index RLE runs.")
-            ->capture_default_str();
         app.add_option("--syncmer-k", cfg.syncmer.k,
-                       "K-mer length (table is 4^k bits; k=15 ⇒ 128 MiB)")
-            ->check(CLI::Range(3u, 32u))
+                       "Syncmer k-mer length (in RLE runs with --rle)")
+            ->check(CLI::Range(2u, syncmer_params::max_k))
             ->capture_default_str();
-        app.add_option("--density", cfg.syncmer.density,
-                       "Mincode-submer selection (Edgar 2021): keep k-mers whose "
-                       "hashed code < H*density (compression c = 1/density). "
-                       "'density' is the resulting metric, not a syncmer.")
-            ->check(CLI::Range(0.0, 1.0));
-        app.add_option("--submer-s", cfg.syncmer.smer.s,
-                       "s-mer length s for syncmer selection. Without --submer-t "
-                       "this is a closed syncmer (smallest s-mer at the first or "
-                       "last position).")
-            ->check(CLI::Range(1ul, 31ul))
-            ->excludes("--density");
-        app.add_option("--submer-t", cfg.syncmer.smer.t,
-                       "Offset t of the smallest s-mer: selects an open syncmer "
-                       "(smallest s-mer at position t).")
-            ->check(CLI::Range(0ul, 31ul))
-            ->excludes("--density")
+        app.add_option(
+               "--submer-s", cfg.syncmer.smer.s,
+               "s-mer length s for syncmer selection. Without --submer-t "
+               "this is a closed syncmer (smallest s-mer at the first or "
+               "last position). Default when neither --submer-s nor "
+               "--submer-t is given: open syncmer, s=4, t=5.")
+            ->check(CLI::Range(1ul, 15ul));
+        app.add_option(
+               "--submer-t", cfg.syncmer.smer.t,
+               "Offset t of the smallest s-mer: selects an open syncmer "
+               "(smallest s-mer at position t).")
+            ->check(CLI::Range(0ul, 15ul))
             ->needs("--submer-s");
-        app.add_flag("--canonical", cfg.syncmer.canonical,
-                     "Strand-canonical selection: apply the submer rule to "
-                     "min(kmer, reverse-complement) so a k-mer and its reverse "
-                     "complement are always co-selected.")
-            ->capture_default_str();
         auto bfg = app.add_option_group("bloomfilter",
                                         "Parameters to setup bloom filter");
         bfg->add_option("--projected-element-count", cfg.bloom.projected_count,
@@ -151,8 +135,9 @@ public:
             ->check(CLI::Range(0, 1000000))
             ->capture_default_str();
         app.callback([this]() {
-            // Validate the syncmer configuration (selection mode + mask) up
-            // front; a CLI error makes CLI11 print the message and exit nonzero.
+            // Validate the syncmer configuration up front; a CLI error makes
+            // CLI11 print the message and exit nonzero.
+            cfg.syncmer.apply_default_rule();
             if (auto v = cfg.syncmer.validate(); !v) {
                 throw CLI::ValidationError(v.error());
             }
@@ -174,9 +159,9 @@ class SamReadTesting {
     int threads = 8;
     SamReadTestingMode mode = SamReadTestingMode::BASIC;
     string job = "read_count";
-    double density = 0.01;
+    syncmer_params syncmer;
 
-public:
+   public:
     explicit SamReadTesting(CLI::App &parent) {
         auto &app = *parent.add_subcommand("bamdoctor", "read bam file fast");
         app.add_option("input", input, "Input bam file")->required();
@@ -185,9 +170,17 @@ public:
         app.add_option("-t,--threads", threads, "Number of threads")
             ->check(CLI::Range(1, MAXIMUM_WORK_THREADS))
             ->capture_default_str();
-        app.add_option("--density", density, "Density of selected k-mers")
-            ->check(CLI::Range(0.0, 1.0))
-            ->required();
+        app.add_option("--syncmer-k", syncmer.k, "Syncmer k-mer length")
+            ->check(CLI::Range(2u, syncmer_params::max_k))
+            ->capture_default_str();
+        app.add_option("--submer-s", syncmer.smer.s,
+                       "s-mer length (default with no --submer-t: open "
+                       "syncmer, s=4, t=5)")
+            ->check(CLI::Range(1ul, 15ul));
+        app.add_option("--submer-t", syncmer.smer.t,
+                       "Offset t of the smallest s-mer (open syncmer)")
+            ->check(CLI::Range(0ul, 15ul))
+            ->needs("--submer-s");
 
         std::map<std::string, SamReadTestingMode> SamReadTestingMode_map = {
             {"basic", SamReadTestingMode::BASIC},
@@ -205,10 +198,14 @@ public:
             ->transform(CLI::CheckedTransformer(SamReadTestingMode_map,
                                                 CLI::ignore_case));
         app.callback([this]() {
+            syncmer.apply_default_rule();
+            if (auto v = syncmer.validate(); !v) {
+                throw CLI::ValidationError(v.error());
+            }
             // CLI11 callbacks return void; re-raise a nonzero rc as a CLI error
             // so it reaches the process exit status.
             if (int rc = run_sam_read_testing(input, threads, lcp_level, mode,
-                                              job, density);
+                                              job, syncmer);
                 rc != 0) {
                 throw CLI::RuntimeError("bamdoctor failed", rc);
             }
