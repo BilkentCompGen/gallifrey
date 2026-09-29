@@ -258,7 +258,7 @@ struct assembler {
     // `lr` are caller scratch.
     template <class BFT>
     static void prime_reverse_complement(const uint8_t *nibbles, size_t len,
-                                         int lcp_level, lps *str,
+                                         int lcp_level, core_buf *str,
                                          const SyncmerType &syncmer_functor,
                                          charsi &chs, pos_scratch &pos_buf,
                                          gtl::vector<uint8_t> &rc, lcp_read &lr,
@@ -298,34 +298,27 @@ struct assembler {
     // positions in the range's own coordinates. The run-length stream is
     // read straight from the 2-bit words, so the range is never copied.
     static void parse_range(const SequenceContainerType &seq, size_t from,
-                            size_t to, bool rc, int lcp_level, lps *str,
-                            const SyncmerType &syncmer_functor, charsi &rle,
-                            pos_scratch &pos, lcp_read &lr) {
+                            size_t to, bool rc, int lcp_level, core_buf *str,
+                            const SyncmerType &syncmer_functor, lcp_read &lr) {
         lr.clear();
         const size_t len = to - from;
-        rle.require(len + kOnehotRlePad);
-        pos.require(len + kOnehotRlePad);
+        const auto [rle_data, rle_pos] = str->rle_scratch(len);
         int64_t rle_len = 0;
         uint8_t prev = 255;
         for (size_t j = 0; j < len; ++j) {
             const uint8_t b = range_base(seq, from, to, rc, j);
             if (b != prev) {
-                rle.data[rle_len] = b;
-                pos.data[rle_len] = static_cast<uint32_t>(j);
+                rle_data[rle_len] = b;
+                rle_pos[rle_len] = static_cast<uint32_t>(j);
                 ++rle_len;
                 prev = b;
             }
         }
-        prepare_lps(str, len);
-        str->size = parse1_rle_syncmers(rle.data, pos.data, rle_len,
-                                        static_cast<int64_t>(len), str,
-                                        syncmer_functor);
-        lps_deepen(str, lcp_level);
+        parse1_rle_syncmers(rle_data, rle_pos, rle_len,
+                            static_cast<int64_t>(len), str, syncmer_functor);
+        str->deepen(lcp_level);
         lr.reserve(str->size);
-        for (int i = 0; i < str->size; ++i) {
-            lr.cores.emplace_back(str->cores[i].label);
-            lr.pos.emplace_back(str->cores[i].start, str->cores[i].end);
-        }
+        str->append_to(lr);
     }
 
     // Bases [a, b) of the range seq[from, to) in the orientation it was
@@ -406,9 +399,7 @@ struct assembler {
         gtl::vector<std::thread> workers;
         for (int t = 0; t < threads.work; ++t) {
             workers.emplace_back([&, t]() {
-                lps str = {0, 0, 0, 0};
-                charsi rle;
-                pos_scratch pos;
+                core_buf str;
                 lcp_read lr;
                 gtl::vector<uint64_t> ll;
                 size_t n = 0;
@@ -416,13 +407,12 @@ struct assembler {
                     const auto &[s, from, to] = chunks[c];
                     for (bool rc : {false, true}) {
                         parse_range(segments[s], from, to, rc, lcp_level, &str,
-                                    syncmer_functor, rle, pos, lr);
+                                    syncmer_functor, lr);
                         n += process_seeded_cores(lr, segments[s], from, to, rc,
                                                   dbgi, lcmer_l, ll, t);
                     }
                 }
                 windows += n;
-                free_lps(&str);
             });
         }
         for (auto &w : workers) w.join();
@@ -481,7 +471,7 @@ struct assembler {
                              int lcmer_l, bool prime_reverse) {
         uint64_t lcmer_index = 0;
         typename Ops::record *data_p = NULL;
-        lps str = {0, 0, 0, 0};
+        core_buf str;
         charsi chs;
         pos_scratch pos_buf;
         lcp_read lr;
@@ -508,7 +498,6 @@ struct assembler {
                 data_p = NULL;
             }
         }
-        free_lps(&str);
     }
 
     // Producer loop shared by every reader: takes a recycled record (or
@@ -784,36 +773,29 @@ struct assembler {
 
     static auto build_lr_cores(fragment_span seqs,
                                const SyncmerType &syncmer_functor,
-                               int lcp_level, lps &str) -> lcp_read {
+                               int lcp_level, core_buf &str) -> lcp_read {
         lcp_read lr;
         lr.clear();
 
-        lps_parse_crumbled(&str, seqs, syncmer_functor, lcp_level);
-
-        for (int i = 0; i < str.size; ++i) {
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-        }
+        lps_parse_crumbled(lr, &str, seqs, syncmer_functor, lcp_level);
         return lr;
     }
 
     static auto build_lr_cores_with_seqs(fragment_span seqs,
                                          const SyncmerType &syncmer_functor,
-                                         int lcp_level, lps &str)
+                                         int lcp_level, core_buf &str)
         -> std::pair<lcp_read, gtl::vector<SequenceContainerType>> {
         lcp_read lr;
         lr.clear();
         gtl::vector<SequenceContainerType> core_seqs;
 
-        lps_parse_crumbled(&str, seqs, syncmer_functor, lcp_level);
+        lps_parse_crumbled(lr, &str, seqs, syncmer_functor, lcp_level);
 
-        if (str.size == 0 || seqs.empty()) {
+        if (lr.cores.empty() || seqs.empty()) {
             return {std::move(lr), std::move(core_seqs)};
         }
 
-        lr.cores.reserve(str.size);
-        lr.pos.reserve(str.size);
-        core_seqs.reserve(str.size);
+        core_seqs.reserve(lr.cores.size());
 
         // Co-iterate: track current fragment and its cumulative position
         size_t frag_idx = 0;
@@ -821,11 +803,8 @@ struct assembler {
 
         size_t prev_end = 0;  // End position of previous core
 
-        for (int i = 0; i < str.size; ++i) {
-            size_t cur_start = str.cores[i].start;
-            size_t cur_end = str.cores[i].end;
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(cur_start, cur_end);
+        for (const auto &core_pos : lr.pos) {
+            const size_t cur_end = core_pos.second;
 
             // Extract non-overlapping portion: [prev_end, cur_end)
             // For the first core, this is [0, cur_end)
@@ -895,25 +874,21 @@ struct assembler {
         gtl::parallel_flat_hash_map_d<u64, gtl::vector<SelfMatch>, HT_SHARD_BC,
                                       std::mutex>
             matched;
+        // One parse buffer per worker, reused across its unitigs.
+        std::vector<core_buf> parse_bufs(threads.work);
         graph.for_each_unitig(
             threads.work, [&](int tid, const unitig_graph::unitig &node) {
-                (void)tid;
                 if (!graph.active_set.contains(node.id)) return;
 
-                lps str = {0, 0, 0, 0};
+                core_buf &str = parse_bufs[tid];
                 lcp_read lr;
                 gtl::vector<SequenceContainerType> rev_seqs;
                 for (auto it = node.seq.rbegin(); it != node.seq.rend(); ++it) {
                     rev_seqs.emplace_back(it->reverse_complement());
                 }
-                lps_parse_crumbled(&str, rev_seqs, syncmer_functor, lcp_level);
-
-                for (int i = 0; i < str.size; ++i) {
-                    lr.cores.emplace_back(str.cores[i].label);
-                    lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-                }
+                lps_parse_crumbled(lr, &str, rev_seqs, syncmer_functor,
+                                   lcp_level);
                 if (lr.cores.size() < static_cast<size_t>(lcmer_l + 1)) {
-                    free_lps(&str);
                     return;
                 }
                 good.fetch_add(1);
@@ -965,7 +940,6 @@ struct assembler {
                         static_cast<size_t>(lcmer_l + OLC_SKIP_FIRST(lcmer_l) +
                                             OLC_SKIP_LAST(lcmer_l)))
                     no_ranges.fetch_add(1);
-                free_lps(&str);
             });
 
         gtl::btree_multimap<u64, Overlap> reciprocal;
