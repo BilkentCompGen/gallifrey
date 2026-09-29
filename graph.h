@@ -540,11 +540,11 @@ struct GraphCleaning {
         const gtl::vector<
             gtl::vector<std::pair<u64, dbg_index::dbg_map_t::iterator>>>
             &to_simplify,
-        redir_map &redirect_deleted, auto &active_set) {
+        redir_map &redirect_deleted) {
         // Chains are node-disjoint (see the seed guard in
         // simplify_simple_parallel_mark), so each thread mutates only its own
         // chain's nodes without synchronization. redirect_deleted is a mutexed
-        // parallel map; active_set is pruned after the join.
+        // parallel map.
         gtl::vector<std::thread> threads;
         for (size_t i = 0; i < to_simplify.size(); ++i) {
             threads.emplace_back(
@@ -560,9 +560,10 @@ struct GraphCleaning {
         for (auto &thread : threads) {
             thread.join();
         }
-
-        // Prune absorbed nodes: a merged node is redirected() and a consumed
-        // node is gone from dbg.
+    }
+    // Prune absorbed nodes: a merged node is redirected() and a consumed
+    // node is gone from dbg.
+    static void prune_active_set(const dbg_map_t &dbg, auto &active_set) {
         for (auto it = active_set.begin(); it != active_set.end();) {
             auto nit = dbg.find(*it);
             if (nit == dbg.end() || nit->second.redirected()) {
@@ -571,8 +572,35 @@ struct GraphCleaning {
                 ++it;
             }
         }
-
-        for (auto &node : dbg) {
+    }
+    // active_set from scratch: every dbg node, or only the live
+    // (non-redirected) ones. Built from sorted keys in one pass instead of
+    // one btree insert (or erase) per node.
+    static void build_active_set(const dbg_map_t &dbg,
+                                 gtl::btree_set<u64> &active_set,
+                                 bool live_only) {
+        gtl::vector<u64> keys;
+        keys.reserve(live_only ? 0 : dbg.size());
+        for (const auto &node : dbg) {
+            if (!live_only || !node.second.redirected()) {
+                keys.push_back(node.first);
+            }
+        }
+        std::sort(keys.begin(), keys.end());
+        active_set = gtl::btree_set<u64>(keys.begin(), keys.end());
+    }
+    // Rewrite prev edges through redirect_deleted and drop the self-edges
+    // this creates. Only live nodes can change: a redirected node's prev is
+    // [0] and 0 is never a node id. Every live node is in active_set (nodes
+    // only ever leave it), so iterating it instead of all of dbg (mostly
+    // redirected husks) gives the same result; each node edits only itself.
+    static void redirect_prev_edges(dbg_map_t &dbg,
+                                    const redir_map &redirect_deleted,
+                                    const auto &active_set) {
+        for (u64 id : active_set) {
+            auto nit = dbg.find(id);
+            if (nit == dbg.end()) continue;
+            auto &node = *nit;
             for (size_t idx = 0; idx < node.second.prev.size(); ++idx) {
                 auto &p = node.second.prev[idx];
                 auto it = redirect_deleted.find(p);
@@ -593,15 +621,16 @@ struct GraphCleaning {
         }
     }
     // Unified simple-path simplification: discover node-disjoint chains in
-    // parallel (mark), then merge them lock-free (sweep). Used for both the
-    // initial pass and every cleaning iteration; threads==1 just means a single
-    // partition.
+    // parallel (mark), merge them lock-free (sweep), prune active_set and
+    // redirect the remaining edges. Used for every cleaning iteration;
+    // threads==1 just means a single partition.
     static void simplify_simple_paths(dbg_index::dbg_map_t &dbg,
                                       redir_map &redirect_deleted,
                                       auto &active_set, int threads) {
         auto to_simplify = simplify_simple_parallel_mark(dbg, threads);
-        simplify_simple_parallel_sweep(dbg, to_simplify, redirect_deleted,
-                                       active_set);
+        simplify_simple_parallel_sweep(dbg, to_simplify, redirect_deleted);
+        prune_active_set(dbg, active_set);
+        redirect_prev_edges(dbg, redirect_deleted, active_set);
     }
 
     static void cut_tips(dbg_map_t &dbg, int min_core_depth,
@@ -946,9 +975,13 @@ struct GraphCleaning {
             dbg.erase(node);
         }
     }
-    static void fix_edges(dbg_map_t &dbg) {
-        for (auto &node : dbg) {
-            if (node.second.redirected()) continue;
+    // Drops prev edges to erased or redirected nodes. Every live node is in
+    // active_set, so iterating it visits the same nodes as all of dbg.
+    static void fix_edges(dbg_map_t &dbg, const auto &active_set) {
+        for (u64 id : active_set) {
+            auto nit = dbg.find(id);
+            if (nit == dbg.end() || nit->second.redirected()) continue;
+            auto &node = *nit;
             auto &pvec = node.second.prev;
             for (auto it = pvec.begin(); it != pvec.end(); ++it) {
                 if (dbg.find(*it) == dbg.end() ||
@@ -970,17 +1003,21 @@ struct GraphCleaning {
         redir_map redirect_deleted;
         decltype(dbgi.active_set) &active_set = dbgi.active_set;
 
-        for (const auto &node : dbgi.dbg) {
-            active_set.insert(node.first);
-        }
         if (cfg.iterations > -1) {
-            simplify_simple_paths(dbgi.dbg, redirect_deleted, active_set,
-                                  acfg.threads.work);
+            // Initial simplification over all of dbg. active_set is not read
+            // before the first prune, which would leave exactly the live
+            // nodes, so it is built from those after the merge.
+            auto to_simplify =
+                simplify_simple_parallel_mark(dbgi.dbg, acfg.threads.work);
+            simplify_simple_parallel_sweep(dbgi.dbg, to_simplify,
+                                           redirect_deleted);
+            build_active_set(dbgi.dbg, active_set, true);
+            redirect_prev_edges(dbgi.dbg, redirect_deleted, active_set);
             IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                "Initial Simplification");
             cut_low_support_edges(dbgi.dbg, active_set);
             for (int i = 1; i < cfg.iterations; ++i) {
-                fix_edges(dbgi.dbg);
+                fix_edges(dbgi.dbg, active_set);
                 cut_tips(dbgi.dbg, 3, cfg.max_tip_length, active_set);
                 // Strict fork-2/merge-2 bubble popping (see pop_bubbles).
                 const size_t popped = pop_bubbles(
@@ -1001,7 +1038,9 @@ struct GraphCleaning {
                 IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                    "Iteration %d done.", i);
             }
-            fix_edges(dbgi.dbg);
+            fix_edges(dbgi.dbg, active_set);
+        } else {
+            build_active_set(dbgi.dbg, active_set, false);
         }
     }
 };
