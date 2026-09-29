@@ -2037,7 +2037,9 @@ TEST_CASE("Live syncmer selection matches the per-k-mer rule") {
         }
         const int64_t seq_len = 2 * n + 1;
         lps str = {0, 0, 0, nullptr};
-        const uint64_t got =
+        // got/c are read only by asserts, which DOCTEST_CONFIG_DISABLE (the
+        // lasm target) compiles away.
+        [[maybe_unused]] const uint64_t got =
             parse1_rle_syncmers(rle.data(), pos.data(), n, seq_len, &str, rule);
         uint64_t want = 0;
         const uint64_t kmask = (1ULL << (2 * k)) - 1;
@@ -2048,7 +2050,7 @@ TEST_CASE("Live syncmer selection matches the per-k-mer rule") {
                 !rule.is_submer(static_cast<uint32_t>(v)))
                 continue;
             REQUIRE(want < got);
-            const core &c = str.cores[want];
+            [[maybe_unused]] const core &c = str.cores[want];
             CHECK(c.label == v);
             CHECK(c.start == pos[e - k + 1]);
             CHECK(c.end == ((e + 1 < n) ? pos[e + 1] : seq_len));

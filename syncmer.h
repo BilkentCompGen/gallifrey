@@ -419,7 +419,9 @@ void select_windows(bool open, int w, int t, const R *__restrict h,
             sel[e] = (t == 0 || q < lo) & (q <= hi);
         } else {
             const R f = h[e], l = h[e - (w - 1)];
-            sel[e] = (f <= std::min(lo, l)) | (l < std::min(lo, f));
+            const bool first = f <= std::min(lo, l);
+            const bool last = l < std::min(lo, f);
+            sel[e] = first | last;
         }
     }
 }
