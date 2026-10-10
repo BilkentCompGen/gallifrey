@@ -1,0 +1,12 @@
+# ThreadSanitizer suppressions for lasm (TSAN_OPTIONS=suppressions=tests/tsan.supp).
+#
+# moodycamel::ConcurrentQueue, implicit producers: a dequeuer reads a slot,
+# then marks it empty with a release-only fetch_add on the block's
+# elementsCompletelyDequeued counter; the dequeuer that empties the block
+# returns it to the free list, and a producer that takes the block from the
+# free list writes the slot again. The counter RMW is not an acquire, so in
+# the C++ model the first dequeuer's read does not happen-before the reuse,
+# and TSan reports the slot write (enqueue) against the earlier slot read
+# (dequeue). The RMW chain orders them on x86 and ARMv8; the queue is
+# third-party code. Seen in print_dbg_seqs (--print-bi-dbg).
+race:moodycamel::ConcurrentQueue<*>::ImplicitProducer::enqueue<*>

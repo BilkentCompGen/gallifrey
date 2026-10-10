@@ -87,7 +87,7 @@ build/lasm hifi reads.bam \
   -l 5 \
   -t 16 \
   -@ 8 \
-  --dbg-lcmer-l 8 \
+  --lcmer-l 6 \
   --syncmer-k 11 \
   --submer-s 4 \
   --submer-t 5 \
@@ -104,7 +104,9 @@ Required:
 
 Core assembly controls:
 
-- `--dbg-lcmer-l`: rolling `lcmer` window length used for DBG construction
+- `--lcmer-l`: rolling `lcmer` window length (cores) used for DBG construction
+  and overlap detection (default 6). `--dbg-lcmer-l` is accepted as the old
+  name; `--olc-lcmer-l` is ignored.
 - `--random-seed`: hash/random seed
 
 Syncmer selection (Edgar 2021). A k-mer is selected by the position of its

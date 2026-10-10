@@ -477,8 +477,10 @@ struct GraphCleaning {
             // read of forward_edge_count.
             return false;
         }
-        // simplified implies the walk moved, i.e. current != seed.
-        redirect_deleted[id] = current->first;
+        // simplified implies the walk moved, i.e. current != seed. Assign
+        // under the submap lock: operator[] returns a reference after the
+        // lock is released, and a concurrent insert may rehash the submap.
+        redirect_deleted.insert_or_assign(id, current->first);
 
         current->second.forward_edge_count = first_fec;
         current->second.counts.core_count += cc_sum;
@@ -543,8 +545,8 @@ struct GraphCleaning {
         redir_map &redirect_deleted) {
         // Chains are node-disjoint (see the seed guard in
         // simplify_simple_parallel_mark), so each thread mutates only its own
-        // chain's nodes without synchronization. redirect_deleted is a mutexed
-        // parallel map.
+        // chain's nodes without synchronization. redirect_deleted is shared:
+        // it is written only through its locking insert_or_assign.
         gtl::vector<std::thread> threads;
         for (size_t i = 0; i < to_simplify.size(); ++i) {
             threads.emplace_back(

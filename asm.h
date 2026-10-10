@@ -85,8 +85,9 @@ struct asm_config {
     std::vector<std::string> inputs;
     std::string output;
     int lcp_level = 3;
-    int dbg_lcmer_l = 8;
-    int olc_lcmer_l = 8;
+    // LCMER window length (cores) of the DBG keys; overlap detection queries
+    // the same index, so it uses the same length.
+    int lcmer_l = 6;
     struct {
         int io = 4;
         int work = 8;
@@ -97,7 +98,7 @@ struct asm_config {
     syncmer_params syncmer;
     bool print_precleanup_graph = false;
     bool print_prelayout_graph = false;
-    // Drop crumb nodes (fewer than olc_lcmer_l+1 cores) that continue into a
+    // Drop crumb nodes (fewer than lcmer_l+1 cores) that continue into a
     // longer node instead of emitting them as C segments.
     bool drop_crumbs = true;
     bool silent = false;
@@ -124,8 +125,7 @@ struct asm_config {
         }
         fprintf(f, "Output: %s\n", output.c_str());
         fprintf(f, "LCP Level: %d\n", lcp_level);
-        fprintf(f, "DBG LCMER Length: %d\n", dbg_lcmer_l);
-        fprintf(f, "OLC LCMER Length: %d\n", olc_lcmer_l);
+        fprintf(f, "LCMER Length: %d\n", lcmer_l);
         fprintf(f, "Threads:\n\tIO: %d\n\tWork: %d\n", threads.io, threads.work);
         fprintf(f, "Seed: %zu\n", seed);
         fprintf(f, "RLE: %s\n", rle ? "true" : "false");

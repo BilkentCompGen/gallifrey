@@ -66,8 +66,7 @@ struct assembler {
     uint64_t seed;
     decltype(asm_config::syncmer) syncmer_params;
     SyncmerType syncmer_functor;
-    int dbg_lcmer_l;
-    int olc_lcmer_l;
+    int lcmer_l;
     bool parallel_file_reading;
     bool drop_crumbs;
 
@@ -81,23 +80,10 @@ struct assembler {
           syncmer_params{cfg.syncmer},
           // syncmer hash seed is 32-bit; truncate cfg.seed (size_t) to fit.
           syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)},
-          dbg_lcmer_l{cfg.dbg_lcmer_l},
-          olc_lcmer_l{cfg.olc_lcmer_l},
+          lcmer_l{cfg.lcmer_l},
           parallel_file_reading{cfg.parallel_file_reading},
           drop_crumbs{cfg.drop_crumbs} {
         inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
-        // Overlap detection queries the DBG keyed by length-`dbg_lcmer_l`
-        // lcmers; the litecmer hash is window-length dependent, so olc_lcmer_l
-        // must match dbg_lcmer_l for any key to hit.
-        if (olc_lcmer_l != dbg_lcmer_l) {
-            fprintf(stderr,
-                    "[config] WARNING: --olc-lcmer-l (%d) != --dbg-lcmer-l (%d). "
-                    "Overlap detection queries the DBG built at --dbg-lcmer-l, "
-                    "so mismatched lengths lose overlaps and collapse the "
-                    "layout. Set them equal unless you are deliberately "
-                    "probing this behavior.\n",
-                    olc_lcmer_l, dbg_lcmer_l);
-        }
     }
 
     template <class BFT>
@@ -217,6 +203,10 @@ struct assembler {
         }
         ll.push_back(0);
 
+        // Node ll[i] is the window of cores i..i+L-1. It stores the bases its
+        // own last core adds, [end(i+L-2), end(i+L-1)): they lie inside the
+        // key window, so a successor's fragment starts where this one ends on
+        // every path, and spelling a path concatenates fragments exactly.
         for (size_t i = 1; i < ll.size() - 1; ++i) {
             if (insert_lcmer_helper(ll, i, dbgi)) {
                 // Lets try atomic
@@ -225,39 +215,10 @@ struct assembler {
                     [&lr, i,
                      lcmer_l](dbg_index_base<BFT>::dbg_map_t::value_type &val) {
                         val.second.seq.emplace_back(
-                            lr.data, lr.pos[i + lcmer_l - 1].second,
-                            lr.pos[i + lcmer_l].second, val.first);
+                            lr.data, lr.pos[i + lcmer_l - 2].second,
+                            lr.pos[i + lcmer_l - 1].second, val.first);
                     });
             }
-        }
-    }
-    static void process_cores_for_basespace(
-        const lcp_read &lr, dbg_index &dbgi, [[maybe_unused]] int thread_id,
-        [[maybe_unused]] uint64_t &lcmer_index, int lcmer_l) {
-        // DBG node sequences stay in BASE space (actual substrings);
-        // overlap/layout coordinates stay in core-index space and scale to
-        // base offsets only at final emission.
-        LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
-
-        uint64_t val = dbgi.get(l).id;
-
-        for (size_t i = static_cast<size_t>(lcmer_l + 1);
-             i < lr.cores.size() - 1; ++i) {
-            uint64_t from = lr.pos[i - 1].second;
-            uint64_t to = lr.pos[i].second;
-
-            dbgi.dbg.modify_if(val, [&](dbg_index::dbg_map_t::value_type &val) {
-                if (val.second.seq.size() == 0) {
-                    if (to - from > 0) {
-                        val.second.seq.emplace_back(lr.data, from, to,
-                                                    val.first);
-                        // assert((to & 3) + 4 < lr.data_length);
-                    }
-                }
-            });
-            uint32_t in_core = lr.cores[i];
-            l.update_lcmer(in_core, lr.cores[i - lcmer_l], lcmer_l);
-            val = dbgi.get(l).id;
         }
     }
 
@@ -440,7 +401,7 @@ struct assembler {
                 process_data<Ops>(tid, lcp_level, data_queue, recycle_queue,
                                   dbgi, done, valid_read_counts[tid - 1],
                                   all_read_counts[tid - 1], Process_Func,
-                                  syncmer_functor, dbg_lcmer_l);
+                                  syncmer_functor, lcmer_l);
             });
         }
 
@@ -532,19 +493,6 @@ struct assembler {
         fprintf(stderr, "%" PRIu64 " processed\n%" PRIu64 " total reads\n",
                 valid_sum, all_sum);
         return {};
-    }
-
-    auto convert2basespace(dbg_index &dbgi) -> int {
-        u64 valid_sum = 0;
-        u64 all_sum = 0;
-        if (!run_over_inputs(dbgi, process_cores_for_basespace, valid_sum,
-                             all_sum)) {
-            fprintf(stderr, "Error in reading data for basespace conversion\n");
-            return -1;
-        }
-        fprintf(stderr, "%" PRIu64 " processed\n%" PRIu64 " total reads\n",
-                valid_sum, all_sum);
-        return 0;
     }
 
     size_t count_seqv_len(const gtl::vector<SequenceContainerType> &seqv) {
@@ -799,18 +747,13 @@ struct assembler {
     auto fold_dbg_graph(dbg_index &dbgi) {
         fprintf(stderr, "dbg_size: %zu\n", dbgi.dbg.size());
 
-        // Discard a match whose overlap spans less than 1/N of the SHORTER
-        // node's cores. Enforced at the reciprocity stage where both spans
-        // are known.
-        constexpr size_t MIN_OVERLAP_CORE_FRACTION_DIV = 20;
-
         std::atomic<int> all_n{0};
         std::atomic<int> hits{0};
         std::atomic<int> bad{0};
         // Phase-0 matching diagnostics.
-        std::atomic<int> too_short{0};   // < 4*olc_lcmer_l cores → no ranges (#4)
+        std::atomic<int> too_short{0};   // < 4*lcmer_l cores → no ranges (#4)
         std::atomic<int> no_ranges{0};   // long enough but 0 lcmer hits
-        std::atomic<int> frac_drop{0};   // reciprocal but < 5% of shorter node
+        std::atomic<int> short_drop{0};  // reciprocal but below span_floor
         gtl::parallel_flat_hash_map_d<u64, gtl::vector<SelfMatch>, HT_SHARD_BC,
                                       std::mutex>
             matched;
@@ -845,7 +788,7 @@ struct assembler {
                     lr.cores.emplace_back(str.cores[i].label);
                     lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
                 }
-                if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 1)) {
+                if (lr.cores.size() < static_cast<size_t>(lcmer_l + 1)) {
                     bad.fetch_add(1);
                     // good_n.fetch_sub(1);
                     free_lps(&str);
@@ -855,11 +798,11 @@ struct assembler {
                 // inclusive [from_core,to_core]. Diagnostic below mirrors its
                 // gate via OLC_SKIP_*.
                 if (lr.cores.size() <
-                    static_cast<size_t>(olc_lcmer_l + OLC_SKIP_FIRST(olc_lcmer_l) +
-                                        OLC_SKIP_LAST(olc_lcmer_l))) {
+                    static_cast<size_t>(lcmer_l + OLC_SKIP_FIRST(lcmer_l) +
+                                        OLC_SKIP_LAST(lcmer_l))) {
                     too_short.fetch_add(1);  // fails find_lcmer_ranges gate (#4)
                 }
-                auto found_ranges = find_lcmer_ranges(lr, dbgi, olc_lcmer_l);
+                auto found_ranges = find_lcmer_ranges(lr, dbgi, lcmer_l);
                 bool any_hit = false;
                 for (const auto &[id, from_core, to_core, from_lcmer,
                                   to_lcmer] : found_ranges) {
@@ -896,9 +839,8 @@ struct assembler {
                 }
                 if (!any_hit &&
                     lr.cores.size() >=
-                        static_cast<size_t>(olc_lcmer_l +
-                                            OLC_SKIP_FIRST(olc_lcmer_l) +
-                                            OLC_SKIP_LAST(olc_lcmer_l)))
+                        static_cast<size_t>(lcmer_l + OLC_SKIP_FIRST(lcmer_l) +
+                                            OLC_SKIP_LAST(lcmer_l)))
                     no_ranges.fetch_add(1);
                 free_lps(&str);
             },
@@ -908,7 +850,7 @@ struct assembler {
         int non_recip = 0, recip_kept = 0;
         // Absolute overlap-span floor in cores: half an lcmer window; below
         // this an overlap is treated as noise.
-        const u64 span_floor = std::max<u64>(2, (u64)olc_lcmer_l / 2);
+        const u64 span_floor = std::max<u64>(2, (u64)lcmer_l / 2);
         for (const auto &[k, v] : matched) {
             for (const auto &match : v) {
                 // Keep the overlap only if the partner records the reverse one
@@ -923,17 +865,14 @@ struct assembler {
                                              })
                               : gtl::vector<SelfMatch>::const_iterator{};
                 if (it != matched.end() && ff != it->second.end()) {
-                    // Span-symmetric fraction gate: overlap extent must be >=
-                    // 1/MIN_OVERLAP_CORE_FRACTION_DIV of the SHORTER node's
-                    // total cores and >= span_floor cores in absolute terms.
+                    // Overlap extent must be >= span_floor cores on both
+                    // nodes. No length-relative gate: a fraction of the
+                    // shorter node rejected the few-kb end overlaps that join
+                    // Mb-scale nodes.
                     const u64 span_a = match.self.to - match.self.from;
                     const u64 span_b = ff->self.to - ff->self.from;
-                    const u64 shorter_total =
-                        std::min(match.self.len, ff->self.len);
-                    if (std::min(span_a, span_b) <
-                        std::max(shorter_total / MIN_OVERLAP_CORE_FRACTION_DIV,
-                                 span_floor)) {
-                        frac_drop.fetch_add(1);
+                    if (std::min(span_a, span_b) < span_floor) {
+                        short_drop.fetch_add(1);
                         continue;
                     }
                     reciprocal.emplace(k,
@@ -948,9 +887,9 @@ struct assembler {
         fprintf(stderr, "all:%d\ngood: %d nodes\nhits: %d\n", all_n.load(),
                 all_n.load() - bad.load(), hits.load());
         fprintf(stderr,
-                "[match-diag] too_short:%d no_ranges:%d frac_drop:%d "
+                "[match-diag] too_short:%d no_ranges:%d short_drop:%d "
                 "recip_kept:%d non_recip:%d\n",
-                too_short.load(), no_ranges.load(), frac_drop.load(),
+                too_short.load(), no_ranges.load(), short_drop.load(),
                 recip_kept, non_recip);
         auto layouts =
             layout_graph_algo::connected_comp_plus_layout(reciprocal);
@@ -960,14 +899,14 @@ struct assembler {
                                std::move(dropped));
     }
 
-    // Crumbs: nodes with fewer than olc_lcmer_l+1 cores, too short to form
+    // Crumbs: nodes with fewer than lcmer_l+1 cores, too short to form
     // an lcmer and therefore invisible to overlap detection. A crumb with a
     // single live predecessor that continues into a longer node is not
     // emitted as its own C segment. Crumbs that sit between two long nodes
     // (a hub) or whose only continuation is a collapsed repeat (depth above
     // 3x the live median) are kept.
     gtl::flat_hash_set<u64> find_droppable_crumbs(const dbg_index &dbgi) const {
-        const u64 min_cores = static_cast<u64>(olc_lcmer_l + 1);
+        const u64 min_cores = static_cast<u64>(lcmer_l + 1);
         gtl::vector<double> depths;
         depths.reserve(dbgi.active_set.size());
         for (u64 nid : dbgi.active_set) {
@@ -1421,6 +1360,241 @@ TEST_CASE(
         CHECK_EQ(merged.skip_first_n, 0);
         CHECK_EQ(merged.origin_node, 0);
     }
+}
+
+// ── Node fragments: path spelling through bubbles ──────────────────────
+// Reads go through the production per-read step (process_cores) and graph
+// cleaning; node sequences are then compared with the haplotypes the reads
+// came from.
+namespace fragment_test {
+constexpr int kLevel = 3;
+constexpr int kLcmerL = 6;
+
+struct bubble {
+    u64 s;
+    u64 arm[2];
+    u64 t;
+};
+
+[[maybe_unused]] static std::string random_dna(size_t n, uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    std::string s(n, 'A');
+    for (auto &c : s) c = "ACGT"[rng() & 3];
+    return s;
+}
+
+// A base differing from the sequence's bases at pos-1, pos and pos+1, so a
+// substitution there changes the run-length-encoded sequence.
+[[maybe_unused]] static char other_base(const std::string &s, size_t pos) {
+    for (char c : std::string("ACGT")) {
+        if (c != s[pos - 1] && c != s[pos] && c != s[pos + 1]) return c;
+    }
+    return 'N';
+}
+
+// BAM one-hot nibbles (A=1, C=2, G=4, T=8, high nibble first), zero-padded
+// for the vectorised decoders.
+[[maybe_unused]] static gtl::vector<uint8_t> to_nibbles(const std::string &s) {
+    gtl::vector<uint8_t> nib(s.size() / 2 + 64, 0);
+    for (size_t i = 0; i < s.size(); ++i) {
+        const uint8_t c = s[i] == 'A'   ? 1
+                          : s[i] == 'C' ? 2
+                          : s[i] == 'G' ? 4
+                                        : 8;
+        nib[i / 2] |= (i % 2 == 0) ? static_cast<uint8_t>(c << 4) : c;
+    }
+    return nib;
+}
+
+// Error-free reads of `len` bases starting at `first`, every `step` bases,
+// plus one read ending at the haplotype's end.
+[[maybe_unused]] static void tile_reads(const std::string &hap, size_t len,
+                                        size_t first, size_t step,
+                                        std::vector<std::string> &out) {
+    for (size_t p = first; p + len <= hap.size(); p += step) {
+        out.push_back(hap.substr(p, len));
+    }
+    out.push_back(hap.substr(hap.size() - len));
+}
+
+// DBG from reads in input order: an lcmer's node and fragment come from the
+// read that sights it the second time.
+[[maybe_unused]] static void build_dbg(dbg_index &dbgi,
+                                       const std::vector<std::string> &reads) {
+    decltype(asm_config::syncmer) spara;
+    spara.apply_default_rule();
+    const assembler::SyncmerType fnctr(spara, 1453);
+    lps str = {0, 0, 0, 0};
+    charsi chs;
+    pos_scratch pos_buf;
+    uint64_t lcmer_index = 0;
+    for (const auto &r : reads) {
+        const auto nib = to_nibbles(r);
+        lcp_read lr;
+        parse_cores_from_nibbles(nib.data(), r.size(), kLevel, &str, fnctr, chs,
+                                 lr, pos_buf);
+        if (lr.cores.size() >= static_cast<size_t>(kLcmerL + 2)) {
+            assembler::process_cores<DefaultBF>(lr, dbgi, 0, lcmer_index,
+                                                kLcmerL);
+        }
+    }
+    free_lps(&str);
+    dbgi.count_forward_edges();
+}
+
+[[maybe_unused]] static void clean(dbg_index &dbgi,
+                                   size_t max_bubble_arm_length) {
+    asm_config cfg;
+    cfg.threads.work = 1;
+    cfg.silent = true;
+    cfg.graph_cleaning.max_bubble_arm_length = max_bubble_arm_length;
+    GraphCleaning::run(dbgi, cfg);
+}
+
+[[maybe_unused]] static std::string spell(const dbg_index &dbgi, u64 id) {
+    std::string out;
+    for (const auto &f : dbgi.dbg.find(id)->second.seq) {
+        const size_t at = out.size();
+        out.resize(at + f.len + 1);  // convert_to_ascii writes a terminator
+        f.convert_to_ascii(out.data() + at);
+        out.resize(at + f.len);
+    }
+    return out;
+}
+
+// Two-arm bubbles S -> {A0, A1} -> T whose arms are single unitigs.
+[[maybe_unused]] static std::vector<bubble> find_bubbles(
+    const dbg_index &dbgi) {
+    const auto fwd = GraphCleaning::build_live_fwd(dbgi.dbg, dbgi.active_set);
+    std::vector<bubble> out;
+    for (const auto &[s, succs] : fwd) {
+        if (succs.size() != 2) continue;
+        bubble b{s, {succs[0], succs[1]}, 0};
+        u64 t[2] = {0, 0};
+        for (int a = 0; a < 2; ++a) {
+            const auto it = fwd.find(b.arm[a]);
+            if (it != fwd.end() && it->second.size() == 1) t[a] = it->second[0];
+        }
+        if (t[0] != 0 && t[0] == t[1]) {
+            b.t = t[0];
+            out.push_back(b);
+        }
+    }
+    return out;
+}
+}  // namespace fragment_test
+
+TEST_CASE(
+    "Node fragments: diploid bubble arms carry the het and spell both "
+    "haplotypes exactly") {
+    using namespace fragment_test;
+    const std::string h1 = random_dna(9000, 7);
+    std::string h2 = h1;
+    const size_t snp = 3000;
+    h2[snp] = other_base(h1, snp);
+    // 7-bp deletion that cannot slide: its first/last bases differ from the
+    // bases after/before it.
+    size_t del = 6000;
+    const size_t del_len = 7;
+    while (h1[del] == h1[del + del_len] || h1[del - 1] == h1[del + del_len - 1])
+        ++del;
+    h2.erase(del, del_len);
+    const std::string *haps[2] = {&h1, &h2};
+    // Het k on haplotype h is [het_from[k], het_to[h][k]).
+    const size_t het_from[2] = {snp, del};
+    const size_t het_to[2][2] = {{snp + 1, del + del_len}, {snp + 1, del}};
+
+    // Interleaved haplotypes with different tilings, so the creating read of
+    // a shared node is either haplotype.
+    std::vector<std::string> r1, r2, reads;
+    tile_reads(h1, 3000, 0, 300, r1);
+    tile_reads(h2, 3000, 150, 300, r2);
+    for (size_t i = 0; i < std::max(r1.size(), r2.size()); ++i) {
+        if (i < r2.size()) reads.push_back(r2[i]);
+        if (i < r1.size()) reads.push_back(r1[i]);
+    }
+    dbg_index dbgi(0.001, 1 << 20, 42);
+    build_dbg(dbgi, reads);
+    clean(dbgi, 0);  // keep bubbles (--max-bubble-arm-length 0)
+
+    const auto bubbles = find_bubbles(dbgi);
+    REQUIRE_EQ(bubbles.size(), 2);
+    int seen[2] = {0, 0};
+    for (const auto &b : bubbles) {
+        const std::string S = spell(dbgi, b.s), T = spell(dbgi, b.t);
+        // Place S and T on a haplotype containing them (h1 if both do).
+        size_t s_at = std::string::npos, t_at = std::string::npos;
+        int th = -1;
+        for (int h = 1; h >= 0; --h) {
+            if (const size_t p = haps[h]->find(S); p != std::string::npos)
+                s_at = p;
+            if (const size_t p = haps[h]->find(T); p != std::string::npos) {
+                t_at = p;
+                th = h;
+            }
+        }
+        REQUIRE(s_at != std::string::npos);
+        REQUIRE(th >= 0);
+        const size_t s_end = s_at + S.size();
+        const int k = s_end < (snp + del) / 2 ? 0 : 1;
+        ++seen[k];
+        INFO("het ", k, " S ends at ", s_end, ", T starts at ", t_at);
+        // (a) The het lies between S and T, i.e. inside the arms.
+        CHECK(s_end <= het_from[k]);
+        CHECK(t_at >= het_to[th][k]);
+        // (b) S + arm + T spells one haplotype exactly, each arm another.
+        bool on[2][2];
+        for (int a = 0; a < 2; ++a) {
+            const std::string path = S + spell(dbgi, b.arm[a]) + T;
+            on[a][0] = h1.find(path) != std::string::npos;
+            on[a][1] = h2.find(path) != std::string::npos;
+            CHECK(on[a][0] != on[a][1]);
+        }
+        CHECK(on[0][0] != on[1][0]);
+        CHECK(on[0][1] != on[1][1]);
+    }
+    CHECK_EQ(seen[0], 1);
+    CHECK_EQ(seen[1], 1);
+}
+
+TEST_CASE(
+    "Node fragments: unitig through a popped read-error bubble is exact") {
+    using namespace fragment_test;
+    const std::string h = random_dna(6000, 11);
+    // The error read comes first (three copies, so its arm survives the
+    // low-support cut and is popped): every node around the error takes its
+    // fragment from it.
+    const size_t err = 3000;
+    std::string bad = h.substr(1500, 3000);
+    bad[err - 1500] = other_base(h, err);
+    std::vector<std::string> reads(3, bad);
+    tile_reads(h, 3000, 0, 250, reads);
+
+    // Without popping, the error forms one bubble.
+    {
+        dbg_index kept(0.001, 1 << 20, 42);
+        build_dbg(kept, reads);
+        clean(kept, 0);
+        REQUIRE_EQ(find_bubbles(kept).size(), 1);
+    }
+    dbg_index dbgi(0.001, 1 << 20, 42);
+    build_dbg(dbgi, reads);
+    clean(dbgi, 128);
+
+    REQUIRE(!dbgi.active_set.empty());
+    size_t through = 0;
+    for (u64 id : dbgi.active_set) {
+        const auto it = dbgi.dbg.find(id);
+        if (it == dbgi.dbg.end() || it->second.redirected()) continue;
+        const std::string u = spell(dbgi, id);
+        const size_t at = h.find(u);
+        INFO("unitig of ", u.size(), " bp");
+        CHECK(at != std::string::npos);
+        if (at != std::string::npos && at + 500 <= err &&
+            at + u.size() >= err + 500)
+            ++through;
+    }
+    CHECK_EQ(through, 1);
 }
 
 // ── Characterization tests: layout_graph_emit core algorithms ──────────
@@ -1955,6 +2129,57 @@ TEST_CASE("GraphCleaning::simplify_simple_paths leaves degenerate boundary "
         CHECK(m->second.redirected());
     }
     CHECK(redirect_deleted.find(109)->second == 101);
+}
+
+TEST_CASE("GraphCleaning parallel sweep records every chain's redirect") {
+    // Many disjoint chains a -> b -> c (c is a type-1 seed: fec 0, one prev)
+    // merged by many threads at once. Every seed must end up redirected to
+    // its chain head, with no write lost to a concurrent insert into the
+    // shared redirect map (that insert may rehash the submap the write
+    // targets). The unlocked write rarely loses a value in a plain build;
+    // a ThreadSanitizer build of lasm_tests reports it as a data race.
+    constexpr u64 kChains = 200'000;
+    constexpr int kThreads = 32;
+    dbg_index dbgi(0.001, 1024, 7);
+    auto add_node = [&](u64 id, std::initializer_list<u64> prevs,
+                        unsigned fec) {
+        dbgi.dbg.emplace(id, dbg_index::bidbg_val{100u});
+        auto it = dbgi.dbg.find(id);
+        for (u64 p : prevs) it->second.prev.push_back(p);
+        it->second.forward_edge_count = fec;
+        it->second.seq.emplace_back(40, 3);
+    };
+    for (u64 k = 0; k < kChains; ++k) {
+        const u64 a = 3 * k + 1, b = a + 1, c = a + 2;
+        add_node(a, {}, 1);
+        add_node(b, {a}, 1);
+        add_node(c, {b}, 0);
+    }
+
+    GraphCleaning::redir_map redirect_deleted;
+    const auto seeds =
+        GraphCleaning::simplify_simple_parallel_mark(dbgi.dbg, kThreads);
+    GraphCleaning::simplify_simple_parallel_sweep(dbgi.dbg, seeds,
+                                                  redirect_deleted);
+
+    size_t lost = 0, wrong_head = 0;
+    for (u64 k = 0; k < kChains; ++k) {
+        const u64 a = 3 * k + 1, c = a + 2;
+        auto rit = redirect_deleted.find(c);
+        if (rit == redirect_deleted.end() || rit->second == 0) {
+            ++lost;
+        } else if (rit->second != a) {
+            ++wrong_head;
+        }
+        auto head = dbgi.dbg.find(a);
+        if (head->second.seq.size() != 3 ||
+            head->second.counts.core_count != 300) {
+            ++wrong_head;
+        }
+    }
+    CHECK(redirect_deleted.size() == kChains);
+    CHECK(lost == 0);
+    CHECK(wrong_head == 0);
 }
 
 // ── Syncmer rule arithmetic ──────────────────────────────────────────────

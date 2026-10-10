@@ -125,7 +125,7 @@ inline constexpr size_t SCD_CORES_PER_CONTIG_HINT = 64;
 // Default max length (bp) of a post-layout C-node tip to prune.
 inline constexpr size_t DEFAULT_POST_LAYOUT_MAX_TIP_LEN = 50000;
 // Layout-boundary fuzz: a node counts as touching an end if it is within
-// max(olc_lcmer_l * BOUNDARY_FUZZ_LCMER_MULT, span / BOUNDARY_FUZZ_SPAN_DIV).
+// max(lcmer_l * BOUNDARY_FUZZ_LCMER_MULT, span / BOUNDARY_FUZZ_SPAN_DIV).
 inline constexpr i64 BOUNDARY_FUZZ_LCMER_MULT = 2;
 inline constexpr i64 BOUNDARY_FUZZ_SPAN_DIV = 20;
 
@@ -622,8 +622,7 @@ template <class AssemblerT>
 inline gtl::vector<gtl::vector<SequenceContainerType>>
 build_layout_sequence_from_nodes(
     [[maybe_unused]] AssemblerT &as, dbg_index &dbg,
-    const gtl::vector<ultra_layout_node_info> &lnodes,
-    [[maybe_unused]] int hash_combine_len, u64 layout_idx = 0) {
+    const gtl::vector<ultra_layout_node_info> &lnodes, u64 layout_idx = 0) {
     if (lnodes.empty()) return {};
 
     // ── Build lane_nodes ────────────────────────────────────────────
@@ -762,8 +761,7 @@ using layout_seq_t = gtl::vector<layout_comp_seqs_t>;
 
 template <class AssemblerT>
 inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
-    AssemblerT &as, dbg_index &dbg, const gtl::vector<ultra_layout_job> &jobs,
-    int hash_combine_len) {
+    AssemblerT &as, dbg_index &dbg, const gtl::vector<ultra_layout_job> &jobs) {
     gtl::vector<layout_seq_t> out_seqs(jobs.size());
     if (jobs.empty()) return out_seqs;
 
@@ -787,13 +785,11 @@ inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
                     continue;
                 }
                 out_seqs[job_idx] = build_layout_sequence_from_nodes(
-                    as, dbg, jobs[job_idx].lnodes, hash_combine_len,
-                    jobs[job_idx].layout_idx);
+                    as, dbg, jobs[job_idx].lnodes, jobs[job_idx].layout_idx);
             }
             while (job_queue.try_dequeue(job_idx)) {
                 out_seqs[job_idx] = build_layout_sequence_from_nodes(
-                    as, dbg, jobs[job_idx].lnodes, hash_combine_len,
-                    jobs[job_idx].layout_idx);
+                    as, dbg, jobs[job_idx].lnodes, jobs[job_idx].layout_idx);
             }
         });
     }
@@ -1043,7 +1039,7 @@ inline void build_layout_jobs(
                   });
 
         const i64 span = std::max<i64>(1, max_end - min_start);
-        const i64 fuzzy = std::max<i64>(as.olc_lcmer_l * BOUNDARY_FUZZ_LCMER_MULT,
+        const i64 fuzzy = std::max<i64>(as.lcmer_l * BOUNDARY_FUZZ_LCMER_MULT,
                                         span / BOUNDARY_FUZZ_SPAN_DIV);
         for (const auto &n : lnodes) {
             uint8_t mask = 0;
@@ -1389,9 +1385,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
                       node_boundary_mask);
 
     // ── Phase 2: build layout ("M") supernode sequences in parallel ─────
-    const int hash_combine_len = as.olc_lcmer_l;
-    auto layout_seqs =
-        build_layout_sequences_parallel(as, dbg, layout_jobs, hash_combine_len);
+    auto layout_seqs = build_layout_sequences_parallel(as, dbg, layout_jobs);
     TIME_CHECKPOINT(LayoutEmit, stderr, "Build layout sequences");
     for (size_t i = 0; i < layout_jobs.size(); ++i) {
         const auto &job = layout_jobs[i];

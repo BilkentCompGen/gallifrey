@@ -20,6 +20,7 @@ using std::string;
 class AsmProgram {
     asm_config cfg;
     std::string file_reading_mode{"sequential"};
+    int olc_lcmer_l_ignored = 0;  // --olc-lcmer-l: accepted, no effect
 
 public:
     explicit AsmProgram(CLI::App &parent) {
@@ -34,16 +35,14 @@ public:
         app.add_option("-l,--level", cfg.lcp_level, "LCP level to compute")
             ->required()
             ->check(CLI::Range(1, 64));
-        app.add_option("--dbg-lcmer-l", cfg.dbg_lcmer_l,
-                       "DBG LCMER window length")
+        app.add_option("--lcmer-l,--dbg-lcmer-l", cfg.lcmer_l,
+                       "LCMER window length, used for DBG construction and "
+                       "overlap detection (--dbg-lcmer-l is the old name)")
             ->check(CLI::Range(1, 64))
             ->capture_default_str();
-        app.add_option("--olc-lcmer-l", cfg.olc_lcmer_l,
-                       "OLC (overlap) LCMER window length. Overlap detection "
-                       "queries the DBG (built at --dbg-lcmer-l), so this must "
-                       "equal --dbg-lcmer-l or overlaps are lost")
-            ->check(CLI::Range(1, 64))
-            ->capture_default_str();
+        app.add_option("--olc-lcmer-l", olc_lcmer_l_ignored,
+                       "Ignored; overlap detection uses --lcmer-l")
+            ->group("");
         app.add_option("-t,--threads", cfg.threads.work,
                        "Number of worker threads")
             ->check(CLI::Range(1, MAXIMUM_WORK_THREADS))
@@ -71,7 +70,7 @@ public:
         app.add_flag("--silent", cfg.silent, "Do not print progress to stderr")
             ->capture_default_str();
         app.add_flag("--drop-crumbs,!--keep-crumbs", cfg.drop_crumbs,
-                     "Drop crumb nodes (fewer than olc-lcmer-l+1 cores, so "
+                     "Drop crumb nodes (fewer than lcmer-l+1 cores, so "
                      "invisible to overlap detection) that have a single "
                      "predecessor and continue into a longer node, instead of "
                      "emitting them as C segments. Halves the contig count at "
@@ -135,6 +134,12 @@ public:
             ->check(CLI::Range(0, 1000000))
             ->capture_default_str();
         app.callback([this]() {
+            if (olc_lcmer_l_ignored != 0) {
+                std::fprintf(stderr,
+                             "[config] --olc-lcmer-l is ignored; overlap "
+                             "detection uses --lcmer-l (%d)\n",
+                             cfg.lcmer_l);
+            }
             // Validate the syncmer configuration up front; a CLI error makes
             // CLI11 print the message and exit nonzero.
             cfg.syncmer.apply_default_rule();
