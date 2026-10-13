@@ -20,6 +20,7 @@ class DumpCoresProgram {
     int submer_s = 4;
     int submer_t = 5;
     int lcp_level = 4;
+    int lcmer_l = 0;
     uint64_t seed = 0;
 
 public:

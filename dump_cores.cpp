@@ -25,7 +25,7 @@ static input_format dump_input_format(const std::string &path) {
 static int run_dump_cores(const std::string &input_path,
                           const std::string &output_path, int syncmer_k,
                           int submer_s, int submer_t, int lcp_level,
-                          uint64_t seed) {
+                          int lcmer_l, uint64_t seed) {
     syncmer_params spara;
     spara.k = syncmer_k;
     spara.smer.s = submer_s;
@@ -44,7 +44,14 @@ static int run_dump_cores(const std::string &input_path,
         fprintf(stderr, "Cannot open output: %s\n", output_path.c_str());
         return 1;
     }
-    fprintf(out, "read_name\tread_len\tcore_idx\tcore_label\tstart\tend\tspan\n");
+    if (lcmer_l > 0)
+        fprintf(out,
+                "read_name\tread_len\twin_idx\tlcmer\tstart\tend\tfrag_start\t"
+                "frag_end\n");
+    else
+        fprintf(
+            out,
+            "read_name\tread_len\tcore_idx\tcore_label\tstart\tend\tspan\n");
 
     const input_format fmt = dump_input_format(input_path);
     if (fmt == input_format::invalid) {
@@ -70,6 +77,28 @@ static int run_dump_cores(const std::string &input_path,
         parse_cores_from_nibbles(rec.nibbles, rec.len, lcp_level, &str,
                                  syncmer_functor, chs, lr, pos_buf);
 
+        if (lcmer_l > 0) {
+            // Window w holds cores w..w+L-1 and is keyed like the DBG node of
+            // that window; its node fragment is the bases its last core adds.
+            if (lr.cores.size() < static_cast<size_t>(lcmer_l)) {
+                ++read_count;
+                continue;
+            }
+            LCmer l{lr.cores.begin(), lcmer_l};
+            for (size_t w = 0; w + lcmer_l <= lr.cores.size(); ++w) {
+                if (w > 0)
+                    l.update_lcmer(lr.cores[w + lcmer_l - 1], lr.cores[w - 1],
+                                   lcmer_l);
+                const size_t last = w + lcmer_l - 1;
+                fprintf(out, "%s\t%u\t%zu\t%" PRIu64 "\t%u\t%u\t%u\t%u\n",
+                        reader.name().c_str(), rec.len, w, l.value(),
+                        lr.pos[w].first, lr.pos[last].second,
+                        last > 0 ? lr.pos[last - 1].second : lr.pos[w].first,
+                        lr.pos[last].second);
+            }
+            ++read_count;
+            continue;
+        }
         for (size_t i = 0; i < lr.cores.size(); ++i) {
             fprintf(out, "%s\t%u\t%zu\t%" PRIu32 "\t%u\t%u\t%u\n",
                     reader.name().c_str(), rec.len, i, lr.cores[i],
@@ -109,12 +138,16 @@ DumpCoresProgram::DumpCoresProgram(CLI::App &parent) {
         ->capture_default_str();
     app.add_option("-l,--level", lcp_level, "LCP level to compute")
         ->capture_default_str();
+    app.add_option("--lcmer-l", lcmer_l,
+                   "Dump lcmer keys of this window length (DBG node keys) "
+                   "instead of cores; 0 dumps cores")
+        ->capture_default_str();
     app.add_option("--seed", seed, "Random seed")->capture_default_str();
     app.callback([this]() {
         // CLI11 callbacks return void; surface a nonzero rc as a
         // CLI::RuntimeError so CLI11_PARSE prints it and exits with that code.
         if (int rc = run_dump_cores(input, output, syncmer_k, submer_s,
-                                    submer_t, lcp_level, seed);
+                                    submer_t, lcp_level, lcmer_l, seed);
             rc != 0) {
             throw CLI::RuntimeError("dump-cores failed", rc);
         }
