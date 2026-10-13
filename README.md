@@ -132,8 +132,9 @@ Graph cleaning:
 
 - `--iterations`: number of graph-cleaning passes (default 6)
 - `--max-tip-length`: maximum tip length in cores
-- `--max-bubble-arm-length`: maximum arm length (cores) of a bubble arm to pop; `0` disables bubble popping
-- `--min-bubble-depth-difference-ratio`: pop the shallower arm when its depth ratio to the deeper arm is below this (default 2, i.e. depth is not a gate); `--min-bubble-length-difference`: maximum arm length ratio (default 2)
+- `--ploidy`: copies of a locus, `1` (default) or `2`; a bubble whose nodes all stay within the depth of one locus (its measured depth plus three times its spread) holds alleles or read errors and is popped, a deeper one is a repeat and is kept. With `2`, short dead-end branches at one-locus forks (allele tips) are cut as well
+- `--max-bubble-length`: largest bubble to pop, in inner cores (default 1024); `0` disables bubble popping
+- `--min-bubble-length-difference`: maximum length ratio of a bubble's removed nodes to its kept path (default 2)
 
 Layout:
 

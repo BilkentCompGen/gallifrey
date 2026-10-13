@@ -1442,12 +1442,11 @@ struct bubble {
     dbgi.count_forward_edges();
 }
 
-[[maybe_unused]] static void clean(dbg_index &dbgi,
-                                   size_t max_bubble_arm_length) {
+[[maybe_unused]] static void clean(dbg_index &dbgi, size_t max_bubble_length) {
     asm_config cfg;
     cfg.threads.work = 1;
     cfg.silent = true;
-    cfg.graph_cleaning.max_bubble_arm_length = max_bubble_arm_length;
+    cfg.graph_cleaning.max_bubble_length = max_bubble_length;
     GraphCleaning::run(dbgi, cfg);
 }
 
@@ -1515,7 +1514,7 @@ TEST_CASE(
     }
     dbg_index dbgi(0.001, 1 << 20, 42);
     build_dbg(dbgi, reads);
-    clean(dbgi, 0);  // keep bubbles (--max-bubble-arm-length 0)
+    clean(dbgi, 0);  // keep bubbles (--max-bubble-length 0)
 
     const auto bubbles = find_bubbles(dbgi);
     REQUIRE_EQ(bubbles.size(), 2);
@@ -2042,6 +2041,184 @@ TEST_CASE("layout_graph_emit::find_contained_cnodes keeps standalone/circular "
     CHECK(!contained.contains(21));
     CHECK(!contained.contains(40));  // boundary-adjacent: kept
     CHECK(!contained.contains(50));  // non-layout-adjacent: kept
+}
+
+TEST_CASE("GraphCleaning::pop_bubbles decides bubbles by depth") {
+    // X -> S -> {A, B} -> T -> Y. A node of depth d and n cores holds
+    // core_count d * n, so avg_core_count() == d. One copy reads 10.
+    dbg_index dbgi(0.001, 1024, 7);
+    auto add_node = [&](u64 id, std::initializer_list<u64> prevs,
+                        unsigned depth, unsigned fec) {
+        dbgi.dbg.emplace(id, dbg_index::bidbg_val{depth * 4});
+        auto it = dbgi.dbg.find(id);
+        for (int i = 0; i < 4; ++i) it->second.seq.emplace_back(10, 0);
+        for (u64 p : prevs) it->second.prev.push_back(p);
+        it->second.forward_edge_count = fec;
+        dbgi.active_set.insert(id);
+    };
+    constexpr u64 X = 1, S = 2, A = 3, B = 4, T = 5, Y = 6;
+    auto build = [&](unsigned ends, unsigned a, unsigned b) {
+        dbgi.dbg.clear();
+        dbgi.active_set.clear();
+        add_node(X, {}, ends, 1);
+        add_node(S, {X}, ends, 2);
+        add_node(A, {S}, a, 1);
+        add_node(B, {S}, b, 1);
+        add_node(T, {A, B}, ends, 1);
+        add_node(Y, {T}, ends, 0);
+    };
+    gtl::vector<popped_bubble> popped;
+    auto pop = [&](int ploidy) {
+        popped.clear();
+        return GraphCleaning::pop_bubbles(dbgi.dbg, 10.0, (ploidy + 0.5) * 10.0,
+                                          2, 1024, dbgi.active_set, popped);
+    };
+
+    SUBCASE("two alleles are popped on ploidy 2 and recorded") {
+        build(20, 11, 9);
+        CHECK(pop(2) == 1);
+        CHECK(dbgi.dbg.find(A) != dbgi.dbg.end());
+        CHECK(dbgi.dbg.find(B) == dbgi.dbg.end());
+        CHECK(dbgi.active_set.count(B) == 0);
+        CHECK(dbgi.dbg.find(T)->second.prev == gtl::vector<u64>{A});
+        CHECK(dbgi.dbg.find(S)->second.forward_edge_count == 1);
+        CHECK(dbgi.dbg.find(S)->second.prev == gtl::vector<u64>{X});
+        REQUIRE(popped.size() == 1);
+        CHECK_FALSE(popped[0].error);
+        CHECK(popped[0].alt.len == 40);
+        CHECK(popped[0].removed_depth == doctest::Approx(9));
+        CHECK(popped[0].kept_depth == doctest::Approx(11));
+    }
+    SUBCASE("the same bubble is kept on ploidy 1") {
+        build(20, 11, 9);
+        CHECK(pop(1) == 0);
+        CHECK(dbgi.dbg.find(B) != dbgi.dbg.end());
+        CHECK(popped.empty());
+    }
+    SUBCASE("a read-error arm is popped on ploidy 1") {
+        build(10, 10, 2);
+        CHECK(pop(1) == 1);
+        CHECK(dbgi.dbg.find(B) == dbgi.dbg.end());
+        REQUIRE(popped.size() == 1);
+        CHECK(popped[0].error);
+    }
+    SUBCASE("two-copy arms are a repeat and kept") {
+        build(40, 20, 19);
+        CHECK(pop(2) == 0);
+    }
+    SUBCASE("three-copy ends are a repeat and kept") {
+        build(30, 10, 9);
+        CHECK(pop(2) == 0);
+    }
+    SUBCASE("a self-loop on the sink is not a bubble") {
+        build(20, 11, 9);
+        dbgi.dbg.find(T)->second.prev.push_back(T);
+        CHECK(pop(2) == 0);
+        CHECK(dbgi.dbg.find(B) != dbgi.dbg.end());
+    }
+}
+
+TEST_CASE("GraphCleaning::pop_bubbles resolves nested bubbles inside out") {
+    // S -> {A -> {C, D} -> E, F} -> T, all inner nodes one copy (10).
+    dbg_index dbgi(0.001, 1024, 7);
+    auto add_node = [&](u64 id, std::initializer_list<u64> prevs,
+                        unsigned depth, unsigned fec) {
+        dbgi.dbg.emplace(id, dbg_index::bidbg_val{depth * 4});
+        auto it = dbgi.dbg.find(id);
+        for (int i = 0; i < 4; ++i) it->second.seq.emplace_back(10, 0);
+        for (u64 p : prevs) it->second.prev.push_back(p);
+        it->second.forward_edge_count = fec;
+        dbgi.active_set.insert(id);
+    };
+    constexpr u64 S = 1, A = 2, C = 3, D = 4, E = 5, F = 6, T = 7;
+    add_node(S, {}, 20, 2);
+    add_node(A, {S}, 10, 2);
+    add_node(C, {A}, 10, 1);
+    add_node(D, {A}, 9, 1);
+    add_node(E, {C, D}, 10, 1);
+    add_node(F, {S}, 10, 1);
+    add_node(T, {E, F}, 20, 0);
+
+    gtl::vector<popped_bubble> popped;
+    CHECK(GraphCleaning::pop_bubbles(dbgi.dbg, 10.0, 25.0, 4, 1024,
+                                     dbgi.active_set, popped) == 2);
+    // A -> {C, D} -> E pops first; S -> {A C E, F} -> T then pops too.
+    CHECK(dbgi.dbg.find(D) == dbgi.dbg.end());
+    CHECK(dbgi.dbg.find(F) == dbgi.dbg.end());
+    CHECK(dbgi.dbg.find(C)->second.prev == gtl::vector<u64>{A});
+    CHECK(dbgi.dbg.find(T)->second.prev == gtl::vector<u64>{E});
+    REQUIRE(popped.size() == 2);
+    CHECK(popped[0].alt.len == 40);  // D
+    CHECK(popped[1].alt.len == 40);  // F
+}
+
+TEST_CASE("GraphCleaning::one_copy_depth takes the lowest strong peak") {
+    dbg_index dbgi(0.001, 1024, 7);
+    auto add_node = [&](u64 id, unsigned depth, unsigned cores) {
+        dbgi.dbg.emplace(id, dbg_index::bidbg_val{depth * cores});
+        auto it = dbgi.dbg.find(id);
+        for (unsigned i = 0; i < cores; ++i) it->second.seq.emplace_back(10, 0);
+        dbgi.active_set.insert(id);
+    };
+    // 60% of long-node cores at depth 10, 40% at 20; short nodes are noise.
+    for (u64 id = 1; id <= 6; ++id) add_node(id, 10, 100);
+    for (u64 id = 7; id <= 10; ++id) add_node(id, 20, 100);
+    for (u64 id = 11; id <= 60; ++id) add_node(id, 3, 8);
+    CHECK(GraphCleaning::one_copy_depth(dbgi.dbg, dbgi.active_set) ==
+          doctest::Approx(10).epsilon(0.05));
+}
+
+TEST_CASE("GraphCleaning::cut_fork_tips cuts tips within one locus") {
+    // X -> {Y -> Z, tip}: Y -> Z is longer than a tip, the tip dead-ends.
+    dbg_index dbgi(0.001, 1024, 7);
+    auto add_node = [&](u64 id, std::initializer_list<u64> prevs,
+                        unsigned depth, unsigned cores, unsigned fec) {
+        dbgi.dbg.emplace(id, dbg_index::bidbg_val{depth * cores});
+        auto it = dbgi.dbg.find(id);
+        for (unsigned i = 0; i < cores; ++i) it->second.seq.emplace_back(10, 0);
+        for (u64 p : prevs) it->second.prev.push_back(p);
+        it->second.forward_edge_count = fec;
+        dbgi.active_set.insert(id);
+    };
+    constexpr u64 X = 1, Y = 2, Z = 3, TIP = 4;
+    auto build = [&](unsigned tip_depth) {
+        dbgi.dbg.clear();
+        dbgi.active_set.clear();
+        add_node(X, {}, 20, 4, 2);
+        add_node(Y, {X}, 10, 4, 1);
+        add_node(Z, {Y}, 10, 100, 0);
+        add_node(TIP, {X}, tip_depth, 4, 0);
+    };
+    gtl::vector<popped_bubble> popped;
+    auto cut = [&](double limit) {
+        popped.clear();
+        return GraphCleaning::cut_fork_tips(dbgi.dbg, 10.0, limit, 64,
+                                            dbgi.active_set, popped);
+    };
+    SUBCASE("allele tip at a two-copy fork, ploidy 2: cut and recorded") {
+        build(10);
+        CHECK(cut(25.0) == 1);
+        CHECK(dbgi.dbg.find(TIP) == dbgi.dbg.end());
+        CHECK(dbgi.dbg.find(X)->second.forward_edge_count == 1);
+        REQUIRE(popped.size() == 1);
+        CHECK_FALSE(popped[0].error);
+        CHECK(popped[0].alt.len == 40);
+    }
+    SUBCASE("the same fork is a repeat on ploidy 1: kept") {
+        build(10);
+        CHECK(cut(15.0) == 0);
+        CHECK(dbgi.dbg.find(TIP) != dbgi.dbg.end());
+    }
+    SUBCASE("a tip deeper than one locus is a repeat copy: kept") {
+        build(30);
+        CHECK(cut(25.0) == 0);
+    }
+    SUBCASE("an error tip is cut and marked") {
+        build(2);
+        CHECK(cut(25.0) == 1);
+        REQUIRE(popped.size() == 1);
+        CHECK(popped[0].error);
+    }
 }
 
 TEST_CASE("GraphCleaning::simplify_simple_paths terminates on self-loops"

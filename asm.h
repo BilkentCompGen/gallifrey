@@ -110,8 +110,10 @@ struct asm_config {
         int iterations = 6;
         int max_tip_length = 8 * 2;
         double min_bubble_length_difference = 2;
-        size_t max_bubble_arm_length = 128;
-        double min_bubble_depth_difference_percentage = 2;
+        // Inner cores of the largest bubble to pop; 0 disables popping.
+        size_t max_bubble_length = 1024;
+        // Bubbles within this many copies lie at one locus and are popped.
+        int ploidy = 1;
     } graph_cleaning;
 
     void print_cfg(FILE *f) const {
@@ -141,12 +143,10 @@ struct asm_config {
         fprintf(f,
                 "Graph Cleaning Parameters: \n\tIterations: %d\n\tMax Tip "
                 "Length: %d\n\tMin Bubble Length Difference: %.2f\n\tMax "
-                "Bubble Arm Length: %zu\n\tMin Bubble Depth Difference "
-                "Rate: %.2f\n",
+                "Bubble Length: %zu\n\tPloidy: %d\n",
                 graph_cleaning.iterations, graph_cleaning.max_tip_length,
                 graph_cleaning.min_bubble_length_difference,
-                graph_cleaning.max_bubble_arm_length,
-                graph_cleaning.min_bubble_depth_difference_percentage);
+                graph_cleaning.max_bubble_length, graph_cleaning.ploidy);
     }
 };
 

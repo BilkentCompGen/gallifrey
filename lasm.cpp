@@ -115,23 +115,22 @@ public:
             ->check(CLI::Range(0, 1000000))
             ->capture_default_str();
         gcg->add_option(
-               "--min-bubble-depth-difference-ratio",
-               cfg.graph_cleaning.min_bubble_depth_difference_percentage,
-               "Pops the shallower bubble arm when min_depth(shallow) / "
-               "min_depth(deep) < arg; arg >= 1 pops regardless of depth.")
-            ->capture_default_str();
-        gcg->add_option(
                "--min-bubble-length-difference",
                cfg.graph_cleaning.min_bubble_length_difference,
-               "Maximum length ratio between bubble arms to pop: pops when "
-               "longer_arm <= shorter_arm * arg; more divergent arms are kept.")
+               "Maximum length ratio of a bubble's removed nodes to its kept "
+               "path; more divergent bubbles are kept.")
             ->capture_default_str();
-        gcg->add_option(
-               "--max-bubble-arm-length",
-               cfg.graph_cleaning.max_bubble_arm_length,
-               "Maximum arm length (in cores) of a bubble arm to pop; "
-               "longer arms are treated as real copy divergence and kept.")
+        gcg->add_option("--max-bubble-length",
+                        cfg.graph_cleaning.max_bubble_length,
+                        "Maximum inner length (in cores) of a bubble to pop; 0 "
+                        "disables bubble popping.")
             ->check(CLI::Range(0, 1000000))
+            ->capture_default_str();
+        gcg->add_option("--ploidy", cfg.graph_cleaning.ploidy,
+                        "Copies of a locus (1 or 2): bubbles whose nodes read "
+                        "at most this many copies are popped, deeper ones are "
+                        "repeats and kept; 2 also cuts allele tips at forks")
+            ->check(CLI::Range(1, 2))
             ->capture_default_str();
         app.callback([this]() {
             if (olc_lcmer_l_ignored != 0) {

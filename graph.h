@@ -63,6 +63,18 @@ using u64 = uint64_t;
 using i64 = int64_t;
 using u32 = uint32_t;
 using DefaultBF = bloom_interface<bloom_ext::BlockedAtomicBloomFilter<>>;
+// A bubble removed by GraphCleaning::pop_bubbles, kept so the removed allele
+// can be written as an alternate sequence after layout. The fragments of the
+// source's last and the sink's first lcmer keep their origin ids through
+// every later merge, so they locate the bubble in the final unitigs.
+struct popped_bubble {
+    u64 source_origin;
+    u64 sink_origin;
+    bool error;                 // removed nodes read below half a copy
+    float removed_depth;        // highest avg_core_count among removed nodes
+    float kept_depth;           // lowest avg_core_count on the kept path
+    SequenceContainerType alt;  // best removed path, source to sink
+};
 template <class BFT = DefaultBF>
 struct dbg_index_base {
     using BloomFilterType = BFT;
@@ -136,6 +148,7 @@ struct dbg_index_base {
 
     dbg_map_t dbg;
     gtl::btree_set<u64> active_set;
+    gtl::vector<popped_bubble> popped_bubbles;
 
     // merge_info_map_t merge_map;
     BloomFilterType bf;
@@ -342,6 +355,56 @@ struct GraphCleaning {
         const auto &pool = filtered.empty() ? depths : filtered;
         stats.baseline = median_of_sorted(pool);
         return stats;
+    }
+
+    // Depth (avg_core_count) of one copy: the lowest peak of the depth
+    // histogram of long nodes, weighted by cores, that holds at least 10% of
+    // the long-node cores within +-25% of it. Long nodes average many
+    // lcmers, so their depths are sharp. Returns 0 without long nodes.
+    static double one_copy_depth(const dbg_map_t &dbg,
+                                 const gtl::btree_set<u64> &active_set) {
+        constexpr size_t kMinCores = 32;
+        constexpr int kBins = 512;
+        constexpr double kLogLow = -3.0, kLogStep = 0.025;
+        gtl::vector<double> hist(kBins, 0.0), smooth(kBins, 0.0);
+        double total = 0.0;
+        for (u64 node : active_set) {
+            auto it = dbg.find(node);
+            if (it == dbg.end() || it->second.redirected()) continue;
+            const size_t len = it->second.seq.size();
+            if (len < kMinCores) continue;
+            const double d = it->second.avg_core_count();
+            if (d <= 0.0) continue;
+            const int bin =
+                std::clamp(static_cast<int>((std::log(d) - kLogLow) / kLogStep),
+                           0, kBins - 1);
+            hist[bin] += len;
+            total += len;
+        }
+        if (total == 0.0) return 0.0;
+        const auto bin_depth = [](int bin) {
+            return std::exp(kLogLow + (bin + 0.5) * kLogStep);
+        };
+        for (int bin = 0; bin < kBins; ++bin) {
+            for (int k = -3; k <= 3; ++k) {
+                if (bin + k >= 0 && bin + k < kBins)
+                    smooth[bin] += hist[bin + k] * (4 - std::abs(k));
+            }
+        }
+        for (int bin = 1; bin + 1 < kBins; ++bin) {
+            if (smooth[bin] < smooth[bin - 1] ||
+                smooth[bin] <= smooth[bin + 1]) {
+                continue;  // not a peak
+            }
+            const double peak = bin_depth(bin);
+            double near = 0.0;
+            for (int other = 0; other < kBins; ++other) {
+                const double d = bin_depth(other);
+                if (d >= 0.75 * peak && d <= 1.25 * peak) near += hist[other];
+            }
+            if (near >= 0.1 * total) return peak;
+        }
+        return 0.0;
     }
     struct loop_copy_estimate {
         double base_cn = 1.0;
@@ -740,132 +803,444 @@ struct GraphCleaning {
         return fwd;
     }
 
-    // Walk a simple forward path from `start` until a reconvergence node
-    // (>= 2 predecessors) is reached; return it. Abort (0) on non-simple
-    // nodes, divergence, dead/stale edges, cycles, or the node cap. The path
-    // is collected excluding the sink.
-    static u64 walk_arm_path(
+    // Bubble search from fork `sid` (Onodera et al. 2013): a node is visited
+    // once all its predecessors are visited; the bubble closes when exactly
+    // one reached node is left, the sink. Visited nodes other than `sid` go
+    // to `inner`, each after its predecessors. Returns the sink, or 0 on a
+    // dead end, a stale edge, a cycle, a self-loop, or when the inner nodes
+    // exceed max_nodes nodes or max_len cores.
+    static u64 find_bubble_sink(
         const dbg_map_t &dbg,
-        const gtl::flat_hash_map<u64, gtl::vector<u64>> &fwd, u64 start,
-        gtl::vector<u64> &path) {
-        path.clear();
-        u64 cur = start;
-        constexpr size_t kMaxArmNodes = 64;
-        for (size_t step = 0; step < kMaxArmNodes; ++step) {
+        const gtl::flat_hash_map<u64, gtl::vector<u64>> &fwd, u64 sid,
+        size_t max_nodes, size_t max_len, gtl::vector<u64> &inner) {
+        inner.clear();
+        gtl::flat_hash_set<u64> visited;
+        gtl::flat_hash_set<u64> reached;  // reached but not visited yet
+        gtl::vector<u64> ready{sid};
+        size_t len = 0;
+        while (!ready.empty()) {
+            const u64 cur = ready.back();
+            ready.pop_back();
             auto cit = dbg.find(cur);
             if (cit == dbg.end() || cit->second.redirected()) return 0;
-            if (cit->second.prev.size() != 1) return 0;
-            path.push_back(cur);
+            const auto &cprev = cit->second.prev;
+            if (std::find(cprev.begin(), cprev.end(), cur) != cprev.end()) {
+                return 0;  // self-loop: a tandem repeat unit
+            }
+            visited.insert(cur);
+            reached.erase(cur);
+            if (cur != sid) {
+                inner.push_back(cur);
+                len += cit->second.seq.size();
+                if (inner.size() > max_nodes || len > max_len) return 0;
+            }
             auto nxt_it = fwd.find(cur);
-            if (nxt_it == fwd.end() || nxt_it->second.empty()) return 0;
-            u64 next = 0;
-            for (u64 cand : nxt_it->second) {
-                auto nit = dbg.find(cand);
+            if (nxt_it == fwd.end() || nxt_it->second.empty()) {
+                return 0;  // dead end inside the bubble
+            }
+            for (u64 next : nxt_it->second) {
+                if (next == sid) return 0;  // cycle back onto the fork
+                auto nit = dbg.find(next);
                 if (nit == dbg.end() || nit->second.redirected()) {
                     return 0;  // stale edge from an earlier mutation
                 }
-                if (next != 0) return 0;  // divergence
-                next = cand;
+                reached.insert(next);
+                bool all_prev_visited = true;
+                for (u64 p : nit->second.prev) {
+                    auto pit = dbg.find(p);
+                    if (pit == dbg.end() || pit->second.redirected()) {
+                        continue;  // stale edge to a removed node
+                    }
+                    if (!visited.contains(p)) {
+                        all_prev_visited = false;
+                        break;
+                    }
+                }
+                if (all_prev_visited) ready.push_back(next);
             }
-            if (next == start) return 0;  // cycle back onto the arm start
-            auto nit = dbg.find(next);
-            if (nit->second.prev.size() >= 2) return next;  // sink
-            cur = next;
+            if (ready.size() == 1 && reached.size() == 1) {
+                const u64 tid = ready[0];
+                const auto &tprev = dbg.find(tid)->second.prev;
+                if (std::find(tprev.begin(), tprev.end(), tid) != tprev.end()) {
+                    return 0;  // self-loop on the sink
+                }
+                if (auto tnext = fwd.find(tid);
+                    tnext != fwd.end() &&
+                    std::find(tnext->second.begin(), tnext->second.end(),
+                              sid) != tnext->second.end()) {
+                    return 0;  // sink leads straight back to the fork
+                }
+                return inner.empty() ? 0 : tid;
+            }
         }
-        return 0;  // cap exceeded
+        return 0;
     }
 
-    // Arm stats: core count and minimum avg_core_count along a path. Dead
-    // nodes anywhere on the path abort with {0, 0.0}.
-    static std::pair<size_t, double> arm_depth_len(
-        const dbg_map_t &dbg, const gtl::vector<u64> &path) {
+    // Heaviest sid -> tid path through a bubble found by find_bubble_sink
+    // (`inner` lists every node after its predecessors). A node weighs its
+    // lcmer support (core_count), or nothing when it is in `weightless`.
+    // Returns the inner nodes of the path in order.
+    static gtl::vector<u64> heaviest_bubble_path(
+        const dbg_map_t &dbg, u64 sid, u64 tid, const gtl::vector<u64> &inner,
+        const gtl::flat_hash_set<u64> &weightless) {
+        // node -> (weight of the best path ending here, its predecessor)
+        gtl::flat_hash_map<u64, std::pair<double, u64>> best;
+        best[sid] = {0.0, 0};
+        const auto best_into = [&](u64 nid, double weight) {
+            std::pair<double, u64> out{-1.0, 0};
+            for (u64 p : dbg.find(nid)->second.prev) {
+                auto bit = best.find(p);
+                if (bit == best.end()) continue;  // not in the bubble
+                if (bit->second.first + weight > out.first) {
+                    out = {bit->second.first + weight, p};
+                }
+            }
+            return out;
+        };
+        for (u64 nid : inner) {
+            const double weight =
+                weightless.contains(nid)
+                    ? 0.0
+                    : (double)dbg.find(nid)->second.counts.core_count;
+            best[nid] = best_into(nid, weight);
+        }
+        gtl::vector<u64> path;
+        for (u64 nid = best_into(tid, 0.0).second; nid != sid;
+             nid = best[nid].second) {
+            path.push_back(nid);
+        }
+        std::reverse(path.begin(), path.end());
+        return path;
+    }
+
+    // Copy of a bubble's removed allele with its depths and anchors.
+    static popped_bubble make_popped_bubble(const dbg_map_t &dbg, u64 sid,
+                                            u64 tid,
+                                            const gtl::vector<u64> &alt_path,
+                                            bool error, double removed_depth,
+                                            double kept_depth) {
+        gtl::vector<SequenceContainerType> frags;
         size_t len = 0;
-        double min_depth = std::numeric_limits<double>::infinity();
-        for (u64 nid : path) {
-            auto nit = dbg.find(nid);
-            if (nit == dbg.end() || nit->second.redirected()) {
-                return {0, 0.0};
+        for (u64 nid : alt_path) {
+            for (const auto &frag : dbg.find(nid)->second.seq) {
+                frags.push_back(SequenceContainerType::copy_of(frag));
+                len += frag.len;
             }
-            len += nit->second.seq.size();
-            min_depth = std::min(min_depth, nit->second.avg_core_count());
         }
-        return {len, min_depth};
+        const auto &sseq = dbg.find(sid)->second.seq;
+        const auto &tseq = dbg.find(tid)->second.seq;
+        return popped_bubble{sseq.empty() ? 0 : sseq.back().origin_node,
+                             tseq.empty() ? 0 : tseq.front().origin_node,
+                             error,
+                             (float)removed_depth,
+                             (float)kept_depth,
+                             frags.empty()
+                                 ? SequenceContainerType()
+                                 : SequenceContainerType(frags, 0, len)};
     }
 
-    // Bubble popping (strict fork-2 -> merge-2 bubbles).
-    // A bubble is two node-disjoint simple paths S -> ... -> T between a
-    // 2-successor fork S and a 2-predecessor merge T (S != T). Pops the
-    // shallower arm (minimum avg_core_count) when its depth ratio to the
-    // deeper arm is below bubble_depth_epsilon and the two arm lengths (core
-    // counts) are within bubble_length_bound. Arms longer than
-    // max_popped_arm_len are kept; 0 disables popping. Only strict 2/2
-    // topology is popped. Returns the number of popped arms.
-    static size_t pop_bubbles(dbg_map_t &dbg, double bubble_depth_epsilon,
-                              double bubble_length_bound,
-                              size_t max_popped_arm_len, auto &active_set) {
-        if (max_popped_arm_len == 0) return 0;
+    // Depth above which a node holds more copies than one locus of `ploidy`
+    // copies, measured once before cleaning on the fork nodes (nodes with
+    // two or more successors; most sit at one locus): median m and
+    // cv = 1.4826 * MAD / m of the fork depths within half to one and a half
+    // times ploidy * one_copy. A node beyond m * (1 + 3 cv) holds more copies
+    // with about 1 in 1000 chance of being a locus node by noise. Measured
+    // once because popping leaves mostly repeat forks behind, which would
+    // shift the estimate up.
+    static double locus_depth_limit(const dbg_map_t &dbg,
+                                    const gtl::btree_set<u64> &active_set,
+                                    double one_copy, int ploidy) {
+        const double expected = ploidy * one_copy;
+        const auto fwd = build_live_fwd(dbg, active_set);
+        gtl::vector<double> depths;
+        for (const auto &[id, succs] : fwd) {
+            if (succs.size() < 2) continue;
+            const double d = dbg.find(id)->second.avg_core_count();
+            if (d >= 0.5 * expected && d <= 1.5 * expected) depths.push_back(d);
+        }
+        if (depths.size() < 100) return (ploidy + 0.5) * one_copy;
+        std::sort(depths.begin(), depths.end());
+        const double m = median_of_sorted(depths);
+        gtl::vector<double> dev;
+        dev.reserve(depths.size());
+        for (double d : depths) dev.push_back(std::abs(d - m));
+        std::sort(dev.begin(), dev.end());
+        const double cv = 1.4826 * median_of_sorted(dev) / m;
+        return m * (1.0 + 3.0 * cv);
+    }
+
+    // Bubble popping by copy number. `one_copy` is the depth of one copy (see
+    // one_copy_depth), `locus_limit` the depth of one locus (see
+    // locus_depth_limit). A bubble whose source, sink and inner nodes all
+    // stay below locus_limit lies at one locus: its arms are alleles or read
+    // errors, and it is popped, keeping its heaviest path. A bubble with any
+    // node beyond it is a repeat whose arms are different copies; popping it
+    // would collapse them, so it is kept. The removed side's depth only marks
+    // the record as a read error (below half a copy). Removed nodes may hold
+    // at most bubble_length_bound times the kept path's cores. Bubbles are
+    // decided smallest first, so nested ones resolve from the inside out.
+    // Each pop is appended to `popped` before its nodes go. max_bubble_len
+    // (inner cores) 0 disables popping.
+    static size_t pop_bubbles(dbg_map_t &dbg, double one_copy,
+                              double locus_limit, double bubble_length_bound,
+                              size_t max_bubble_len, auto &active_set,
+                              gtl::vector<popped_bubble> &popped) {
+        if (max_bubble_len == 0 || one_copy <= 0.0) return 0;
+        constexpr size_t kMaxBubbleNodes = 256;
         auto fwd = build_live_fwd(dbg, active_set);
 
-        gtl::vector<u64> to_rm;
-        size_t popped = 0;
+        // Forks that open a bubble, smallest bubble first.
+        gtl::vector<std::pair<size_t, u64>> forks;
+        gtl::vector<u64> inner;
         for (u64 sid : active_set) {
+            auto ffit = fwd.find(sid);
+            if (ffit == fwd.end() || ffit->second.size() < 2) continue;
+            if (find_bubble_sink(dbg, fwd, sid, kMaxBubbleNodes, max_bubble_len,
+                                 inner) == 0) {
+                continue;
+            }
+            size_t len = 0;
+            for (u64 nid : inner) len += dbg.find(nid)->second.seq.size();
+            forks.push_back({len, sid});
+        }
+        std::sort(forks.begin(), forks.end());
+
+        gtl::vector<u64> to_rm;
+        size_t n_popped = 0;
+        for (const auto &[_, sid] : forks) {
+            // Earlier pops change the graph, so the bubble is searched again.
             auto sit = dbg.find(sid);
             if (sit == dbg.end() || sit->second.redirected()) continue;
             auto ffit = fwd.find(sid);
-            if (ffit == fwd.end() || ffit->second.size() != 2) continue;
+            if (ffit == fwd.end() || ffit->second.size() < 2) continue;
+            const u64 tid = find_bubble_sink(dbg, fwd, sid, kMaxBubbleNodes,
+                                             max_bubble_len, inner);
+            if (tid == 0) continue;
 
-            gtl::vector<u64> path0, path1;
-            const u64 t0 = walk_arm_path(dbg, fwd, ffit->second[0], path0);
-            if (t0 == 0) continue;
-            const u64 t1 = walk_arm_path(dbg, fwd, ffit->second[1], path1);
-            if (t1 == 0) continue;
+            const gtl::vector<u64> keep =
+                heaviest_bubble_path(dbg, sid, tid, inner, {});
+            const gtl::flat_hash_set<u64> kept(keep.begin(), keep.end());
 
-            // Loop bubble: an arm closes back onto the fork S (walk sinks at
-            // S). Not popped: shallow loop arms are low-coverage repeat units.
-            if (t0 == sid || t1 == sid) continue;
-            if (t1 != t0) continue;  // fork-join: arms must reconverge
-
-            auto tit = dbg.find(t0);
-            if (tit == dbg.end() || tit->second.redirected() ||
-                tit->second.prev.size() != 2) {
-                continue;  // strict 2-merge only
+            double removed_depth = 0.0, inner_high = 0.0;
+            double kept_depth =
+                std::min(sit->second.avg_core_count(),
+                         dbg.find(tid)->second.avg_core_count());
+            size_t removed_len = 0, kept_len = 0;
+            for (u64 nid : inner) {
+                const auto &node = dbg.find(nid)->second;
+                const double d = node.avg_core_count();
+                inner_high = std::max(inner_high, d);
+                if (kept.contains(nid)) {
+                    kept_len += node.seq.size();
+                } else {
+                    removed_depth = std::max(removed_depth, d);
+                    removed_len += node.seq.size();
+                }
             }
-
-            auto [len0, d0] = arm_depth_len(dbg, path0);
-            auto [len1, d1] = arm_depth_len(dbg, path1);
-            if (len0 == 0 || len1 == 0) continue;
-            const size_t lmax = std::max(len0, len1);
-            const size_t lmin = std::min(len0, len1);
-            if ((double)lmax > (double)lmin * bubble_length_bound) {
-                continue;  // lengths too divergent
+            for (u64 nid : keep) {
+                kept_depth = std::min(kept_depth,
+                                      dbg.find(nid)->second.avg_core_count());
             }
-            const double dhi = std::max(d0, d1);
-            const double dlo = std::min(d0, d1);
-            if (dhi <= 0.0 || dlo / dhi >= bubble_depth_epsilon) continue;
-
-            const size_t dead_len = (d0 <= d1) ? len0 : len1;
-            if (dead_len > max_popped_arm_len) {
-                continue;  // arm too long to be a sequencing-error bubble
+            if (removed_len == 0) continue;  // only skip edges
+            if ((double)removed_len >
+                bubble_length_bound * (double)std::max<size_t>(kept_len, 1)) {
+                continue;  // removed side much longer than the kept path
             }
+            const double end_depth =
+                std::max(sit->second.avg_core_count(),
+                         dbg.find(tid)->second.avg_core_count());
+            if (end_depth >= locus_limit || inner_high >= locus_limit) {
+                continue;  // a repeat: the arms are different copies
+            }
+            const bool error = removed_depth < 0.5 * one_copy;
 
-            // Pop the shallower arm; on a tie, path0 goes. active_set erases
-            // are deferred (erasing mid-iteration corrupts the btree walk).
-            const gtl::vector<u64> &dead = (d0 <= d1) ? path0 : path1;
-            for (u64 nid : dead) {
+            // The removed allele is the heaviest path over removed nodes.
+            popped.push_back(make_popped_bubble(
+                dbg, sid, tid, heaviest_bubble_path(dbg, sid, tid, inner, kept),
+                error, removed_depth, kept_depth));
+
+            // Delete removed nodes; along the kept path, drop every other
+            // edge inside the bubble. Inner nodes have no edges outside it.
+            gtl::flat_hash_set<u64> in_bubble(inner.begin(), inner.end());
+            in_bubble.insert(sid);
+            in_bubble.insert(tid);
+            for (u64 nid : inner) {
+                if (kept.contains(nid)) continue;
                 dbg.erase(nid);
+                fwd.erase(nid);
                 to_rm.push_back(nid);
             }
-            auto &tprev = tit->second.prev;
-            const u64 sink_in = dead.back();
-            auto pit = std::find(tprev.begin(), tprev.end(), sink_in);
-            if (pit != tprev.end()) tprev.erase(pit);
-            sit->second.forward_edge_count--;
-            ++popped;
+            u64 from = sid;
+            for (size_t i = 0; i <= keep.size(); ++i) {
+                const u64 to = i < keep.size() ? keep[i] : tid;
+                auto &pvec = dbg.find(to)->second.prev;
+                pvec.erase(std::remove_if(pvec.begin(), pvec.end(),
+                                          [&](u64 p) {
+                                              return p != from &&
+                                                     in_bubble.contains(p);
+                                          }),
+                           pvec.end());
+                auto &next = fwd[from];
+                next.erase(std::remove_if(next.begin(), next.end(),
+                                          [&](u64 n) {
+                                              return n != to &&
+                                                     in_bubble.contains(n);
+                                          }),
+                           next.end());
+                dbg.find(from)->second.forward_edge_count =
+                    (unsigned)next.size();
+                from = to;
+            }
+            ++n_popped;
         }
         for (u64 nid : to_rm) {
             active_set.erase(nid);
         }
-        return popped;
+        return n_popped;
+    }
+
+    // Simple chain leaving `start` away from `from`, in the forward
+    // (successor) or backward (predecessor) direction, that dead-ends within
+    // max_len cores. Fills `chain` and returns true for such a tip; returns
+    // false when the chain continues, merges, forks, loops or is longer.
+    static bool walk_tip(const dbg_map_t &dbg,
+                         const gtl::flat_hash_map<u64, gtl::vector<u64>> &fwd,
+                         u64 from, u64 start, bool forward, size_t max_len,
+                         gtl::vector<u64> &chain) {
+        chain.clear();
+        size_t len = 0;
+        for (u64 cur = start;;) {
+            auto cit = dbg.find(cur);
+            if (cit == dbg.end() || cit->second.redirected()) return false;
+            // Edges into `cur` along the walk must come from the chain only.
+            gtl::vector<u64> in, out;
+            for (u64 p : cit->second.prev) {
+                auto pit = dbg.find(p);
+                if (pit != dbg.end() && !pit->second.redirected())
+                    (forward ? in : out).push_back(p);
+            }
+            if (auto f = fwd.find(cur); f != fwd.end()) {
+                for (u64 n : f->second) {
+                    auto nit = dbg.find(n);
+                    if (nit != dbg.end() && !nit->second.redirected())
+                        (forward ? out : in).push_back(n);
+                }
+            }
+            if (in.size() != 1) return false;  // merge into the chain
+            chain.push_back(cur);
+            len += cit->second.seq.size();
+            if (len > max_len) return false;
+            if (out.empty()) return true;  // dead end: a tip
+            if (out.size() != 1 || out[0] == from || out[0] == start ||
+                out[0] == cur) {
+                return false;  // fork, loop or cycle
+            }
+            cur = out[0];
+        }
+    }
+
+    // Fork tips by copy number. At a node with two or more branches on one
+    // side, a branch that dead-ends within max_tip_len cores while another
+    // branch continues is an allele or a read error when the fork and the
+    // tip stay below locus_limit (see pop_bubbles); it is cut and recorded
+    // (alt = the tip, anchored at the fork). Tips at deeper forks are repeat
+    // copies and kept. The record marks tips below half a copy as errors.
+    static size_t cut_fork_tips(dbg_map_t &dbg, double one_copy,
+                                double locus_limit, size_t max_tip_len,
+                                auto &active_set,
+                                gtl::vector<popped_bubble> &popped) {
+        if (one_copy <= 0.0) return 0;
+        auto fwd = build_live_fwd(dbg, active_set);
+        gtl::vector<u64> to_rm;
+        gtl::vector<u64> chain;
+        size_t n_cut = 0;
+        for (u64 xid : active_set) {
+            for (int forward = 1; forward >= 0; --forward) {
+                auto xit = dbg.find(xid);
+                if (xit == dbg.end() || xit->second.redirected()) break;
+                if (xit->second.avg_core_count() >= locus_limit) break;
+                gtl::vector<u64> branches;
+                if (forward) {
+                    if (auto f = fwd.find(xid); f != fwd.end())
+                        branches = f->second;
+                } else {
+                    branches = xit->second.prev;
+                }
+                branches.erase(
+                    std::remove_if(branches.begin(), branches.end(),
+                                   [&](u64 b) {
+                                       auto bit = dbg.find(b);
+                                       return bit == dbg.end() ||
+                                              bit->second.redirected();
+                                   }),
+                    branches.end());
+                if (branches.size() < 2) continue;
+                gtl::vector<gtl::vector<u64>> tips;
+                size_t continuing = 0;
+                for (u64 b : branches) {
+                    if (walk_tip(dbg, fwd, xid, b, forward, max_tip_len,
+                                 chain)) {
+                        tips.push_back(chain);
+                    } else {
+                        ++continuing;
+                    }
+                }
+                if (continuing == 0) continue;
+                for (const auto &tip : tips) {
+                    double tip_depth = 0.0;
+                    gtl::vector<SequenceContainerType> frags;
+                    size_t len = 0;
+                    for (u64 nid : tip) {
+                        const auto &node = dbg.find(nid)->second;
+                        tip_depth = std::max(tip_depth, node.avg_core_count());
+                    }
+                    if (tip_depth >= locus_limit) continue;  // repeat copy
+                    // Tip sequence in forward order.
+                    for (size_t k = 0; k < tip.size(); ++k) {
+                        const u64 nid =
+                            forward ? tip[k] : tip[tip.size() - 1 - k];
+                        for (const auto &frag : dbg.find(nid)->second.seq) {
+                            frags.push_back(
+                                SequenceContainerType::copy_of(frag));
+                            len += frag.len;
+                        }
+                    }
+                    const auto &xseq = dbg.find(xid)->second.seq;
+                    const u64 anchor = xseq.empty() ? 0
+                                       : forward    ? xseq.back().origin_node
+                                                    : xseq.front().origin_node;
+                    popped.push_back(popped_bubble{
+                        forward ? anchor : 0, forward ? 0 : anchor,
+                        tip_depth < 0.5 * one_copy, (float)tip_depth,
+                        (float)xit->second.avg_core_count(),
+                        frags.empty() ? SequenceContainerType()
+                                      : SequenceContainerType(frags, 0, len)});
+                    // Detach the tip from the fork, then delete it.
+                    const u64 first = tip.front();
+                    if (forward) {
+                        auto &next = fwd[xid];
+                        next.erase(std::remove(next.begin(), next.end(), first),
+                                   next.end());
+                        dbg.find(xid)->second.forward_edge_count =
+                            (unsigned)next.size();
+                    } else {
+                        auto &pvec = dbg.find(xid)->second.prev;
+                        pvec.erase(std::remove(pvec.begin(), pvec.end(), first),
+                                   pvec.end());
+                    }
+                    for (u64 nid : tip) {
+                        dbg.erase(nid);
+                        fwd.erase(nid);
+                        to_rm.push_back(nid);
+                    }
+                    ++n_cut;
+                }
+            }
+        }
+        for (u64 nid : to_rm) {
+            active_set.erase(nid);
+        }
+        return n_cut;
     }
 
     static void cut_low_support_edges(dbg_map_t &dbg, auto &active_set) {
@@ -1018,18 +1393,44 @@ struct GraphCleaning {
             IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                "Initial Simplification");
             cut_low_support_edges(dbgi.dbg, active_set);
+            const double one_copy = one_copy_depth(dbgi.dbg, active_set);
+            const double locus_limit =
+                one_copy > 0.0 ? locus_depth_limit(dbgi.dbg, active_set,
+                                                   one_copy, cfg.ploidy)
+                               : 0.0;
+            if (!acfg.silent)
+                std::fprintf(stderr,
+                             "[graph-clean] one-copy depth %.2f, ploidy %d, "
+                             "locus depth limit %.2f\n",
+                             one_copy, cfg.ploidy, locus_limit);
+            // Isolated tips below half a copy are read errors; 3 without a
+            // depth.
+            const int tip_depth =
+                one_copy > 0.0 ? std::max(1, (int)std::lround(0.5 * one_copy))
+                               : 3;
+            // An allele tip runs from its fork to the allele's lcmer hole,
+            // about one lcmer window; 64 cores leave room for several. Only a
+            // diploid sample has allele tips: on a haploid one the cut tips
+            // were mostly satellite/repeat copies and added misassemblies.
+            constexpr size_t kMaxForkTipCores = 64;
+            const bool fork_tips = cfg.ploidy >= 2;
             for (int i = 1; i < cfg.iterations; ++i) {
                 fix_edges(dbgi.dbg, active_set);
-                cut_tips(dbgi.dbg, 3, cfg.max_tip_length, active_set);
-                // Strict fork-2/merge-2 bubble popping (see pop_bubbles).
+                cut_tips(dbgi.dbg, tip_depth, cfg.max_tip_length, active_set);
                 const size_t popped = pop_bubbles(
-                    dbgi.dbg, cfg.min_bubble_depth_difference_percentage,
-                    cfg.min_bubble_length_difference,
-                    cfg.max_bubble_arm_length, active_set);
-                if (popped > 0)
+                    dbgi.dbg, one_copy, locus_limit,
+                    cfg.min_bubble_length_difference, cfg.max_bubble_length,
+                    active_set, dbgi.popped_bubbles);
+                const size_t tips =
+                    fork_tips ? cut_fork_tips(dbgi.dbg, one_copy, locus_limit,
+                                              kMaxForkTipCores, active_set,
+                                              dbgi.popped_bubbles)
+                              : 0;
+                if (!acfg.silent)
                     std::fprintf(stderr,
-                                 "[graph-clean] popped %zu bubbles\n",
-                                 popped);
+                                 "[graph-clean] popped %zu bubbles, cut %zu "
+                                 "fork tips\n",
+                                 popped, tips);
                 redirect_deleted.clear();
                 // erase_if(dbgi.lci, [](const auto &node) {  // MARK
                 //     return node.second.id == lci_type::max_id;
