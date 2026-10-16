@@ -122,6 +122,14 @@ namespace layout_graph_emit {
 // ── Tunable constants ───────────────────────────────────────────────
 // Reserve hint: expected seed-chain-DAG nodes (cores) per contig.
 inline constexpr size_t SCD_CORES_PER_CONTIG_HINT = 64;
+// Seed-chain shift gate (build_scd_graph). A chained seed's layout shift is
+// where the layout put the contig's core minus where it put the matched node.
+// Consecutive seeds of one true overlap keep their shift within
+// SCD_SEED_SHIFT_TOL cores of each other; a run of fewer than
+// SCD_MIN_SEED_RUN seeds set off by a larger jump is a core-label match
+// between repeat copies and is not merged.
+inline constexpr i64 SCD_SEED_SHIFT_TOL = 64;
+inline constexpr size_t SCD_MIN_SEED_RUN = 2;
 // Default max length (bp) of a post-layout C-node tip to prune.
 inline constexpr size_t DEFAULT_POST_LAYOUT_MAX_TIP_LEN = 50000;
 // Layout-boundary fuzz: a node counts as touching an end if it is within
@@ -321,6 +329,37 @@ inline void build_scd_graph(
                  idx >= 0; idx = lis_prev[idx])
                 query_to_node[seeds[idx].k] =
                     static_cast<int32_t>(seeds[idx].v);
+        }
+
+        // Unchain isolated seeds. Level-5 core labels hash only a core's
+        // boundary children, so diverged repeat copies share labels; one such
+        // seed fuses two layout positions into one DAG component, and the
+        // heaviest path then drops whichever arm is lighter (Mb-scale losses,
+        // sometimes behind a false join). Seeds of a true overlap come in runs
+        // of near-constant layout shift; split the chain where the shift jumps
+        // by more than SCD_SEED_SHIFT_TOL and drop runs shorter than
+        // SCD_MIN_SEED_RUN.
+        {
+            gtl::vector<size_t> run;
+            i64 prev_shift = 0;
+            auto close_run = [&]() {
+                if (run.size() < SCD_MIN_SEED_RUN)
+                    for (size_t k : run) query_to_node[k] = -1;
+                run.clear();
+            };
+            for (size_t k = 0; k < M; ++k) {
+                if (query_to_node[k] < 0) continue;
+                const auto &sv = scd[static_cast<size_t>(query_to_node[k])];
+                const i64 shift = nodes[ci].from + static_cast<i64>(k) -
+                                  nodes[sv.contig_idx].from -
+                                  static_cast<i64>(sv.core_idx);
+                if (!run.empty() &&
+                    std::abs(shift - prev_shift) > SCD_SEED_SHIFT_TOL)
+                    close_run();
+                run.push_back(k);
+                prev_shift = shift;
+            }
+            close_run();
         }
 
         // Merge matched, create new for unmatched

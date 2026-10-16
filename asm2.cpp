@@ -1679,6 +1679,91 @@ TEST_CASE("layout_graph_emit::find_heaviest_paths follows the heaviest chain") {
     CHECK_EQ(paths[0].total_weight, 3);
 }
 
+TEST_CASE(
+    "layout_graph_emit::build_scd_graph ignores an isolated repeat seed") {
+    using namespace layout_graph_emit;
+
+    // contig0 spells labels 1..100 from layout position 0. contig1 sits at
+    // position 500 and spells 300..399 after one core whose label (5) also
+    // occurs in contig0: a repeat copy 495 cores from where the layout puts
+    // it. Merging that seed would hang contig1 off contig0's core 5, and the
+    // heaviest path (1..5 then 300..399) would drop contig0's cores 6..100.
+    gtl::vector<lane_node> nodes(2);
+    nodes[0] = {/*id*/ 0, /*from*/ 0, /*to*/ 99, /*fwd*/ true, nullptr};
+    nodes[1] = {/*id*/ 1, /*from*/ 500, /*to*/ 600, /*fwd*/ true, nullptr};
+
+    gtl::flat_hash_map<size_t, lcp_read> contig_lr;
+    lcp_read lr0, lr1;
+    for (uint32_t i = 0; i < 100; ++i) {
+        lr0.cores.push_back(1 + i);
+        lr0.pos.emplace_back(i, i + 1);
+    }
+    lr1.cores.push_back(5);
+    lr1.pos.emplace_back(0u, 1u);
+    for (uint32_t i = 0; i < 100; ++i) {
+        lr1.cores.push_back(300 + i);
+        lr1.pos.emplace_back(i + 1, i + 2);
+    }
+    contig_lr[0] = std::move(lr0);
+    contig_lr[1] = std::move(lr1);
+    gtl::vector<size_t> contig_order = {0, 1};
+
+    gtl::vector<scd_node> scd;
+    gtl::vector<scd_adj_t> scd_fwd;
+    gtl::flat_hash_map<uint32_t, gtl::vector<uint32_t>> label_nodes;
+    gtl::vector<gtl::vector<std::pair<size_t, size_t>>> node_contigs;
+    build_scd_graph(contig_order, contig_lr, nodes, scd, scd_fwd, label_nodes,
+                    node_contigs);
+
+    // The repeat core gets its own node: nothing merged.
+    CHECK_EQ(scd.size(), 201u);
+    for (const auto &n : scd) CHECK_EQ(n.weight, 1);
+
+    // Both contigs are emitted in full, as two components.
+    auto paths = find_heaviest_paths(scd, scd_fwd, nodes, /*layout_idx*/ 0);
+    REQUIRE_EQ(paths.size(), 2u);
+    CHECK_EQ(paths[0].path.size(), 100u);
+    CHECK_EQ(paths[1].path.size(), 101u);
+}
+
+TEST_CASE("layout_graph_emit::build_scd_graph merges an overlap with drift") {
+    using namespace layout_graph_emit;
+
+    // contig1's overlap with contig0 is placed 40 cores off and drifts by one
+    // core: still one overlap, merged in full.
+    gtl::vector<lane_node> nodes(2);
+    nodes[0] = {/*id*/ 0, /*from*/ 0, /*to*/ 99, /*fwd*/ true, nullptr};
+    nodes[1] = {/*id*/ 1, /*from*/ 130, /*to*/ 230, /*fwd*/ true, nullptr};
+
+    gtl::flat_hash_map<size_t, lcp_read> contig_lr;
+    lcp_read lr0, lr1;
+    for (uint32_t i = 0; i < 100; ++i) {
+        lr0.cores.push_back(1 + i);
+        lr0.pos.emplace_back(i, i + 1);
+    }
+    // Labels 91..100 (contig0 cores 90..99), with one extra core after 95.
+    for (uint32_t l :
+         {91u, 92u, 93u, 94u, 95u, 500u, 96u, 97u, 98u, 99u, 100u, 200u}) {
+        lr1.cores.push_back(l);
+        lr1.pos.emplace_back(0u, 1u);
+    }
+    contig_lr[0] = std::move(lr0);
+    contig_lr[1] = std::move(lr1);
+    gtl::vector<size_t> contig_order = {0, 1};
+
+    gtl::vector<scd_node> scd;
+    gtl::vector<scd_adj_t> scd_fwd;
+    gtl::flat_hash_map<uint32_t, gtl::vector<uint32_t>> label_nodes;
+    gtl::vector<gtl::vector<std::pair<size_t, size_t>>> node_contigs;
+    build_scd_graph(contig_order, contig_lr, nodes, scd, scd_fwd, label_nodes,
+                    node_contigs);
+
+    CHECK_EQ(scd.size(), 102u);  // only 500 and 200 are new
+    size_t merged = 0;
+    for (const auto &n : scd) merged += n.weight == 2;
+    CHECK_EQ(merged, 10u);
+}
+
 TEST_CASE("layout_graph_emit::collect_path_sequences concatenates with gaps") {
     using namespace layout_graph_emit;
 
