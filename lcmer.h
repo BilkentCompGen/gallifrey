@@ -1133,6 +1133,28 @@ inline void init_lps_crumbled(lps *lps_ptr,
     assert(lps_ptr->size < lps_ptr->capacity);
 }
 
+// Base i of BAM-style packed nibbles (high nibble first).
+inline uint8_t nibble_at(const uint8_t *p, uint32_t i) {
+    return (p[i >> 1] >> ((~i & 1u) << 2)) & 0xF;
+}
+
+// Complement of a BAM nibble (A<->T, C<->G, anything else N).
+inline uint8_t nibble_complement(uint8_t n) {
+    static constexpr uint8_t comp[16] = {15, 8,  4,  15, 2,  15, 15, 15,
+                                         1,  15, 15, 15, 15, 15, 15, 15};
+    return comp[n];
+}
+
+// Reverse complement of len packed nibbles into dst.
+inline void revcomp_nibbles(const uint8_t *src, uint32_t len,
+                            gtl::vector<uint8_t> &dst) {
+    dst.assign((len + 1) / 2, 0);
+    for (uint32_t i = 0; i < len; ++i) {
+        const uint8_t c = nibble_complement(nibble_at(src, len - 1 - i));
+        dst[i >> 1] |= (i & 1) ? c : static_cast<uint8_t>(c << 4);
+    }
+}
+
 inline void parse_cores_from_nibbles(const uint8_t *data, size_t len,
                                      int lcp_level, lps *str,
                                      const auto &syncmer_functor, charsi &chs,

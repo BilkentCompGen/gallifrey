@@ -76,6 +76,12 @@ public:
                      "emitting them as C segments. Halves the contig count at "
                      "a small genome-fraction cost.")
             ->capture_default_str();
+        app.add_flag("--prime-reverse,!--no-prime-reverse", cfg.prime_reverse,
+                     "Also parse each read's reverse complement and insert "
+                     "its lcmer keys into the Bloom filter only (no node, "
+                     "count or edge), so reads of the other strand are "
+                     "admitted at their first sighting")
+            ->capture_default_str();
         app.add_option("--syncmer-k", cfg.syncmer.k,
                        "Syncmer k-mer length (in RLE runs with --rle)")
             ->check(CLI::Range(2u, syncmer_params::max_k))

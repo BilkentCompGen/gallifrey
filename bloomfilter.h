@@ -3,12 +3,14 @@
 #include <mutex>
 #define KOMIHASH_NS_CUSTOM komihash
 
+#include <inttypes.h>
+
 #include <algorithm>
 #include <atomic>
-#include <inttypes.h>
+#include <bit>
+#include <cmath>
 #include <memory>
 #include <vector>
-#include <cmath>
 
 // #include "ext/komihash.h"
 namespace bloom_ext {
@@ -310,6 +312,16 @@ struct BlockedAtomicBloomFilter {
     void Reset() {
         for (uint64_t i = 0; i < num_words; i++)
             bv[i].store(0, std::memory_order_relaxed);
+    }
+
+    // Fraction of filter bits set; Query false-positive rate is about
+    // fill^(k - 1) (Insert and Query probe k - 1 bits).
+    double fill_fraction() const {
+        uint64_t set = 0;
+        for (uint64_t i = 0; i < num_words; i++)
+            set += std::popcount(bv[i].load(std::memory_order_relaxed));
+        return static_cast<double>(set) /
+               (static_cast<double>(num_words) * word_bits);
     }
 
     int64_t n;

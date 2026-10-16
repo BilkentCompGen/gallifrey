@@ -69,6 +69,7 @@ struct assembler {
     int lcmer_l;
     bool parallel_file_reading;
     bool drop_crumbs;
+    bool prime_reverse;
 
     assembler(const asm_config &cfg)
         : inputs{},
@@ -82,7 +83,8 @@ struct assembler {
           syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)},
           lcmer_l{cfg.lcmer_l},
           parallel_file_reading{cfg.parallel_file_reading},
-          drop_crumbs{cfg.drop_crumbs} {
+          drop_crumbs{cfg.drop_crumbs},
+          prime_reverse{cfg.prime_reverse} {
         inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
     }
 
@@ -222,6 +224,36 @@ struct assembler {
         }
     }
 
+    // --prime-reverse: parses the read's reverse complement from its nibbles
+    // and inserts those lcmer keys into the Bloom filter only (no node, count
+    // or edge), so the first sighting of the sequence on the other strand is
+    // admitted. The windows are the ones process_cores would take. `rc` and
+    // `lr` are caller scratch.
+    template <class BFT>
+    static void prime_reverse_complement(const uint8_t *nibbles, size_t len,
+                                         int lcp_level, lps *str,
+                                         const SyncmerType &syncmer_functor,
+                                         charsi &chs, pos_scratch &pos_buf,
+                                         gtl::vector<uint8_t> &rc, lcp_read &lr,
+                                         dbg_index_base<BFT> &dbgi,
+                                         int lcmer_l) {
+        revcomp_nibbles(nibbles, static_cast<uint32_t>(len), rc);
+        lr.clear();
+        parse_cores_from_nibbles(rc.data(), len, lcp_level, str,
+                                 syncmer_functor, chs, lr, pos_buf);
+        if (lr.cores.size() < static_cast<size_t>(lcmer_l + 2)) {
+            return;
+        }
+        uint64_t unused_index = 0;
+        LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
+        dbgi.emplace(l, unused_index, 0);
+        for (size_t i = static_cast<size_t>(lcmer_l + 1);
+             i < lr.cores.size() - 1; ++i) {
+            l.update_lcmer(lr.cores[i], lr.cores[i - lcmer_l], lcmer_l);
+            dbgi.emplace(l, unused_index, 0);
+        }
+    }
+
     static std::pair<int, int> get_thread_dist(int threads) {
         if (threads == 0) {
             return {0, 0};
@@ -260,13 +292,14 @@ struct assembler {
                              dbg_index &dbgi, std::atomic<bool> &done,
                              int &processed_read_count, int &all_reads,
                              auto Process_Func, SyncmerType syncmer_functor,
-                             int lcmer_l) {
+                             int lcmer_l, bool prime_reverse) {
         uint64_t lcmer_index = 0;
         typename Ops::record *data_p = NULL;
         lps str = {0, 0, 0, 0};
         charsi chs;
         pos_scratch pos_buf;
         lcp_read lr;
+        gtl::vector<uint8_t> rc_nibbles;
         while (true) {
             if (!data_queue.wait_dequeue_timed(data_p, WAIT_QUEUE_TIMEOUT)) {
                 if (done.load()) {
@@ -283,6 +316,12 @@ struct assembler {
             if (lr.cores.size() >= static_cast<size_t>(lcmer_l + 2)) {
                 ++processed_read_count;
                 Process_Func(lr, dbgi, thread_id, lcmer_index, lcmer_l);
+                if (prime_reverse) {
+                    prime_reverse_complement(Ops::seq(data_p), Ops::len(data_p),
+                                             lcp_level, &str, syncmer_functor,
+                                             chs, pos_buf, rc_nibbles, lr, dbgi,
+                                             lcmer_l);
+                }
             }
             if (!recycle_queue.try_enqueue(data_p)) {
                 Ops::destroy(data_p);
@@ -401,7 +440,7 @@ struct assembler {
                 process_data<Ops>(tid, lcp_level, data_queue, recycle_queue,
                                   dbgi, done, valid_read_counts[tid - 1],
                                   all_read_counts[tid - 1], Process_Func,
-                                  syncmer_functor, lcmer_l);
+                                  syncmer_functor, lcmer_l, prime_reverse);
             });
         }
 
@@ -492,6 +531,12 @@ struct assembler {
         }
         fprintf(stderr, "%" PRIu64 " processed\n%" PRIu64 " total reads\n",
                 valid_sum, all_sum);
+        const auto &bf = dbgi.bf.implementation;
+        const double fill = bf.fill_fraction();
+        fprintf(stderr,
+                "Bloom filter: %.4f of bits set, estimated false-positive "
+                "rate %.2e\n",
+                fill, std::pow(fill, bf.k - 1));
         return {};
     }
 
@@ -1383,6 +1428,13 @@ struct bubble {
     return s;
 }
 
+[[maybe_unused]] static std::string revcomp(std::string s) {
+    std::reverse(s.begin(), s.end());
+    for (char &c : s)
+        c = c == 'A' ? 'T' : c == 'C' ? 'G' : c == 'G' ? 'C' : 'A';
+    return s;
+}
+
 // A base differing from the sequence's bases at pos-1, pos and pos+1, so a
 // substitution there changes the run-length-encoded sequence.
 [[maybe_unused]] static char other_base(const std::string &s, size_t pos) {
@@ -1482,6 +1534,52 @@ struct bubble {
     return out;
 }
 }  // namespace fragment_test
+
+TEST_CASE(
+    "assembler::prime_reverse_complement admits the other strand at its "
+    "first sighting") {
+    using namespace fragment_test;
+    const std::string h = random_dna(8000, 11);
+    const std::string other = revcomp(h);
+    decltype(asm_config::syncmer) spara;
+    spara.apply_default_rule();
+    const assembler::SyncmerType fnctr(spara, 1453);
+    lps str = {0, 0, 0, 0};
+    charsi chs;
+    pos_scratch pos_buf;
+    gtl::vector<uint8_t> rc;
+    lcp_read lr;
+    uint64_t lcmer_index = 0;
+    auto forward = [&](dbg_index &dbgi, const std::string &r) {
+        const auto nib = to_nibbles(r);
+        lr.clear();
+        parse_cores_from_nibbles(nib.data(), r.size(), kLevel, &str, fnctr, chs,
+                                 lr, pos_buf);
+        REQUIRE(lr.cores.size() >= static_cast<size_t>(kLcmerL + 2));
+        assembler::process_cores<DefaultBF>(lr, dbgi, 0, lcmer_index, kLcmerL);
+    };
+    auto prime = [&](dbg_index &dbgi, const std::string &r) {
+        const auto nib = to_nibbles(r);
+        assembler::prime_reverse_complement(nib.data(), r.size(), kLevel, &str,
+                                            fnctr, chs, pos_buf, rc, lr, dbgi,
+                                            kLcmerL);
+    };
+    // One read per strand: without priming each strand sights its keys once.
+    dbg_index plain(0.001, 1 << 20, 7);
+    forward(plain, other);
+    forward(plain, h);
+    CHECK(plain.dbg.empty());
+    // Priming inserts into the Bloom filter only; the other strand's read
+    // then creates a node for every window at its first sighting.
+    dbg_index primed(0.001, 1 << 20, 7);
+    prime(primed, other);
+    CHECK(primed.dbg.empty());
+    forward(primed, other);
+    CHECK(primed.dbg.empty());
+    forward(primed, h);
+    CHECK_EQ(primed.dbg.size(), lr.cores.size() - kLcmerL - 1);
+    free_lps(&str);
+}
 
 TEST_CASE(
     "Node fragments: diploid bubble arms carry the het and spell both "

@@ -101,6 +101,10 @@ struct asm_config {
     // Drop crumb nodes (fewer than lcmer_l+1 cores) that continue into a
     // longer node instead of emitting them as C segments.
     bool drop_crumbs = true;
+    // Also parse every read's reverse complement and insert its lcmer keys
+    // into the Bloom filter only, so the other strand's reads are admitted at
+    // their first sighting.
+    bool prime_reverse = true;
     bool silent = false;
     struct {
         uint64_t projected_count = 100'000'000;
@@ -140,6 +144,7 @@ struct asm_config {
                 "Rate: %.3f\n",
                 bloom.projected_count, bloom.false_positive_rate);
         fprintf(f, "Drop Crumbs: %s\n", drop_crumbs ? "true" : "false");
+        fprintf(f, "Prime Reverse: %s\n", prime_reverse ? "true" : "false");
         fprintf(f,
                 "Graph Cleaning Parameters: \n\tIterations: %d\n\tMax Tip "
                 "Length: %d\n\tMin Bubble Length Difference: %.2f\n\tMax "

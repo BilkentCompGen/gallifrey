@@ -108,6 +108,10 @@ Core assembly controls:
   and overlap detection (default 6). `--dbg-lcmer-l` is accepted as the old
   name; `--olc-lcmer-l` is ignored.
 - `--random-seed`: hash/random seed
+- `--prime-reverse` / `--no-prime-reverse`: also parse each read's reverse
+  complement and insert its lcmer keys into the Bloom filter only (no node,
+  count or edge), so reads of the other strand are admitted at their first
+  sighting (default on)
 
 Syncmer selection (Edgar 2021). A k-mer is selected by the position of its
 smallest s-mer; selection is computed on the fly from s-mer hashes, with no
