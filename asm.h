@@ -81,6 +81,9 @@ struct syncmer_params {
         }
     }
 };
+// Default --random-seed. The seed only drives the syncmer s-mer hash, which
+// is 32-bit, so the seed is stored as uint32_t.
+inline constexpr uint32_t kDefaultRandomSeed = 1453;
 struct asm_config {
     std::vector<std::string> inputs;
     std::string output;
@@ -92,7 +95,7 @@ struct asm_config {
         int io = 4;
         int work = 8;
     } threads;
-    size_t seed = 1453;
+    uint32_t seed = kDefaultRandomSeed;
     bool rle = true;
     bool parallel_file_reading = true;
     syncmer_params syncmer;
@@ -133,7 +136,7 @@ struct asm_config {
         fprintf(f, "LCP Level: %d\n", lcp_level);
         fprintf(f, "LCMER Length: %d\n", lcmer_l);
         fprintf(f, "Threads:\n\tIO: %d\n\tWork: %d\n", threads.io, threads.work);
-        fprintf(f, "Seed: %zu\n", seed);
+        fprintf(f, "Seed: %" PRIu32 "\n", seed);
         fprintf(f, "RLE: %s\n", rle ? "true" : "false");
         fprintf(f, "File Reading Mode: %s\n",
                 parallel_file_reading ? "parallel" : "sequential");
@@ -154,7 +157,6 @@ struct asm_config {
                 graph_cleaning.max_bubble_length, graph_cleaning.ploidy);
     }
 };
-
 
 int run_assembly(const asm_config &param);
 #endif

@@ -452,15 +452,18 @@ struct bloom_interface {
     bool insert(const auto &element) { return implementation.insert(element); }
 };
 
+// The filter is seed-independent: the probe positions come from the 64-bit
+// lcmer key alone (h1 = high word, h2 = low word), so for a given key set
+// --random-seed does not change which keys collide in the filter. The seed
+// argument only keeps the constructor uniform with bloom_interface<MockBF>;
+// threading it into the probes would change the assembly.
 template <BF_Insert_Query_Concept BF>
 struct bloom_interface<BF> {
     BF implementation;
-    uint64_t random_seed;
 
     bloom_interface(double false_positive_rate, size_t projected_element_count,
-                    uint64_t random_seed)
-        : implementation(projected_element_count, false_positive_rate),
-          random_seed(random_seed) {}
+                    uint64_t /*random_seed*/)
+        : implementation(projected_element_count, false_positive_rate) {}
     bool contains(const uint64_t &h) const {
         return implementation.Query(h >> 32, h & 0xFFFFFFFF);
     }

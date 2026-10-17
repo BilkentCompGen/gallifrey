@@ -13,6 +13,7 @@
 #include <atomic>
 #include <concurrentqueue.h>
 #include <gtl/vector.hpp>
+#include "asm.h"
 #include "lcmer.h"
 
 #include "syncmer.h"
@@ -82,8 +83,10 @@ inline int run_sam_read_testing(const std::string &input, int threads,
     std::atomic<bool> done{false};
     // One slot per worker, sized by the thread count.
     std::vector<int> counts(threads, 0);
-    // Same rule the assembly pipeline uses (GenericSubmerRule).
-    syncmer::GenericSubmerRule<uint32_t, syncmer::MurMur> sr{sr_params, 423};
+    // Same rule and seed as the assembly pipeline at its default
+    // --random-seed (GenericSubmerRule over MurMur).
+    syncmer::GenericSubmerRule<uint32_t, syncmer::MurMur> sr{
+        sr_params, kDefaultRandomSeed};
     // Per-worker scratch (charsi/pos_scratch) is passed as arguments, not
     // captured, so the shared job closure stays race-free.
     auto job = [&]() -> std::function<int(bam1_t *, lps *, charsi &, pos_scratch &)> {

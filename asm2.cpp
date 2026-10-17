@@ -63,7 +63,7 @@ struct assembler {
     decltype(asm_config::threads) threads;
     int lcp_level;
     decltype(asm_config::bloom) bloom;
-    uint64_t seed;
+    uint32_t seed;
     decltype(asm_config::syncmer) syncmer_params;
     SyncmerType syncmer_functor;
     int lcmer_l;
@@ -79,8 +79,7 @@ struct assembler {
           bloom{cfg.bloom},
           seed{cfg.seed},
           syncmer_params{cfg.syncmer},
-          // syncmer hash seed is 32-bit; truncate cfg.seed (size_t) to fit.
-          syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)},
+          syncmer_functor{syncmer_params, seed},
           lcmer_l{cfg.lcmer_l},
           parallel_file_reading{cfg.parallel_file_reading},
           drop_crumbs{cfg.drop_crumbs},

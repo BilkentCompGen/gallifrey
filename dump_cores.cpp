@@ -25,7 +25,7 @@ static input_format dump_input_format(const std::string &path) {
 static int run_dump_cores(const std::string &input_path,
                           const std::string &output_path, int syncmer_k,
                           int submer_s, int submer_t, int lcp_level,
-                          int lcmer_l, uint64_t seed) {
+                          int lcmer_l, uint32_t seed) {
     syncmer_params spara;
     spara.k = syncmer_k;
     spara.smer.s = submer_s;
@@ -37,7 +37,7 @@ static int run_dump_cores(const std::string &input_path,
 
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
-    SyncmerType syncmer_functor(spara, static_cast<unsigned int>(seed));
+    SyncmerType syncmer_functor(spara, seed);
 
     FILE *out = fopen(output_path.c_str(), "w");
     if (!out) {
@@ -142,7 +142,9 @@ DumpCoresProgram::DumpCoresProgram(CLI::App &parent) {
                    "Dump lcmer keys of this window length (DBG node keys) "
                    "instead of cores; 0 dumps cores")
         ->capture_default_str();
-    app.add_option("--seed", seed, "Random seed")->capture_default_str();
+    app.add_option("--seed", seed, "Seed of the syncmer s-mer hash (32-bit)")
+        ->check(CLI::Range(uint64_t{0}, uint64_t{UINT32_MAX}))
+        ->capture_default_str();
     app.callback([this]() {
         // CLI11 callbacks return void; surface a nonzero rc as a
         // CLI::RuntimeError so CLI11_PARSE prints it and exits with that code.

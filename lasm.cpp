@@ -51,7 +51,9 @@ public:
                        "Number of IO threads (Used by htslib for decompressing)")
             ->check(CLI::Range(0, 64))
             ->capture_default_str();
-        app.add_option("--random-seed", cfg.seed, "Random seed")
+        app.add_option("--random-seed", cfg.seed,
+                       "Seed of the syncmer s-mer hash (32-bit)")
+            ->check(CLI::Range(uint64_t{0}, uint64_t{UINT32_MAX}))
             ->capture_default_str();
         app.add_option("--file-reading-mode", file_reading_mode,
                        "Input reader mode: parallel or sequential")
