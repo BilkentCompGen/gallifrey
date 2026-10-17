@@ -105,13 +105,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(concurrentqueue)
 
-FetchContent_Declare(
-    libbloom
-    GIT_REPOSITORY https://github.com/jvirkki/libbloom.git
-    GIT_TAG v2.0
-)
-FetchContent_MakeAvailable(libbloom)
-
 # Link libraries
 target_link_libraries(${PROJECT_NAME} PRIVATE
                       PkgConfig::HTS gtl CLI11::CLI11

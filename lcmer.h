@@ -118,73 +118,6 @@ struct lcp_read {
     }
 };
 
-template <int N>
-struct lcmer {
-    static constexpr size_t size = N;
-    std::array<uint32_t, N> data;
-
-    lcmer() {}
-    lcmer(const lcmer<N> &other) {
-        memcpy(this->data.data(), other.data.data(), N * sizeof(uint32_t));
-    }
-    lcmer(std::forward_iterator auto it) {
-        std::copy(it, it + N, std::begin(data));
-    }
-
-    lcmer<N> operator=(const lcmer<N> &other) {
-        memcpy(this->data.data(), other.data.data(), N * sizeof(uint32_t));
-        return *this;
-    }
-    bool operator==(const lcmer &other) const {
-        return memcmp(data.data(), other.data.data(), N * sizeof(uint32_t)) ==
-               0;
-    }
-    bool operator<(const lcmer &other) const {
-        for (int i = 0; i < N; ++i) {
-            if (data[i] != other.data[i]) {
-                if (data[i] < other.data[i]) {
-                    return true;
-                } else {
-                    return false;
-                }
-            }
-        }
-        return false;
-    }
-    void print_name(FILE *out) const {
-        fprintf(out, "%0x", data[0]);
-        for (int z = 1; z < N; ++z) {
-            fprintf(out, "%0x", data[z]);
-        }
-    }
-
-    void set0(uint32_t new_core) { data[N - 1] = new_core; }
-    void setN(uint32_t new_core) { data[0] = new_core; }
-    static lcmer<N> left_shift(lcmer<N> l) {
-        for (int i = 1; i < N; ++i) {
-            l.data[i - 1] = l.data[i];
-        }
-        return l;
-    }
-
-    static lcmer<N> right_shift(lcmer<N> l) {
-        for (int i = N - 1; i > 0; --i) {
-            l.data[i] = l.data[i - 1];
-        }
-        return l;
-    }
-
-    uint32_t update_lcmer(uint32_t new_core,
-                          [[maybe_unused]] uint32_t outcore) {
-        uint32_t old_core = data[0];
-        for (int i = 1; i < N; ++i) {
-            data[i - 1] = data[i];
-        }
-        data[N - 1] = new_core;
-        return old_core;
-    }
-};
-
 struct litecmer {
     struct words_t {
         uint32_t hi;
@@ -237,21 +170,6 @@ struct litecmer {
         return litecmer(it, n);
     }
 
-    static litecmer make_xor(std::forward_iterator auto it, int n) {
-        litecmer l;
-        for (int i = 0; i < n - 1; ++i) {
-            l.words.hi ^= *(it++);
-        }
-        l.words.lo = *it;
-        return l;
-    }
-
-    void update_lcmer_xor(uint32_t new_core, uint32_t out_core) {
-        words.hi ^= words.lo;
-        words.hi ^= out_core;
-        words.lo = new_core;
-    }
-
     // Order-sensitive rolling update for first N-1 cores.
     // Requires state initialized by make_poly().
     void update_lcmer_poly(uint32_t new_core, uint32_t out_core, int n) {
@@ -278,30 +196,10 @@ struct litecmer {
 };
 using LCmer = litecmer;
 
-template <int N>
-struct combined_lcmer {
-    lcmer<N> full;
-    litecmer lite;
-
-    combined_lcmer(std::forward_iterator auto it) : full(it), lite(it, N) {}
-
-    void update_lcmer(uint32_t new_core, uint32_t out_core) {
-        full.update_lcmer(new_core, out_core);
-        lite.update_lcmer(new_core, out_core, N);
-    }
-};
-
 template <>
 struct std::hash<litecmer> {
     std::size_t operator()(const litecmer &l) const noexcept {
         return l.value();
-    }
-};
-
-template <int N>
-struct std::hash<lcmer<N>> {
-    std::size_t operator()(const lcmer<N> &l) const noexcept {
-        return MurmurHash3_32(&l.data, N * sizeof(uint32_t), 12312342);
     }
 };
 
@@ -560,17 +458,6 @@ void init_core_kmer(struct core *cr, _T Kval, uint64_t si, uint64_t ei, int k) {
     cr->label |= Kval;
     cr->bit_size = WIDTH * k;
     cr->bit_rep = lcp_bit_type{0x8000000000000000, cr->label};
-}
-
-template <typename _T>
-void init_core_kmer_xor(struct core *cr, _T Kval, uint64_t si, uint64_t ei,
-                        int k) {
-    cr->start = si;
-    cr->end = ei;
-    cr->label = 0;
-    cr->label |= (Kval ^ reverse_complement_kmer(Kval, k));
-    cr->bit_rep = lcp_bit_type{0x8000000000000000, cr->label};
-    cr->bit_size = 2 * k;
 }
 
 uint8_t *onehotto2bitDNA(const uint8_t *data, size_t len);
