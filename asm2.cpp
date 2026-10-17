@@ -70,6 +70,7 @@ struct assembler {
     bool parallel_file_reading;
     bool drop_crumbs;
     bool prime_reverse;
+    bool strict_layout_labels;
 
     assembler(const asm_config &cfg)
         : inputs{},
@@ -83,7 +84,8 @@ struct assembler {
           lcmer_l{cfg.lcmer_l},
           parallel_file_reading{cfg.parallel_file_reading},
           drop_crumbs{cfg.drop_crumbs},
-          prime_reverse{cfg.prime_reverse} {
+          prime_reverse{cfg.prime_reverse},
+          strict_layout_labels{cfg.strict_layout_labels} {
         inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
     }
 
@@ -1874,6 +1876,140 @@ TEST_CASE("layout_graph_emit::build_scd_graph merges an overlap with drift") {
     size_t merged = 0;
     for (const auto &n : scd) merged += n.weight == 2;
     CHECK_EQ(merged, 10u);
+}
+
+TEST_CASE(
+    "layout_graph_emit::core_hpc_fingerprints compares homopolymer-compressed "
+    "cores") {
+    using namespace fragment_test;
+    using namespace layout_graph_emit;
+    const std::string x = random_dna(150, 7);
+    const std::string s = x + x;  // cores [0,150) and [150,300) spell x
+    auto frag = [](const std::string &t, size_t from, size_t to) {
+        return SequenceContainerType(t.c_str(), from, to, 0,
+                                     SequenceContainerType::from_ascii{});
+    };
+    auto one = [&](const std::string &t) {
+        gtl::vector<SequenceContainerType> v;
+        v.push_back(frag(t, 0, t.size()));
+        return v;
+    };
+    gtl::vector<SequenceContainerType> pieces;
+    pieces.push_back(frag(s, 0, 37));
+    pieces.push_back(frag(s, 37, 170));
+    pieces.push_back(frag(s, 170, s.size()));
+
+    lcp_read lr;
+    lr.pos = {{0u, 150u}, {150u, 300u}, {5u, 69u}, {100u, 133u}};
+    lr.cores.assign(lr.pos.size(), 7u);
+    const auto fw = core_hpc_fingerprints(one(s), lr);
+    CHECK(fw == core_hpc_fingerprints(pieces, lr));  // fragmentation
+    CHECK_EQ(fw[0], fw[1]);  // same compressed sequence at another position
+    CHECK_NE(fw[0], fw[2]);
+
+    // One more base in a homopolymer inside [100, 133): the core's span grows
+    // by one but its runs, and so its fingerprint, do not change.
+    const std::string h = s.substr(0, 120) + s[120] + s.substr(120);
+    lcp_read lh;
+    lh.pos = {{100u, 134u}};
+    lh.cores = {7u};
+    CHECK_EQ(core_hpc_fingerprints(one(h), lh)[0], fw[3]);
+
+    // A substitution that changes the compressed sequence changes the
+    // fingerprints of the cores covering it only.
+    std::string m = s;
+    m[120] = other_base(m, 120);
+    const auto fm = core_hpc_fingerprints(one(m), lr);
+    CHECK_NE(fm[0], fw[0]);
+    CHECK_NE(fm[3], fw[3]);
+    CHECK_EQ(fm[1], fw[1]);
+    CHECK_EQ(fm[2], fw[2]);
+
+    // A span one run longer differs.
+    lcp_read ll;
+    size_t end = 69;
+    while (s[end] == s[68]) ++end;  // past the run holding base 68
+    ll.pos = {{5u, static_cast<uint32_t>(end + 1)}};
+    ll.cores = {7u};
+    CHECK_NE(core_hpc_fingerprints(one(s), ll)[0], fw[2]);
+}
+
+TEST_CASE(
+    "layout_graph_emit::build_scd_graph with core fingerprints rejects a "
+    "label collision") {
+    using namespace layout_graph_emit;
+    // The assembler compares homopolymer-compressed cores by default
+    // (--no-strict-layout-labels turns it off).
+    CHECK(asm_config{}.strict_layout_labels);
+
+    // contig1 repeats contig0's first ten labels at the same layout shift,
+    // then continues with labels of its own. Without fingerprints the ten
+    // label matches form one consistent seed run and are merged.
+    gtl::vector<lane_node> nodes(2);
+    nodes[0] = {/*id*/ 0, /*from*/ 0, /*to*/ 99, /*fwd*/ true, nullptr};
+    nodes[1] = {/*id*/ 1, /*from*/ 0, /*to*/ 19, /*fwd*/ true, nullptr};
+    gtl::flat_hash_map<size_t, lcp_read> contig_lr;
+    lcp_read lr0, lr1;
+    for (uint32_t i = 0; i < 100; ++i) {
+        lr0.cores.push_back(1 + i);
+        lr0.pos.emplace_back(i, i + 1);
+    }
+    for (uint32_t i = 0; i < 20; ++i) {
+        lr1.cores.push_back(i < 10 ? 1 + i : 1000 + i);
+        lr1.pos.emplace_back(i, i + 1);
+    }
+    contig_lr[0] = std::move(lr0);
+    contig_lr[1] = std::move(lr1);
+    const gtl::vector<size_t> contig_order = {0, 1};
+
+    // Per-contig fingerprints: contig1's colliding cores spell other bases
+    // (`collide`) or the same bases (a true overlap).
+    auto make_fps = [](bool collide) {
+        gtl::vector<gtl::vector<u64>> fps(2);
+        for (u64 i = 0; i < 100; ++i) fps[0].push_back(i);
+        for (u64 i = 0; i < 20; ++i)
+            fps[1].push_back(i < 10 && !collide ? i : 5000 + i);
+        return fps;
+    };
+    struct result {
+        size_t nodes, merged;
+        scd_seed_stats stats;
+    };
+    auto run = [&](const gtl::vector<gtl::vector<u64>> *fps) {
+        gtl::vector<scd_node> scd;
+        gtl::vector<scd_adj_t> scd_fwd;
+        gtl::flat_hash_map<uint32_t, gtl::vector<uint32_t>> label_nodes;
+        gtl::vector<gtl::vector<std::pair<size_t, size_t>>> node_contigs;
+        const auto stats =
+            build_scd_graph(contig_order, contig_lr, nodes, scd, scd_fwd,
+                            label_nodes, node_contigs, fps);
+        size_t merged = 0;
+        for (const auto &n : scd) merged += n.weight == 2;
+        return result{scd.size(), merged, stats};
+    };
+
+    SUBCASE("without fingerprints the collision is seeded") {
+        const auto r = run(nullptr);
+        CHECK_EQ(r.nodes, 110u);
+        CHECK_EQ(r.merged, 10u);
+        CHECK_EQ(r.stats.seeds, 10u);
+        CHECK_EQ(r.stats.rejected, 0u);
+    }
+    SUBCASE("differing fingerprints reject every colliding seed") {
+        const auto fps = make_fps(true);
+        const auto r = run(&fps);
+        CHECK_EQ(r.nodes, 120u);
+        CHECK_EQ(r.merged, 0u);
+        CHECK_EQ(r.stats.seeds, 10u);
+        CHECK_EQ(r.stats.rejected, 10u);
+    }
+    SUBCASE("equal fingerprints keep a true overlap") {
+        const auto fps = make_fps(false);
+        const auto r = run(&fps);
+        CHECK_EQ(r.nodes, 110u);
+        CHECK_EQ(r.merged, 10u);
+        CHECK_EQ(r.stats.rejected, 0u);
+    }
 }
 
 TEST_CASE("layout_graph_emit::collect_path_sequences concatenates with gaps") {

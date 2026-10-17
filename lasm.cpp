@@ -84,6 +84,13 @@ public:
                      "count or edge), so reads of the other strand are "
                      "admitted at their first sighting")
             ->capture_default_str();
+        app.add_flag("--strict-layout-labels,!--no-strict-layout-labels",
+                     cfg.strict_layout_labels,
+                     "Layout: accept a core-label match as a seed only if "
+                     "both cores have the same homopolymer-compressed "
+                     "sequence, so cores that merely share a label are not "
+                     "chained")
+            ->capture_default_str();
         app.add_option("--syncmer-k", cfg.syncmer.k,
                        "Syncmer k-mer length (in RLE runs with --rle)")
             ->check(CLI::Range(2u, syncmer_params::max_k))

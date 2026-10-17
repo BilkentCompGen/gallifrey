@@ -194,16 +194,101 @@ struct comp_path {
 
 using scd_adj_t = gtl::vector<std::pair<uint32_t, uint16_t>>;
 
+// 64-bit fingerprint of the homopolymer-compressed sequence of each core's
+// span lr.pos[k] = [from, to) on the concatenation of `seqs`: one base per
+// homopolymer and the number of homopolymers, not their lengths. Cores are
+// built on homopolymer-compressed sequence, so copies of one core whose
+// homopolymers differ in length (a common HiFi error) agree, while cores with
+// equal labels but different compressed sequence (a 32-bit label collision,
+// or repeat copies whose labels agree on the boundary children only) do not.
+//
+// One pass over the bases keeps the polynomial hash of all homopolymers so
+// far; each core's first and last base record it, and the span's hash is the
+// difference of the two prefixes. Memory is O(cores), not O(bases).
+inline gtl::vector<u64> core_hpc_fingerprints(
+    const gtl::vector<SequenceContainerType> &seqs, const lcp_read &lr) {
+    constexpr u64 mul = 0x9E3779B97F4A7C15ULL;
+    const size_t M = lr.pos.size();
+    // (base, 2k) for core k's first base, (base, 2k + 1) for its last.
+    gtl::vector<std::pair<uint32_t, uint32_t>> marks;
+    marks.reserve(2 * M);
+    for (uint32_t k = 0; k < M; ++k) {
+        const auto [from, to] = lr.pos[k];
+        if (from >= to) continue;
+        marks.emplace_back(from, 2 * k);
+        marks.emplace_back(to - 1, 2 * k + 1);
+    }
+    std::sort(marks.begin(), marks.end());
+
+    // At a core's first base: hash of the runs before it and that run's
+    // index. At its last base: hash of the runs through it and the run count.
+    gtl::vector<u64> h_first(M, 0), h_last(M, 0);
+    gtl::vector<uint32_t> r_first(M, 0), r_last(M, 0);
+    u64 before = 0, through = 0;  // hash of runs [0, run - 1) / [0, run)
+    uint32_t run = 0;             // runs started so far
+    int prev = -1;
+    uint32_t pos = 0;
+    size_t mi = 0;
+    for (const auto &f : seqs) {
+        for (size_t b = 0; b < f.len && mi < marks.size(); ++b, ++pos) {
+            const size_t bit = (static_cast<size_t>(f.skip_first_n) + b) * 2;
+            const int c =
+                static_cast<int>((f.data[bit >> 6] >> (bit & 63)) & 3);
+            if (c != prev) {
+                prev = c;
+                before = through;
+                through = through * mul + static_cast<u64>(c + 1);
+                ++run;
+            }
+            for (; mi < marks.size() && marks[mi].first == pos; ++mi) {
+                const uint32_t k = marks[mi].second >> 1;
+                if (marks[mi].second & 1) {
+                    h_last[k] = through;
+                    r_last[k] = run;
+                } else {
+                    h_first[k] = before;
+                    r_first[k] = run - 1;
+                }
+            }
+        }
+        if (mi == marks.size()) break;
+    }
+
+    gtl::vector<u64> fps(M, 0);
+    for (size_t k = 0; k < M; ++k) {
+        if (lr.pos[k].first >= lr.pos[k].second) continue;
+        const uint32_t runs = r_last[k] - r_first[k];
+        u64 p = 1;  // mul^runs
+        for (u64 base = mul, e = runs; e; e >>= 1, base *= base)
+            if (e & 1) p *= base;
+        u64 h = h_last[k] - h_first[k] * p;
+        h = (h ^ runs) * mul;
+        fps[k] = h ^ (h >> 32);
+    }
+    return fps;
+}
+
+// Label-matched seeds seen by build_scd_graph, and those rejected because the
+// two cores' homopolymer-compressed fingerprints differ.
+struct scd_seed_stats {
+    u64 seeds = 0;
+    u64 rejected = 0;
+};
+
 // ── Phase 1: Build seed-chain DAG from contig cores ─────────────────
-inline void build_scd_graph(
+// With `core_fps` (core_hpc_fingerprints per contig, indexed like `nodes`),
+// a label match becomes a seed only if both cores' fingerprints agree.
+inline scd_seed_stats build_scd_graph(
     const gtl::vector<size_t> &contig_order,
     const gtl::flat_hash_map<size_t, lcp_read> &contig_lr,
     const gtl::vector<lane_node> &nodes,
     gtl::vector<scd_node> &scd,
     gtl::vector<scd_adj_t> &scd_fwd,
     gtl::flat_hash_map<uint32_t, gtl::vector<uint32_t>> &label_nodes,
-    gtl::vector<gtl::vector<std::pair<size_t, size_t>>> &node_contigs)
+    gtl::vector<gtl::vector<std::pair<size_t, size_t>>> &node_contigs,
+    const gtl::vector<gtl::vector<u64>> *core_fps = nullptr)
 {
+    scd_seed_stats stats;
     scd.reserve(contig_order.size() * SCD_CORES_PER_CONTIG_HINT);
     scd_fwd.reserve(contig_order.size() * SCD_CORES_PER_CONTIG_HINT);
     node_contigs.reserve(contig_order.size() * SCD_CORES_PER_CONTIG_HINT);
@@ -286,11 +371,20 @@ inline void build_scd_graph(
         // Collect seeds
         struct scd_seed { uint32_t rank; size_t k; uint32_t v; };
         gtl::vector<scd_seed> seeds;
+        const u64 *ci_fps = core_fps ? (*core_fps)[ci].data() : nullptr;
         for (size_t k = 0; k < M; ++k) {
             auto it = label_nodes.find(lr.cores[k]);
             if (it == label_nodes.end()) continue;
             for (uint32_t v : it->second) {
                 if (v >= gn) continue;
+                ++stats.seeds;
+                if (ci_fps) {
+                    const auto &sv = scd[v];
+                    if (ci_fps[k] != (*core_fps)[sv.contig_idx][sv.core_idx]) {
+                        ++stats.rejected;
+                        continue;
+                    }
+                }
                 seeds.push_back({topo_rank[v], k, v});
             }
         }
@@ -381,6 +475,7 @@ inline void build_scd_graph(
             last_node = static_cast<int32_t>(cur_node);
         }
     }
+    return stats;
 }
 
 // Compiled only under -DLASM_LAYOUT_RESOLVE_OVERLAP. Drops any SCD component
@@ -657,11 +752,13 @@ inline gtl::vector<gtl::vector<SequenceContainerType>> collect_path_sequences(
 // ── Main entry: build layout sequence from positioned nodes ─────────
 template <class AssemblerT>
 // Returns one sequence group per SCD component (see collect_path_sequences):
-// disconnected components are never concatenated.
+// disconnected components are never concatenated. Adds this layout's SCD seed
+// counts to `seed_stats`.
 inline gtl::vector<gtl::vector<SequenceContainerType>>
 build_layout_sequence_from_nodes(
     [[maybe_unused]] AssemblerT &as, dbg_index &dbg,
-    const gtl::vector<ultra_layout_node_info> &lnodes, u64 layout_idx = 0) {
+    const gtl::vector<ultra_layout_node_info> &lnodes, u64 layout_idx,
+    scd_seed_stats &seed_stats) {
     if (lnodes.empty()) return {};
 
     // ── Build lane_nodes ────────────────────────────────────────────
@@ -724,6 +821,10 @@ build_layout_sequence_from_nodes(
     gtl::vector<size_t> contig_order;
     contig_order.reserve(sorted_idx.size());
     lps lps_buf = {0, 0, 0, 0};
+    // --strict-layout-labels: per-contig homopolymer-compressed core
+    // fingerprints, indexed like `nodes`.
+    gtl::vector<gtl::vector<u64>> core_fps;
+    if (as.strict_layout_labels) core_fps.resize(nodes.size());
 
     for (size_t ci : sorted_idx) {
         const auto &raw = *nodes[ci].raw_seqs;
@@ -749,10 +850,14 @@ build_layout_sequence_from_nodes(
             synth_lr.cores.push_back(0);
             synth_lr.pos.emplace_back(0u, static_cast<uint32_t>(total_len));
             contig_lr[ci] = std::move(synth_lr);
+            if (as.strict_layout_labels)
+                core_fps[ci] = core_hpc_fingerprints(frags, contig_lr[ci]);
             contig_core_seqs[ci] = std::move(synth_vec);
             contig_order.push_back(ci);
             continue;
         }
+        if (as.strict_layout_labels)
+            core_fps[ci] = core_hpc_fingerprints(*seqs_ptr, lr);
         contig_lr[ci] = std::move(lr);
         contig_core_seqs[ci] = std::move(cseqs);
         contig_order.push_back(ci);
@@ -771,8 +876,11 @@ build_layout_sequence_from_nodes(
     gtl::vector<scd_adj_t> scd_fwd;
     gtl::flat_hash_map<uint32_t, gtl::vector<uint32_t>> label_nodes;
     gtl::vector<gtl::vector<std::pair<size_t, size_t>>> node_contigs;
-    build_scd_graph(contig_order, contig_lr, nodes,
-                    scd, scd_fwd, label_nodes, node_contigs);
+    const scd_seed_stats stats = build_scd_graph(
+        contig_order, contig_lr, nodes, scd, scd_fwd, label_nodes, node_contigs,
+        as.strict_layout_labels ? &core_fps : nullptr);
+    seed_stats.seeds += stats.seeds;
+    seed_stats.rejected += stats.rejected;
 
     if (scd.empty()) {
         std::fprintf(stderr, "[layout-dag] layout=%" PRIu64
@@ -814,8 +922,10 @@ inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
 
     gtl::vector<std::thread> workers;
     workers.reserve(nthreads);
+    gtl::vector<scd_seed_stats> worker_stats(static_cast<size_t>(nthreads));
     for (int tid = 0; tid < nthreads; ++tid) {
-        workers.emplace_back([&]() {
+        workers.emplace_back([&, tid]() {
+            scd_seed_stats &stats = worker_stats[static_cast<size_t>(tid)];
             size_t job_idx = 0;
             while (true) {
                 if (!job_queue.wait_dequeue_timed(job_idx,
@@ -824,11 +934,13 @@ inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
                     continue;
                 }
                 out_seqs[job_idx] = build_layout_sequence_from_nodes(
-                    as, dbg, jobs[job_idx].lnodes, jobs[job_idx].layout_idx);
+                    as, dbg, jobs[job_idx].lnodes, jobs[job_idx].layout_idx,
+                    stats);
             }
             while (job_queue.try_dequeue(job_idx)) {
                 out_seqs[job_idx] = build_layout_sequence_from_nodes(
-                    as, dbg, jobs[job_idx].lnodes, jobs[job_idx].layout_idx);
+                    as, dbg, jobs[job_idx].lnodes, jobs[job_idx].layout_idx,
+                    stats);
             }
         });
     }
@@ -841,6 +953,17 @@ inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
     done.store(true);
     for (auto &worker : workers) {
         worker.join();
+    }
+    if (as.strict_layout_labels) {
+        scd_seed_stats total;
+        for (const auto &s : worker_stats) {
+            total.seeds += s.seeds;
+            total.rejected += s.rejected;
+        }
+        std::fprintf(stderr,
+                     "[layout-dag] strict-layout-labels: rejected %" PRIu64
+                     " of %" PRIu64 " label-matched SCD seeds\n",
+                     total.rejected, total.seeds);
     }
 
     return out_seqs;

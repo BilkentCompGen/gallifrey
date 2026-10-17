@@ -108,6 +108,10 @@ struct asm_config {
     // into the Bloom filter only, so the other strand's reads are admitted at
     // their first sighting.
     bool prime_reverse = true;
+    // Accept a core-label match as an SCD layout seed only if both cores have
+    // the same homopolymer-compressed sequence, so cores that merely share a
+    // label are not chained.
+    bool strict_layout_labels = true;
     bool silent = false;
     struct {
         uint64_t projected_count = 100'000'000;
@@ -148,6 +152,8 @@ struct asm_config {
                 bloom.projected_count, bloom.false_positive_rate);
         fprintf(f, "Drop Crumbs: %s\n", drop_crumbs ? "true" : "false");
         fprintf(f, "Prime Reverse: %s\n", prime_reverse ? "true" : "false");
+        fprintf(f, "Strict Layout Labels: %s\n",
+                strict_layout_labels ? "true" : "false");
         fprintf(f,
                 "Graph Cleaning Parameters: \n\tIterations: %d\n\tMax Tip "
                 "Length: %d\n\tMin Bubble Length Difference: %.2f\n\tMax "

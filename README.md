@@ -112,6 +112,10 @@ Core assembly controls:
   complement and insert its lcmer keys into the Bloom filter only (no node,
   count or edge), so reads of the other strand are admitted at their first
   sighting (default on)
+- `--strict-layout-labels` / `--no-strict-layout-labels`: during layout,
+  accept a core-label match as a seed only if both cores have the same
+  homopolymer-compressed sequence, so cores that merely share a label are not
+  chained (default on)
 
 Syncmer selection (Edgar 2021). A k-mer is selected by the position of its
 smallest s-mer; selection is computed on the fly from s-mer hashes, with no
