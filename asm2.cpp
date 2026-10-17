@@ -533,10 +533,25 @@ struct assembler {
                 valid_sum, all_sum);
         const auto &bf = dbgi.bf.implementation;
         const double fill = bf.fill_fraction();
+        const double est_fpr = std::pow(fill, bf.k - 1);
         fprintf(stderr,
                 "Bloom filter: %.4f of bits set, estimated false-positive "
                 "rate %.2e\n",
-                fill, std::pow(fill, bf.k - 1));
+                fill, est_fpr);
+        // The filter meets --false-positive-probability while it holds at
+        // most --projected-element-count distinct keys. Far above that a
+        // false positive admits a first-sighting lcmer as a node, so the
+        // "seen twice" gate weakens. Warn at 10x the configured rate. k <= 1
+        // sets no bits: the filter is deliberately off (eps near 1).
+        if (bf.k > 1 && est_fpr > 10 * bloom.false_positive_rate) {
+            fprintf(stderr,
+                    "Warning: Bloom filter estimated false-positive rate "
+                    "%.2e exceeds 10x the configured %.2e; it holds about "
+                    "%.3g distinct keys, so raise --projected-element-count "
+                    "(now %" PRIu64 ") to at least that\n",
+                    est_fpr, bloom.false_positive_rate,
+                    bf.distinct_keys_for_fill(fill), bloom.projected_count);
+        }
         return {};
     }
 
@@ -2724,4 +2739,22 @@ TEST_CASE("BlockedAtomicBloomFilter clamps an absurd projected count") {
     bloom_ext::BlockedAtomicBloomFilter<> bf(1, 0.99f);
     bf.n = 1'000'000'000'000'000LL;  // 1e15
     CHECK(bf.ComputeNumBits() == static_cast<uint64_t>(1e13));  // clamped
+}
+
+// The undersize warning reports the key count recovered from the fill: at the
+// projected count it is the inserted count, and the estimated FPR is near eps.
+TEST_CASE("BlockedAtomicBloomFilter estimates distinct keys from its fill") {
+    const int64_t n = 200'000;
+    bloom_ext::BlockedAtomicBloomFilter<> bf(n, 0.001f);
+    std::mt19937_64 rng(7);
+    for (int64_t i = 0; i < n; ++i) {
+        const uint64_t h = rng();
+        bf.Insert(h >> 32, h & 0xFFFFFFFF);
+    }
+    const double fill = bf.fill_fraction();
+    // num_blocks is even here, so the estimate reads low (see
+    // distinct_keys_for_fill; about 7% for these keys).
+    CHECK(bf.distinct_keys_for_fill(fill) ==
+          doctest::Approx(static_cast<double>(n)).epsilon(0.1));
+    CHECK(std::pow(fill, bf.k - 1) < 0.002);
 }

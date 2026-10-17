@@ -324,6 +324,16 @@ struct BlockedAtomicBloomFilter {
                (static_cast<double>(num_words) * word_bits);
     }
 
+    // Distinct keys inserted, estimated from fill_fraction(): each insert
+    // sets k - 1 uniform bits, so fill = 1 - exp(-(k - 1) * keys / bits).
+    // The block index and the probe offsets both derive from h1, so with an
+    // even num_blocks a block's keys share an h1 parity and reach fewer of
+    // its bits: the fill grows slower and this reads several percent low.
+    double distinct_keys_for_fill(double fill) const {
+        const double bits = static_cast<double>(num_words) * word_bits;
+        return -bits * std::log1p(-fill) / (k - 1);
+    }
+
     int64_t n;
     float epsilon;
 

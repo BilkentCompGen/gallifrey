@@ -101,9 +101,12 @@ public:
             ->needs("--submer-s");
         auto bfg = app.add_option_group("bloomfilter",
                                         "Parameters to setup bloom filter");
-        bfg->add_option("--projected-element-count", cfg.bloom.projected_count,
-                        "Projected element count (human-scale ~3e9 is fine; the "
-                        "filter prints its allocated size on startup)")
+        bfg->add_option(
+               "--projected-element-count", cfg.bloom.projected_count,
+               "Distinct lcmer keys the Bloom filter is sized for at the "
+               "configured false-positive probability; construction logs the "
+               "fill and estimated false-positive rate and warns when the "
+               "filter is undersized")
             ->check(CLI::Range((int64_t)1, (int64_t)10000000000))
             ->capture_default_str();
         bfg->add_option("--false-positive-probability",
