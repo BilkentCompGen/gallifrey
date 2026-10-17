@@ -150,6 +150,13 @@ public:
                              "detection uses --lcmer-l (%d)\n",
                              cfg.lcmer_l);
             }
+            if (cfg.lcp_level < 3) {
+                std::fprintf(stderr,
+                             "Warning: LCP levels lower than 3 are not "
+                             "intended for actual use and may use "
+                             "significantly more memory and build "
+                             "suboptimal assemblies.\n");
+            }
             // Validate the syncmer configuration up front; a CLI error makes
             // CLI11 print the message and exit nonzero.
             cfg.syncmer.apply_default_rule();
