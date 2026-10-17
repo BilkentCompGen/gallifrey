@@ -9,6 +9,16 @@
 #include <concepts>
 #include <memory>
 
+// MurmurHash3 64-bit finalizer.
+constexpr uint64_t fmix64(uint64_t k) {
+    k ^= k >> 33;
+    k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33;
+    k *= 0xc4ceb9fe1a85ec53ULL;
+    k ^= k >> 33;
+    return k;
+}
+
 namespace bloom_ext {
 // Copyright (c) 2023 Sasha Krassovsky
 
@@ -83,26 +93,52 @@ struct BlockedAtomicBloomFilter {
         return static_cast<int>(-std::log2(epsilon) + 0.5);
     }
 
-    uint64_t BlockWordBase(uint32_t h1) const {
-        return static_cast<uint64_t>(h1 % num_blocks) * words_per_block;
+    // Block word base, probe start h1 and probe stride h2 of a key, all from
+    // separate bits of fmix64(key). The block comes from the mixed key's top
+    // bits by multiply-shift, so it is independent of the probe start for any
+    // num_blocks. h2 is odd, so the k - 1 probes (h1 + i * h2) % block_bits
+    // are distinct whatever the key: an lcmer key's low word is its last
+    // core label verbatim, and used as the stride it could fold every probe
+    // onto a few bits.
+    struct Probes {
+        uint64_t base;
+        uint32_t h1;
+        uint32_t h2;
+    };
+    Probes ProbesOf(uint64_t key) const {
+        const uint64_t x = fmix64(key);
+        const auto block = static_cast<uint64_t>(
+            (static_cast<unsigned __int128>(x) * num_blocks) >> 64);
+        return {block * words_per_block, static_cast<uint32_t>(x),
+                static_cast<uint32_t>(x >> 16) | 1u};
     }
 
-    void Insert(uint32_t h1, uint32_t h2) {
-        const uint64_t base = BlockWordBase(h1);
+    void Insert(uint64_t key) { InsertProbes(ProbesOf(key)); }
+
+    bool Query(uint64_t key) const { return QueryProbes(ProbesOf(key)); }
+
+    // Inserts key; returns whether it was absent before. Mixes once.
+    bool InsertIfAbsent(uint64_t key) {
+        const Probes p = ProbesOf(key);
+        if (QueryProbes(p)) return false;
+        InsertProbes(p);
+        return true;
+    }
+
+    void InsertProbes(const Probes &p) {
         for (int i = 1; i < k; i++) {
-            uint32_t bit_pos = (h1 + i * h2) % block_bits;
-            bv[base + bit_pos / word_bits].fetch_or(
+            uint32_t bit_pos = (p.h1 + i * p.h2) % block_bits;
+            bv[p.base + bit_pos / word_bits].fetch_or(
                 block_type(1) << (bit_pos % word_bits),
                 std::memory_order_relaxed);
         }
     }
 
-    bool Query(uint32_t h1, uint32_t h2) const {
+    bool QueryProbes(const Probes &p) const {
         bool result = true;
-        const uint64_t base = BlockWordBase(h1);
         for (int i = 1; i < k; i++) {
-            uint32_t bit_pos = (h1 + i * h2) % block_bits;
-            result &= (bv[base + bit_pos / word_bits].load(
+            uint32_t bit_pos = (p.h1 + i * p.h2) % block_bits;
+            result &= (bv[p.base + bit_pos / word_bits].load(
                            std::memory_order_relaxed) >>
                        (bit_pos % word_bits)) &
                       1;
@@ -126,10 +162,8 @@ struct BlockedAtomicBloomFilter {
     }
 
     // Distinct keys inserted, estimated from fill_fraction(): each insert
-    // sets k - 1 uniform bits, so fill = 1 - exp(-(k - 1) * keys / bits).
-    // The block index and the probe offsets both derive from h1, so with an
-    // even num_blocks a block's keys share an h1 parity and reach fewer of
-    // its bits: the fill grows slower and this reads several percent low.
+    // sets k - 1 distinct, near-uniform bits, so
+    // fill = 1 - exp(-(k - 1) * keys / bits).
     double distinct_keys_for_fill(double fill) const {
         const double bits = static_cast<double>(num_words) * word_bits;
         return -bits * std::log1p(-fill) / (k - 1);
@@ -148,8 +182,9 @@ struct BlockedAtomicBloomFilter {
 
 template <class BF>
 concept BF_Insert_Query_Concept = requires(BF bf) {
-    { bf.Query(uint32_t{}, uint32_t{}) } -> std::same_as<bool>;
-    { bf.Insert(uint32_t{}, uint32_t{}) } -> std::same_as<void>;
+    { bf.Query(uint64_t{}) } -> std::same_as<bool>;
+    { bf.Insert(uint64_t{}) } -> std::same_as<void>;
+    { bf.InsertIfAbsent(uint64_t{}) } -> std::same_as<bool>;
     // { BF(double{}, uint64_t{}) } -> BF;
 };
 
@@ -166,6 +201,7 @@ struct MockBF {
           random_seed(random_seed) {}
     bool contains(const auto &) const { return true; }
     bool insert(const auto &) { return false; }
+    bool insert_if_absent(const auto &) { return false; }
 };
 
 template <class BloomImplementation>
@@ -186,10 +222,15 @@ struct bloom_interface {
         return implementation.contains(element);
     }
     bool insert(const auto &element) { return implementation.insert(element); }
+    bool insert_if_absent(const auto &element) {
+        if (contains(element)) return false;
+        insert(element);
+        return true;
+    }
 };
 
 // The filter is seed-independent: the probe positions come from the 64-bit
-// lcmer key alone (h1 = high word, h2 = low word), so for a given key set
+// lcmer key alone (via fmix64), so for a given key set
 // --random-seed does not change which keys collide in the filter. The seed
 // argument only keeps the constructor uniform with bloom_interface<MockBF>;
 // threading it into the probes would change the assembly.
@@ -200,11 +241,11 @@ struct bloom_interface<BF> {
     bloom_interface(double false_positive_rate, size_t projected_element_count,
                     uint64_t /*random_seed*/)
         : implementation(projected_element_count, false_positive_rate) {}
-    bool contains(const uint64_t &h) const {
-        return implementation.Query(h >> 32, h & 0xFFFFFFFF);
-    }
-    void insert(const uint64_t &h) {
-        implementation.Insert(h >> 32, h & 0xFFFFFFFF);
+    bool contains(const uint64_t &h) const { return implementation.Query(h); }
+    void insert(const uint64_t &h) { implementation.Insert(h); }
+    // Inserts h; returns whether it was absent before.
+    bool insert_if_absent(const uint64_t &h) {
+        return implementation.InsertIfAbsent(h);
     }
 };
 

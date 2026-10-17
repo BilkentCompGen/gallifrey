@@ -202,8 +202,7 @@ struct dbg_index_base {
         (void)idx;
         (void)tid;
         const auto new_hash = std::hash<LCmer>{}(l);
-        if (!bf.contains(new_hash)) {
-            bf.insert(new_hash);
+        if (bf.insert_if_absent(new_hash)) {
             return 0;
         }
         return lcmer_id(l);

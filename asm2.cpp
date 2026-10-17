@@ -2746,14 +2746,46 @@ TEST_CASE("BlockedAtomicBloomFilter estimates distinct keys from its fill") {
     const int64_t n = 200'000;
     bloom_ext::BlockedAtomicBloomFilter<> bf(n, 0.001f);
     std::mt19937_64 rng(7);
-    for (int64_t i = 0; i < n; ++i) {
-        const uint64_t h = rng();
-        bf.Insert(h >> 32, h & 0xFFFFFFFF);
-    }
+    for (int64_t i = 0; i < n; ++i) bf.Insert(rng());
     const double fill = bf.fill_fraction();
-    // num_blocks is even here, so the estimate reads low (see
-    // distinct_keys_for_fill; about 7% for these keys).
     CHECK(bf.distinct_keys_for_fill(fill) ==
-          doctest::Approx(static_cast<double>(n)).epsilon(0.1));
+          doctest::Approx(static_cast<double>(n)).epsilon(0.02));
     CHECK(std::pow(fill, bf.k - 1) < 0.002);
+}
+
+// An lcmer key's low word is its last core label verbatim; a multiple of the
+// 512-bit block must not fold the probes: the key sets k - 1 distinct bits.
+TEST_CASE("Bloom probes of a key with a block-multiple low word") {
+    const uint64_t key = (uint64_t{0x12345678} << 32) | 1024;
+    DefaultBF bf(0.001, 1 << 20, 7);
+    uint64_t set = 0;
+    CHECK(bf.insert_if_absent(key));
+    for (uint64_t w = 0; w < bf.implementation.num_words; ++w)
+        set += std::popcount(bf.implementation.bv[w].load());
+    CHECK_EQ(bf.implementation.k, 10);
+    CHECK_EQ(set, 9);
+    CHECK_FALSE(bf.insert_if_absent(key));
+    CHECK_FALSE(bf.contains(key + 512));
+}
+
+// The block comes from the mixed key's top bits, so a block count that is a
+// multiple of 512 does not tie the probe start to the block: the false
+// positives match those of an odd block count at the same fill.
+TEST_CASE("Bloom false positives with a power-of-two block count") {
+    auto false_positives = [](uint64_t num_blocks) {
+        DefaultBF bf(0.001, 1 << 20, 7);
+        bf.implementation.num_blocks = num_blocks;  // in bounds: shrinks it
+        constexpr uint64_t kWeyl = 0x9e3779b97f4a7c15ULL;
+        constexpr uint64_t kInserted = 35'000;  // fill about 0.45
+        for (uint64_t i = 1; i <= kInserted; ++i) bf.insert(i * kWeyl);
+        int fp = 0;
+        for (uint64_t i = kInserted + 1; i <= kInserted + 100'000; ++i)
+            fp += bf.contains(i * kWeyl);
+        return fp;
+    };
+    const int even = false_positives(1024);
+    const int odd = false_positives(1023);
+    MESSAGE("false positives: 1024 blocks ", even, ", 1023 blocks ", odd);
+    CHECK_LT(even, 1000);  // about 3e-3 of 1e5 queries
+    CHECK_LT(even, odd * 3 / 2 + 50);
 }
