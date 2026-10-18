@@ -21,8 +21,9 @@ class AsmProgram {
     asm_config cfg;
     std::string file_reading_mode{"sequential"};
     int olc_lcmer_l_ignored = 0;  // --olc-lcmer-l: accepted, no effect
+    std::string multipass_text;
 
-public:
+   public:
     explicit AsmProgram(CLI::App &parent) {
         auto &app = *parent.add_subcommand("hifi", "run hifi assembly");
         app.add_option("input", cfg.inputs,
@@ -32,14 +33,27 @@ public:
             ->required();
         app.add_option("-o,--output", cfg.output, "Output gfa file")
             ->required();
-        app.add_option("-l,--level", cfg.lcp_level, "LCP level to compute")
-            ->required()
-            ->check(CLI::Range(1, 64));
-        app.add_option("--lcmer-l,--dbg-lcmer-l", cfg.lcmer_l,
-                       "LCMER window length, used for DBG construction and "
-                       "overlap detection (--dbg-lcmer-l is the old name)")
-            ->check(CLI::Range(1, 64))
-            ->capture_default_str();
+        auto *level_opt =
+            app.add_option("-l,--level", cfg.lcp_level, "LCP level to compute")
+                ->check(CLI::Range(1, 64));
+        auto *lcmer_opt =
+            app.add_option("--lcmer-l,--dbg-lcmer-l", cfg.lcmer_l,
+                           "LCMER window length, used for DBG construction "
+                           "and overlap detection (--dbg-lcmer-l is the old "
+                           "name)")
+                ->check(CLI::Range(1, 64))
+                ->capture_default_str();
+        auto *multipass_opt =
+            app.add_option(
+                   "--multipass", multipass_text,
+                   "Multi-pass assembly: LEVEL:L[,LEVEL:L...] gives the LCP "
+                   "level and lcmer window length of each pass, e.g. "
+                   "4:8,5:6,5:10 (replaces -l and --lcmer-l). Each pass "
+                   "assembles the reads together with the previous pass's "
+                   "contigs; only the last pass writes the output. Order "
+                   "the passes from small to large windows.")
+                ->excludes(level_opt)
+                ->excludes(lcmer_opt);
         app.add_option("--olc-lcmer-l", olc_lcmer_l_ignored,
                        "Ignored; overlap detection uses --lcmer-l")
             ->group("");
@@ -155,14 +169,29 @@ public:
                         "repeats and kept; 2 also cuts allele tips at forks")
             ->check(CLI::Range(1, 2))
             ->capture_default_str();
-        app.callback([this]() {
+        app.callback([this, level_opt, multipass_opt]() {
             if (olc_lcmer_l_ignored != 0) {
                 std::fprintf(stderr,
                              "[config] --olc-lcmer-l is ignored; overlap "
                              "detection uses --lcmer-l (%d)\n",
                              cfg.lcmer_l);
             }
-            if (cfg.lcp_level < 3) {
+            if (multipass_opt->count() > 0) {
+                auto passes = parse_multipass(multipass_text);
+                if (!passes) {
+                    throw CLI::ValidationError(passes.error());
+                }
+                cfg.multipass = std::move(*passes);
+            } else if (level_opt->count() == 0) {
+                throw CLI::RequiredError(level_opt->get_name());
+            }
+            const bool low_level = [&] {
+                if (cfg.multipass.empty()) return cfg.lcp_level < 3;
+                return std::any_of(
+                    cfg.multipass.begin(), cfg.multipass.end(),
+                    [](const pass_params &p) { return p.lcp_level < 3; });
+            }();
+            if (low_level) {
                 std::fprintf(stderr,
                              "Warning: LCP levels lower than 3 are not "
                              "intended for actual use and may use "

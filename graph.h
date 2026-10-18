@@ -102,13 +102,26 @@ struct dbg_index_base {
         };
 
         bidbg_val(unsigned core_count)
-            : redirected_flag(false), forward_edge_count(0), counts{core_count},
-              seq{}, prev{} {}
+            : redirected_flag(false),
+              seeded(false),
+              forward_edge_count(0),
+              counts{core_count},
+              seq{},
+              prev{} {}
         bidbg_val(unsigned core_count, u64 prev)
-            : redirected_flag(false), forward_edge_count(0), counts{core_count},
-              seq{}, prev{prev} {}
+            : redirected_flag(false),
+              seeded(false),
+              forward_edge_count(0),
+              counts{core_count},
+              seq{},
+              prev{prev} {}
 
         bool redirected_flag;
+        // Holds a window of an earlier pass's segment (--multipass): admitted
+        // without the Bloom filter, adding no count, and spared by the
+        // depth-only cleaning rules. Sits in the padding before
+        // forward_edge_count.
+        bool seeded;
         // forward_edge_count stays outside the redirect_to union: a
         // neighbouring chain may read it while this node is being redirected.
         // fec is written only on representatives; core_count stays unioned
@@ -571,6 +584,7 @@ struct GraphCleaning {
                 current->second.seq.emplace_back(std::move(*sit));
             }
             seqs.clear();
+            current->second.seeded |= (*it)->second.seeded;
             (*it)->second.mark_redirected(current->first);
         }
 
@@ -738,7 +752,10 @@ struct GraphCleaning {
             if (current->second.redirected()) {
                 continue;
             }
-            if (current->second.avg_core_count() < min_core_depth) {
+            // Seeded nodes take the branch of a supported node: they are
+            // never removed for depth, but still drop low-depth tips.
+            if (current->second.avg_core_count() < min_core_depth &&
+                !current->second.seeded) {
                 // Forlorn
                 if (current->second.forward_edge_count == 0 &&
                     current->second.prev.size() == 0) {
@@ -759,6 +776,7 @@ struct GraphCleaning {
                     auto prev_it = dbg.find(pid);
                     if (prev_it != dbg.end() && !prev_it->second.redirected()) {
                         if (prev_it->second.avg_core_count() < min_core_depth &&
+                            !prev_it->second.seeded &&
                             prev_it->second.prev.size() == 0 &&
                             prev_it->second.forward_edge_count == 1) {
                             dbg.erase(prev_it);  // MARK
@@ -779,6 +797,7 @@ struct GraphCleaning {
                     if (prev_it != dbg.end() && !prev_it->second.redirected()) {
                         if (prev_it->second.avg_core_count() <
                                 current->second.avg_core_count() &&
+                            !prev_it->second.seeded &&
                             prev_it->second.seq.size() < max_tip_length &&
                             current->second.seq.size() > 2 * max_tip_length &&
                             prev_it->second.prev.size() == 0 &&
@@ -1205,13 +1224,16 @@ struct GraphCleaning {
                 if (continuing == 0) continue;
                 for (const auto &tip : tips) {
                     double tip_depth = 0.0;
+                    bool seeded = false;
                     gtl::vector<SequenceContainerType> frags;
                     size_t len = 0;
                     for (u64 nid : tip) {
                         const auto &node = dbg.find(nid)->second;
                         tip_depth = std::max(tip_depth, node.avg_core_count());
+                        seeded |= node.seeded;
                     }
                     if (tip_depth >= locus_limit) continue;  // repeat copy
+                    if (seeded) continue;  // an earlier pass's segment
                     // Tip sequence in forward order.
                     for (size_t k = 0; k < tip.size(); ++k) {
                         const u64 nid =
@@ -1269,7 +1291,7 @@ struct GraphCleaning {
                 continue;
             }
             if (current->second.avg_core_count() < 2 &&
-                current->second.prev.size() == 1 &&
+                !current->second.seeded && current->second.prev.size() == 1 &&
                 current->second.forward_edge_count == 1) {
                 auto prev_it = dbg.find(current->second.prev[0]);
                 if (prev_it != dbg.end())

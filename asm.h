@@ -6,6 +6,7 @@
 #include <inttypes.h>
 #include <stdint.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <expected>
 #include <optional>
@@ -84,6 +85,54 @@ struct syncmer_params {
 // Default --random-seed. The seed only drives the syncmer s-mer hash, which
 // is 32-bit, so the seed is stored as uint32_t.
 inline constexpr uint32_t kDefaultRandomSeed = 1453;
+// One pass of --multipass: the LCP level and lcmer window length of one
+// assembly pass.
+struct pass_params {
+    int lcp_level;
+    int lcmer_l;
+};
+// Pass bounds: levels as -l; a window needs at least two cores to have an
+// edge between consecutive windows.
+inline constexpr int kMinPassLevel = 1, kMaxPassLevel = 64;
+inline constexpr int kMinPassLcmer = 2, kMaxPassLcmer = 64;
+// Parses "LEVEL:L[,LEVEL:L...]" (at least one pass, bounds above).
+inline std::expected<std::vector<pass_params>, std::string> parse_multipass(
+    const std::string &text) {
+    std::vector<pass_params> out;
+    size_t at = 0;
+    while (true) {
+        const size_t end = std::min(text.find(',', at), text.size());
+        const std::string item = text.substr(at, end - at);
+        const size_t colon = item.find(':');
+        int level = 0, lcmer = 0;
+        size_t level_len = 0, lcmer_len = 0;
+        try {
+            if (colon != std::string::npos) {
+                level = std::stoi(item.substr(0, colon), &level_len);
+                lcmer = std::stoi(item.substr(colon + 1), &lcmer_len);
+            }
+        } catch (const std::exception &) {
+            level_len = 0;
+        }
+        if (colon == std::string::npos || level_len != colon ||
+            lcmer_len == 0 || colon + 1 + lcmer_len != item.size()) {
+            return std::unexpected("--multipass: expected LEVEL:L, got \"" +
+                                   item + "\"");
+        }
+        if (level < kMinPassLevel || level > kMaxPassLevel ||
+            lcmer < kMinPassLcmer || lcmer > kMaxPassLcmer) {
+            return std::unexpected("--multipass: " + item + " needs level " +
+                                   std::to_string(kMinPassLevel) + "-" +
+                                   std::to_string(kMaxPassLevel) + " and L " +
+                                   std::to_string(kMinPassLcmer) + "-" +
+                                   std::to_string(kMaxPassLcmer));
+        }
+        out.push_back({level, lcmer});
+        if (end == text.size()) break;
+        at = end + 1;
+    }
+    return out;
+}
 struct asm_config {
     std::vector<std::string> inputs;
     std::string output;
@@ -91,6 +140,8 @@ struct asm_config {
     // LCMER window length (cores) of the DBG keys; overlap detection queries
     // the same index, so it uses the same length.
     int lcmer_l = 6;
+    // --multipass passes; empty = one pass at (lcp_level, lcmer_l).
+    std::vector<pass_params> multipass;
     struct {
         int io = 4;
         int work = 8;
@@ -140,8 +191,18 @@ struct asm_config {
             fprintf(f, "Inputs (0):\n");
         }
         fprintf(f, "Output: %s\n", output.c_str());
-        fprintf(f, "LCP Level: %d\n", lcp_level);
-        fprintf(f, "LCMER Length: %d\n", lcmer_l);
+        if (multipass.empty()) {
+            fprintf(f, "LCP Level: %d\n", lcp_level);
+            fprintf(f, "LCMER Length: %d\n", lcmer_l);
+        } else {
+            fprintf(f, "Multipass:");
+            const char *sep = " ";
+            for (const auto &p : multipass) {
+                fprintf(f, "%s%d:%d", sep, p.lcp_level, p.lcmer_l);
+                sep = ",";
+            }
+            fprintf(f, "\n");
+        }
         fprintf(f, "Threads:\n\tIO: %d\n\tWork: %d\n", threads.io, threads.work);
         fprintf(f, "Seed: %" PRIu32 "\n", seed);
         fprintf(f, "RLE: %s\n", rle ? "true" : "false");

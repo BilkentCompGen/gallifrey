@@ -100,7 +100,7 @@ Required:
 
 - `input`: one or more BAM/CRAM/SAM or FASTA/FASTQ(.gz) read files
 - `-o, --output`: output GFA path
-- `-l, --level`: LCP/core depth
+- `-l, --level`: LCP/core depth (or `--multipass`)
 
 Core assembly controls:
 
@@ -116,6 +116,13 @@ Core assembly controls:
   accept a core-label match as a seed only if both cores have the same
   homopolymer-compressed sequence, so cores that merely share a label are not
   chained (default on)
+- `--multipass LEVEL:L[,LEVEL:L...]`: multi-pass assembly, e.g.
+  `4:8,5:6,5:10`; each item is the LCP level and lcmer window length of one
+  pass, replacing `-l` and `--lcmer-l`. Each pass assembles the reads together
+  with the previous pass's contigs; only the last pass writes the output (and
+  the `--print-raw-dbg`/`--print-bi-dbg` dumps). Small windows bridge
+  construction holes and large ones resolve repeats, so order the passes from
+  small to large windows
 
 Syncmer selection (Edgar 2021). A k-mer is selected by the position of its
 smallest s-mer; selection is computed on the fly from s-mer hashes, with no
@@ -153,7 +160,8 @@ Output and debugging:
 
 - `--print-raw-dbg`: write the pre-cleaning graph with `.raw.gfa` suffix
 - `--print-bi-dbg`: write the graph before layout with `.bi.gfa` suffix
-- `--silent`: reduce progress logging
+- `--silent`: reduce progress logging (with `--multipass`, every pass logs its
+  settings, the segments it uses and keeps, and its wall/CPU time)
 
 ## Output Files
 

@@ -18,6 +18,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <utility>
 
 #include "align.h"
 #include "graph.h"
@@ -2026,8 +2027,36 @@ class segment_end_depth {
     gtl::flat_hash_map<u64, u64> first_segment_of_;  // layout -> segment
 };
 
-template <class AssemblerT>
-inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
+// Sequences of the output segments (supernodes still named after post-layout
+// cleaning and end joins), each concatenated into one owned container: the
+// segments a --multipass pass seeds into the next pass.
+inline gtl::vector<SequenceContainerType> segment_sequences(
+    const supernode_vec &supernodes, int nthreads) {
+    gtl::vector<const supernode_out *> kept;
+    for (const auto &sn : supernodes) {
+        if (!sn.name.empty()) kept.push_back(&sn);
+    }
+    gtl::vector<SequenceContainerType> out(kept.size());
+    std::atomic<size_t> next{0};
+    gtl::vector<std::thread> workers;
+    for (int t = 0; t < std::max(1, nthreads); ++t) {
+        workers.emplace_back([&]() {
+            for (size_t i = next++; i < kept.size(); i = next++) {
+                const auto &seqs = kept[i]->seqs();
+                out[i] = SequenceContainerType(seqs.begin(), seqs.end());
+            }
+        });
+    }
+    for (auto &w : workers) w.join();
+    return out;
+}
+
+// Layout and emission of the cleaned DBG: fold, layout supernodes, edge
+// aggregation, post-layout cleaning and end joins, then
+// `sink(supernodes, edges)` (`sink_name` labels its timing line).
+template <class AssemblerT, class Sink>
+inline void build_merged_graph(AssemblerT &as, dbg_index &dbg,
+                               const char *sink_name, Sink &&sink) {
     INIT_TIMERS(LayoutEmit);
     auto [recig, layouts, dropped_crumbs] = as.fold_dbg_graph(dbg);
     TIME_CHECKPOINT(LayoutEmit, stderr, "fold_dbg_graph (%zu layouts)",
@@ -2117,9 +2146,19 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         TIME_CHECKPOINT(LayoutEmit, stderr, "End joins");
     }
 
-    // ── Phase 6: format supernode S-lines (parallel) + write GFA ────────
-    write_gfa(supernodes, merged_edges, as.threads.work, out);
-    TIME_CHECKPOINT(LayoutEmit, stderr, "GFA writing");
+    // ── Phase 6: hand the graph to the sink (GFA writing) ───────────────
+    std::forward<Sink>(sink)(std::as_const(supernodes),
+                             std::as_const(merged_edges));
+    TIME_CHECKPOINT(LayoutEmit, stderr, "%s", sink_name);
+}
+
+template <class AssemblerT>
+inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
+    build_merged_graph(
+        as, dbg, "GFA writing",
+        [&](const supernode_vec &supernodes, const edge_map &merged_edges) {
+            write_gfa(supernodes, merged_edges, as.threads.work, out);
+        });
 }
 
 template <class AssemblerT>

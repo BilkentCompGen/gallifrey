@@ -6,6 +6,7 @@
 #include <htslib/sam.h>
 #include <htslib/thread_pool.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -14,11 +15,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <gtl/btree.hpp>
 #include <gtl/phmap.hpp>
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <string>
 #include <tuple>
@@ -91,11 +94,29 @@ struct assembler {
         inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
     }
 
-    template <class BFT>
+    // Seeded (--multipass segment windows): the window adds no count and marks
+    // its node seeded; edges are made as for reads.
+    template <class BFT, bool Seeded = false>
     static inline auto insert_lcmer_helper(const gtl::vector<uint64_t> &ll,
                                            const uint32_t &i,
                                            dbg_index_base<BFT> &dbgi) -> bool {
         using index_type = dbg_index_base<BFT>;
+        using val_type = typename index_type::bidbg_val;
+        constexpr unsigned kCount = [] {
+            if constexpr (Seeded) {
+                return 0U;
+            } else {
+                return 1U;
+            }
+        }();
+        const auto make = [](auto... args) {
+            val_type v{args...};
+            if constexpr (Seeded) v.seeded = true;
+            return v;
+        };
+        const auto mark = [](val_type &v) {
+            if constexpr (Seeded) v.seeded = true;
+        };
         if (ll[i] == 0) {
             return false;
         }
@@ -106,10 +127,11 @@ struct assembler {
                 return dbgi.dbg.lazy_emplace_l(
                     ll[i],
                     [&](index_type::dbg_map_t::value_type &val) {
-                        val.second.counts.core_count++;
+                        val.second.counts.core_count += kCount;
+                        mark(val.second);
                     },
                     [&](const index_type::dbg_map_t::constructor &ctr) {
-                        ctr(ll[i], typename index_type::bidbg_val{1});
+                        ctr(ll[i], make(kCount));
                     });
             }
         } else {
@@ -120,21 +142,21 @@ struct assembler {
                         val.second.emplace_prev(
                             ll[i - 1]);  // TODO verify this CC logic holds
                         // val.second.cc++;
+                        mark(val.second);
                     },
                     [&](const index_type::dbg_map_t::constructor &ctr) {
-                        ctr(ll[i],
-                            typename index_type::bidbg_val{0U, ll[i - 1]});
+                        ctr(ll[i], make(0U, ll[i - 1]));
                     });
             } else {
                 return dbgi.dbg.lazy_emplace_l(
                     ll[i],
                     [&](index_type::dbg_map_t::value_type &val) {
                         val.second.emplace_prev(ll[i - 1]);
-                        val.second.counts.core_count++;
+                        val.second.counts.core_count += kCount;
+                        mark(val.second);
                     },
                     [&](const index_type::dbg_map_t::constructor &ctr) {
-                        ctr(ll[i],
-                            typename index_type::bidbg_val{1U, ll[i - 1]});
+                        ctr(ll[i], make(kCount, ll[i - 1]));
                     });
             }
         }
@@ -255,6 +277,155 @@ struct assembler {
             l.update_lcmer(lr.cores[i], lr.cores[i - lcmer_l], lcmer_l);
             dbgi.emplace(l, unused_index, 0);
         }
+    }
+
+    // ── --multipass: seeding a pass with the previous pass's segments ─────
+    // Base j of seq[from, to), or of its reverse complement.
+    static uint8_t range_base(const SequenceContainerType &seq, size_t from,
+                              size_t to, bool rc, size_t j) {
+        using view = KmerViewOnCrumbs64<uint64_t>;
+        const size_t skip = static_cast<size_t>(seq.skip_first_n);
+        if (rc) {
+            return static_cast<uint8_t>(
+                3 ^ view::base_at(seq.data, skip + to - 1 - j));
+        }
+        return view::base_at(seq.data, skip + from + j);
+    }
+
+    // Cores of seq[from, to) (or of its reverse complement) at lcp_level,
+    // positions in the range's own coordinates. The run-length stream is
+    // read straight from the 2-bit words, so the range is never copied.
+    static void parse_range(const SequenceContainerType &seq, size_t from,
+                            size_t to, bool rc, int lcp_level, lps *str,
+                            const SyncmerType &syncmer_functor, charsi &rle,
+                            pos_scratch &pos, lcp_read &lr) {
+        lr.clear();
+        const size_t len = to - from;
+        rle.require(len + kOnehotRlePad);
+        pos.require(len + kOnehotRlePad);
+        int64_t rle_len = 0;
+        uint8_t prev = 255;
+        for (size_t j = 0; j < len; ++j) {
+            const uint8_t b = range_base(seq, from, to, rc, j);
+            if (b != prev) {
+                rle.data[rle_len] = b;
+                pos.data[rle_len] = static_cast<uint32_t>(j);
+                ++rle_len;
+                prev = b;
+            }
+        }
+        prepare_lps(str, len);
+        str->size = parse1_rle_syncmers(rle.data, pos.data, rle_len,
+                                        static_cast<int64_t>(len), str,
+                                        syncmer_functor);
+        lps_deepen(str, lcp_level);
+        lr.reserve(str->size);
+        for (int i = 0; i < str->size; ++i) {
+            lr.cores.emplace_back(str->cores[i].label);
+            lr.pos.emplace_back(str->cores[i].start, str->cores[i].end);
+        }
+    }
+
+    // Bases [a, b) of the range seq[from, to) in the orientation it was
+    // parsed in, as a node fragment.
+    static SequenceContainerType range_fragment(
+        const SequenceContainerType &seq, size_t from, size_t to, bool rc,
+        size_t a, size_t b, u64 origin_node) {
+        SequenceContainerType out{b - a, 0};
+        out.origin_node = origin_node;
+        for (size_t j = a; j < b; ++j) {
+            const size_t bit = (j - a) * 2;
+            out.data[bit >> 6] |=
+                static_cast<uint64_t>(range_base(seq, from, to, rc, j))
+                << (bit & 63);
+        }
+        return out;
+    }
+
+    // The windows process_cores takes from a read, seeded: keyed without the
+    // Bloom filter, no count, node marked seeded. A new node's fragment comes
+    // from the parsed range. Returns the number of windows. `ll` is scratch.
+    template <class BFT>
+    static size_t process_seeded_cores(const lcp_read &lr,
+                                       const SequenceContainerType &seq,
+                                       size_t from, size_t to, bool rc,
+                                       dbg_index_base<BFT> &dbgi, int lcmer_l,
+                                       gtl::vector<uint64_t> &ll) {
+        if (lr.cores.size() < static_cast<size_t>(lcmer_l + 2)) return 0;
+        uint64_t unused_index = 0;
+        LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
+        ll.assign(1, 0);
+        ll.push_back(dbgi.emplace_nobloomfilter(l, unused_index, 0));
+        for (size_t i = static_cast<size_t>(lcmer_l + 1);
+             i < lr.cores.size() - 1; ++i) {
+            l.update_lcmer(lr.cores[i], lr.cores[i - lcmer_l], lcmer_l);
+            ll.push_back(dbgi.emplace_nobloomfilter(l, unused_index, 0));
+        }
+        ll.push_back(0);
+        for (size_t i = 1; i < ll.size() - 1; ++i) {
+            if (insert_lcmer_helper<BFT, true>(ll, i, dbgi)) {
+                dbgi.dbg.modify_if(ll[i], [&](auto &val) {
+                    val.second.seq.push_back(range_fragment(
+                        seq, from, to, rc, lr.pos[i + lcmer_l - 2].second,
+                        lr.pos[i + lcmer_l - 1].second, val.first));
+                });
+            }
+        }
+        return ll.size() - 2;
+    }
+
+    // Segments are seeded in chunks, so parse buffers stay chunk-sized; the
+    // overlap is far above one window plus the cores a parse loses at each
+    // end, so every window of a segment lies inside some chunk.
+    static constexpr size_t kSeedChunkBases = size_t{1} << 20;
+    static constexpr size_t kSeedChunkOverlap = size_t{1} << 16;
+
+    // Seeds dbgi with every window of every segment, in both orientations
+    // (the LCP parse is not strand-symmetric). Run after all reads, so read
+    // nodes keep their read fragments. Returns {chunks, windows}.
+    std::pair<size_t, size_t> insert_segments(
+        dbg_index &dbgi, const gtl::vector<SequenceContainerType> &segments,
+        size_t chunk_bases = kSeedChunkBases,
+        size_t chunk_overlap = kSeedChunkOverlap) const {
+        struct chunk {
+            size_t seg, from, to;
+        };
+        gtl::vector<chunk> chunks;
+        for (size_t s = 0; s < segments.size(); ++s) {
+            const size_t len = segments[s].len;
+            for (size_t from = 0; from < len;
+                 from += chunk_bases - chunk_overlap) {
+                const size_t to = std::min(len, from + chunk_bases);
+                chunks.push_back({s, from, to});
+                if (to == len) break;
+            }
+        }
+        std::atomic<size_t> next{0};
+        std::atomic<size_t> windows{0};
+        gtl::vector<std::thread> workers;
+        for (int t = 0; t < threads.work; ++t) {
+            workers.emplace_back([&]() {
+                lps str = {0, 0, 0, 0};
+                charsi rle;
+                pos_scratch pos;
+                lcp_read lr;
+                gtl::vector<uint64_t> ll;
+                size_t n = 0;
+                for (size_t c = next++; c < chunks.size(); c = next++) {
+                    const auto &[s, from, to] = chunks[c];
+                    for (bool rc : {false, true}) {
+                        parse_range(segments[s], from, to, rc, lcp_level, &str,
+                                    syncmer_functor, rle, pos, lr);
+                        n += process_seeded_cores(lr, segments[s], from, to, rc,
+                                                  dbgi, lcmer_l, ll);
+                    }
+                }
+                windows += n;
+                free_lps(&str);
+            });
+        }
+        for (auto &w : workers) w.join();
+        return {chunks.size(), windows.load()};
     }
 
     static std::pair<int, int> get_thread_dist(int threads) {
@@ -1043,17 +1214,51 @@ static bool validate_path(const std::string &path) {
     return true;
 }
 
-int run_assembly(const asm_config &cfg) {
-    if (!validate_path(cfg.output)) return 1;
+// Checks shared by both drivers, before any work; prints the configuration.
+static bool prepare_run(const asm_config &cfg) {
+    if (!validate_path(cfg.output)) return false;
 
     // Validate the syncmer configuration once, up front, before any syncmer
     // functor is constructed (the functor ctor assumes a valid rule).
     if (auto v = cfg.syncmer.validate(); !v) {
         fprintf(stderr, "Error: %s\n", v.error().c_str());
-        return 1;
+        return false;
     }
 
     if (!cfg.silent) cfg.print_cfg(stderr);
+    return true;
+}
+
+// Debug dump of the DBG's unitigs (--print-raw-dbg, --print-bi-dbg).
+static bool dump_dbg(const std::string &path, const dbg_index &dbg) {
+    FILE *out = fopen(path.c_str(), "w");
+    if (!out) {
+        fprintf(stderr, "Cannot open output: %s\n", path.c_str());
+        return false;
+    }
+    print_dbg_seqs(out, dbg);
+    fclose(out);
+    return true;
+}
+
+// Layout of the cleaned DBG, written as the output GFA.
+static bool write_output_gfa(const asm_config &cfg, assembler &as,
+                             dbg_index &dbg) {
+    FILE *out = fopen(cfg.output.c_str(), "w");
+    if (!out) {
+        fprintf(stderr, "Cannot open output: %s\n", cfg.output.c_str());
+        return false;
+    }
+    layout_graph_emit::emit_ultra_merged_graph(as, dbg, out);
+    fclose(out);
+    return true;
+}
+
+static int run_passes(const asm_config &cfg);
+
+int run_assembly(const asm_config &cfg) {
+    if (!cfg.multipass.empty()) return run_passes(cfg);
+    if (!prepare_run(cfg)) return 1;
     // free(malloc(1024ULL * 1024 * 1024 * 20)); INTIMIDATE the OS for the
     // ram
 
@@ -1074,15 +1279,7 @@ int run_assembly(const asm_config &cfg) {
                        "Count forward edges");
 
     if (cfg.print_precleanup_graph) {
-        const std::string raw_path = cfg.output + ".raw.gfa";
-        FILE *out = fopen(raw_path.c_str(), "w");
-        if (!out) {
-            fprintf(stderr, "Cannot open output: %s\n", raw_path.c_str());
-            return 1;
-        }
-        print_dbg_seqs(out, dbg);
-        fclose(out);
-
+        if (!dump_dbg(cfg.output + ".raw.gfa", dbg)) return 1;
         IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "DBG printing");
     }
 
@@ -1090,31 +1287,129 @@ int run_assembly(const asm_config &cfg) {
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph cleaning");
 
-
     // Dump pre-layout (bidirected) unitig graph, gated on --print-bi-dbg.
-    if (cfg.print_prelayout_graph) {
-        const std::string pre_path = cfg.output + ".bi.gfa";
-        FILE *pre = fopen(pre_path.c_str(), "w");
-        if (!pre) {
-            fprintf(stderr, "Cannot open output: %s\n", pre_path.c_str());
-            return 1;
-        }
-        print_dbg_seqs(pre, dbg);
-        fclose(pre);
+    if (cfg.print_prelayout_graph && !dump_dbg(cfg.output + ".bi.gfa", dbg)) {
+        return 1;
     }
 
-    {
-        FILE *out = fopen(cfg.output.c_str(), "w");
-        if (!out) {
-            fprintf(stderr, "Cannot open output: %s\n", cfg.output.c_str());
-            return 1;
-        }
-        layout_graph_emit::emit_ultra_merged_graph(as, dbg, out);
-        fclose(out);
-    }
+    if (!write_output_gfa(cfg, as, dbg)) return 1;
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Merged/Printed");
 
+    return 0;
+}
+
+static size_t total_bases(const gtl::vector<SequenceContainerType> &seqs) {
+    size_t sum = 0;
+    for (const auto &s : seqs) sum += s.len;
+    return sum;
+}
+
+// Sequences of the segments a layout of the cleaned DBG would write: the
+// input of the next pass.
+static gtl::vector<SequenceContainerType> collect_segments(assembler &as,
+                                                           dbg_index &dbg) {
+    gtl::vector<SequenceContainerType> segments;
+    layout_graph_emit::build_merged_graph(
+        as, dbg, "Segment collection",
+        [&](const layout_graph_emit::supernode_vec &supernodes,
+            const layout_graph_emit::edge_map &) {
+            segments = layout_graph_emit::segment_sequences(supernodes,
+                                                            as.threads.work);
+        });
+    return segments;
+}
+
+// --multipass driver. Pass p uses the stages of a single pass at its own LCP
+// level and lcmer length: reads into a fresh graph (construct_dbg), then the
+// previous pass's segments as seeded windows (insert_segments), edge counts,
+// cleaning and layout. Earlier passes keep only their segments and free
+// their graph; the last pass writes the outputs.
+static int run_passes(const asm_config &cfg) {
+    if (!prepare_run(cfg)) return 1;
+
+    INIT_TIMERS(HIFI_ASSEMBLY);
+    INIT_TIMERS(MULTIPASS);
+
+    assembler as(cfg);
+    const std::vector<pass_params> &passes = cfg.multipass;
+    const size_t n = passes.size();
+    // The previous pass's segments: the only data kept between passes.
+    gtl::vector<SequenceContainerType> segments;
+    for (size_t p = 0; p < n; ++p) {
+        const bool last = p + 1 == n;
+        as.lcp_level = passes[p].lcp_level;
+        as.lcmer_l = passes[p].lcmer_l;
+        if (!cfg.silent)
+            fprintf(stderr,
+                    "[multipass] pass %zu/%zu: level %d, lcmer-l %d, seeding "
+                    "%zu segments (%zu bp, both strands)\n",
+                    p + 1, n, as.lcp_level, as.lcmer_l, segments.size(),
+                    total_bases(segments));
+        // A fresh index (map and Bloom filter) per pass.
+        auto graph = std::make_unique<dbg_index>(
+            cfg.bloom.false_positive_rate, cfg.bloom.projected_count, cfg.seed);
+        dbg_index &dbg = *graph;
+        if (auto r = as.construct_dbg(dbg); !r) {
+            fprintf(stderr, "%s Terminating.\n", r.error().c_str());
+            return 1;
+        }
+        IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                           "DBG construction");
+
+        if (!segments.empty()) {
+            const auto [chunks, windows] = as.insert_segments(dbg, segments);
+            gtl::vector<SequenceContainerType>().swap(segments);
+            IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                               "Segment seeding (%zu chunks, %zu windows)",
+                               chunks, windows);
+        }
+
+        dbg.count_forward_edges();
+        IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                           "Count forward edges");
+
+        if (last && cfg.print_precleanup_graph) {
+            if (!dump_dbg(cfg.output + ".raw.gfa", dbg)) return 1;
+            IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                               "DBG printing");
+        }
+
+        GraphCleaning::run(dbg, cfg);
+        IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                           "Graph cleaning");
+
+        if (!last) {
+            segments = collect_segments(as, dbg);
+            graph.reset();
+            IF_TIME_CHECKPOINT(!cfg.silent, MULTIPASS, stderr,
+                               "pass %zu/%zu (%d:%d) done", p + 1, n,
+                               as.lcp_level, as.lcmer_l);
+            if (!cfg.silent)
+                fprintf(stderr,
+                        "[multipass] pass %zu/%zu: %zu segments (%zu bp) kept "
+                        "for the next pass\n",
+                        p + 1, n, segments.size(), total_bases(segments));
+            continue;
+        }
+
+        if (cfg.print_prelayout_graph &&
+            !dump_dbg(cfg.output + ".bi.gfa", dbg)) {
+            return 1;
+        }
+        if (!write_output_gfa(cfg, as, dbg)) return 1;
+        IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                           "Merged/Printed");
+        IF_TIME_CHECKPOINT(!cfg.silent, MULTIPASS, stderr,
+                           "pass %zu/%zu (%d:%d) done", p + 1, n, as.lcp_level,
+                           as.lcmer_l);
+        if (!cfg.silent)
+            fprintf(stderr, "[multipass] pass %zu/%zu: output written\n", p + 1,
+                    n);
+        // The last graph is never torn down: the process exits once the GFA
+        // is written, so teardown is pure overhead (as NoDestructor).
+        (void)graph.release();
+    }
     return 0;
 }
 
@@ -1487,10 +1782,10 @@ struct bubble {
     out.push_back(hap.substr(hap.size() - len));
 }
 
-// DBG from reads in input order: an lcmer's node and fragment come from the
-// read that sights it the second time.
-[[maybe_unused]] static void build_dbg(dbg_index &dbgi,
-                                       const std::vector<std::string> &reads) {
+// Reads into the DBG in input order: an lcmer's node and fragment come from
+// the read that sights it the second time. Edges are not counted yet.
+[[maybe_unused]] static void insert_reads(
+    dbg_index &dbgi, const std::vector<std::string> &reads) {
     decltype(asm_config::syncmer) spara;
     spara.apply_default_rule();
     const assembler::SyncmerType fnctr(spara, 1453);
@@ -1509,6 +1804,11 @@ struct bubble {
         }
     }
     free_lps(&str);
+}
+
+[[maybe_unused]] static void build_dbg(dbg_index &dbgi,
+                                       const std::vector<std::string> &reads) {
+    insert_reads(dbgi, reads);
     dbgi.count_forward_edges();
 }
 
@@ -1715,6 +2015,240 @@ TEST_CASE(
             ++through;
     }
     CHECK_EQ(through, 1);
+}
+
+// ── --multipass: option parsing, seeded segment windows ────────────────
+TEST_CASE("parse_multipass reads LEVEL:L passes and rejects malformed ones") {
+    const auto ok = parse_multipass("4:8,5:6,5:10");
+    REQUIRE(ok.has_value());
+    REQUIRE_EQ(ok->size(), 3);
+    CHECK_EQ((*ok)[0].lcp_level, 4);
+    CHECK_EQ((*ok)[0].lcmer_l, 8);
+    CHECK_EQ((*ok)[2].lcp_level, 5);
+    CHECK_EQ((*ok)[2].lcmer_l, 10);
+    const auto one = parse_multipass("5:6");
+    REQUIRE(one.has_value());
+    CHECK_EQ(one->size(), 1);
+    for (const char *bad : {"", "4:8,", ",4:8", "4", "4:", ":8", "4:1", "0:6",
+                            "65:6", "4:65", "4:8x", "a:b", "4:8:2", "4;8"}) {
+        INFO("input \"", bad, "\"");
+        CHECK_FALSE(parse_multipass(bad).has_value());
+    }
+}
+
+namespace multipass_test {
+using namespace fragment_test;
+
+[[maybe_unused]] static assembler make_assembler(int level, int lcmer_l) {
+    asm_config cfg;
+    cfg.lcp_level = level;
+    cfg.lcmer_l = lcmer_l;
+    cfg.threads.work = 2;
+    cfg.syncmer.apply_default_rule();
+    return assembler(cfg);
+}
+
+[[maybe_unused]] static SequenceContainerType packed(const std::string &s) {
+    return SequenceContainerType(s.data(), 0, s.size(), 0,
+                                 SequenceContainerType::from_ascii{});
+}
+
+[[maybe_unused]] static gtl::vector<SequenceContainerType> one_segment(
+    const std::string &s) {
+    gtl::vector<SequenceContainerType> segs;
+    segs.push_back(packed(s));
+    return segs;
+}
+
+// Some live unitig spells `piece` on either strand.
+[[maybe_unused]] static bool unitig_holds(const dbg_index &dbgi,
+                                          const std::string &piece) {
+    const std::string rc = revcomp(piece);
+    for (u64 id : dbgi.active_set) {
+        const auto it = dbgi.dbg.find(id);
+        if (it == dbgi.dbg.end() || it->second.redirected()) continue;
+        const std::string u = spell(dbgi, id);
+        if (u.find(piece) != std::string::npos ||
+            u.find(rc) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+}  // namespace multipass_test
+
+TEST_CASE(
+    "assembler::insert_segments admits every window at its first sighting "
+    "and adds no count") {
+    using namespace multipass_test;
+    const std::string s = random_dna(6000, 5);
+    const assembler as = make_assembler(kLevel, kLcmerL);
+    // Fed once as a read, every window is a first sighting: no node.
+    dbg_index as_read(0.001, 1 << 20, 7);
+    insert_reads(as_read, {s});
+    CHECK(as_read.dbg.empty());
+
+    dbg_index seeded(0.001, 1 << 20, 7);
+    const auto [chunks, windows] = as.insert_segments(seeded, one_segment(s));
+    CHECK_EQ(chunks, 1);
+    REQUIRE_GT(windows, 0);
+    // Both strands: each strand's windows lie on one chain, and an interior
+    // window gets a node (the end windows have no admitted neighbour).
+    CHECK_GE(seeded.dbg.size(), windows - 4);
+    CHECK_LE(seeded.dbg.size(), windows);
+    size_t with_prev = 0;
+    for (const auto &[id, val] : seeded.dbg) {
+        CHECK(val.seeded);
+        CHECK_EQ(val.counts.core_count, 0);
+        REQUIRE_EQ(val.seq.size(), 1);
+        if (!val.prev.empty()) ++with_prev;
+    }
+    CHECK_GE(with_prev, seeded.dbg.size() - 2);
+    // The forward strand spells the segment back through its nodes.
+    seeded.count_forward_edges();
+    clean(seeded, 0);
+    CHECK(unitig_holds(seeded, s.substr(1500, 3000)));
+}
+
+TEST_CASE("assembler::insert_segments chunks give the windows of one chunk") {
+    using namespace multipass_test;
+    const std::string s = random_dna(20000, 9);
+    const assembler as = make_assembler(kLevel, kLcmerL);
+    dbg_index whole(0.001, 1 << 20, 7), chunked(0.001, 1 << 20, 7);
+    as.insert_segments(whole, one_segment(s));
+    const auto [chunks, windows] =
+        as.insert_segments(chunked, one_segment(s), 3000, 1500);
+    CHECK_EQ(chunks, 13);
+    REQUIRE_EQ(chunked.dbg.size(), whole.dbg.size());
+    for (const auto &[id, val] : whole.dbg) {
+        const auto it = chunked.dbg.find(id);
+        REQUIRE(it != chunked.dbg.end());
+        auto a = val.prev, b = it->second.prev;
+        std::sort(a.begin(), a.end());
+        std::sort(b.begin(), b.end());
+        CHECK_EQ(a, b);
+        CHECK_EQ(spell(chunked, id), spell(whole, id));
+    }
+}
+
+TEST_CASE(
+    "Seeded segment windows survive depth-only cleaning and bridge a read "
+    "gap") {
+    using namespace multipass_test;
+    const std::string h = random_dna(10000, 21);
+    const assembler as = make_assembler(kLevel, kLcmerL);
+
+    SUBCASE("a seeded-only branch at a fork is kept") {
+        // Reads hold h; the segment leaves h at 4000 into sequence no read
+        // holds, a zero-count branch that the depth-only tip rules cut.
+        std::vector<std::string> reads;
+        tile_reads(h, 2000, 0, 250, reads);
+        const std::string x = random_dna(3000, 22);
+        dbg_index dbgi(0.001, 1 << 20, 7);
+        insert_reads(dbgi, reads);
+        as.insert_segments(dbgi, one_segment(h.substr(0, 4000) + x));
+        dbgi.count_forward_edges();
+        clean(dbgi, 128);
+        CHECK(unitig_holds(dbgi, x.substr(500, 2000)));
+        CHECK(unitig_holds(dbgi, h.substr(5000, 4000)));
+    }
+
+    SUBCASE("a segment across a read gap connects both sides") {
+        // No read holds h[4500, 5500).
+        std::vector<std::string> reads, left, right;
+        tile_reads(h.substr(0, 4500), 2000, 0, 250, left);
+        tile_reads(h.substr(5500), 2000, 0, 250, right);
+        reads = left;
+        reads.insert(reads.end(), right.begin(), right.end());
+        const std::string seg = h.substr(3000, 4000);
+        const std::string across = h.substr(1000, 8000);
+
+        dbg_index gapped(0.001, 1 << 20, 7);
+        insert_reads(gapped, reads);
+        insert_reads(gapped, {seg});  // a read sighting adds nothing new
+        gapped.count_forward_edges();
+        clean(gapped, 128);
+        CHECK_FALSE(unitig_holds(gapped, h.substr(4400, 1200)));
+
+        dbg_index dbgi(0.001, 1 << 20, 7);
+        insert_reads(dbgi, reads);
+        as.insert_segments(dbgi, one_segment(seg));
+        dbgi.count_forward_edges();
+        clean(dbgi, 128);
+        CHECK(unitig_holds(dbgi, across));
+    }
+}
+
+namespace multipass_test {
+// Writes `reads` as FASTA, assembles them with `cfg` and returns the
+// sequences of the GFA's segments.
+[[maybe_unused]] static std::vector<std::string> assemble(
+    asm_config cfg, const std::vector<std::string> &reads,
+    const std::string &tag) {
+    const std::string base = std::string("/tmp/lasm_multipass_test_") +
+                             std::to_string(getpid()) + "_" + tag;
+    const std::string fa = base + ".fa", gfa = base + ".gfa";
+    if (FILE *f = fopen(fa.c_str(), "w")) {
+        for (size_t i = 0; i < reads.size(); ++i)
+            fprintf(f, ">r%zu\n%s\n", i, reads[i].c_str());
+        fclose(f);
+    }
+    cfg.inputs = {fa};
+    cfg.output = gfa;
+    cfg.threads.work = 2;
+    cfg.threads.io = 1;
+    cfg.silent = true;
+    cfg.syncmer.apply_default_rule();
+    std::vector<std::string> segs;
+    if (run_assembly(cfg) == 0) {
+        std::ifstream in(gfa);
+        for (std::string line; std::getline(in, line);) {
+            if (line.rfind("S\t", 0) != 0) continue;
+            const size_t a = line.find('\t', 2);
+            const size_t b = line.find('\t', a + 1);
+            segs.push_back(line.substr(a + 1, b - a - 1));
+        }
+    }
+    std::remove(fa.c_str());
+    std::remove(gfa.c_str());
+    return segs;
+}
+
+[[maybe_unused]] static bool segment_holds(const std::vector<std::string> &segs,
+                                           const std::string &piece) {
+    const std::string rc = revcomp(piece);
+    for (const auto &s : segs) {
+        if (s.find(piece) != std::string::npos ||
+            s.find(rc) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+}  // namespace multipass_test
+
+TEST_CASE(
+    "run_assembly --multipass: a small window pass closes a gap that the "
+    "large window leaves") {
+    using namespace multipass_test;
+    const std::string h = random_dna(12000, 31);
+    // Two read groups that share only h[5600, 6400): a long window is held by
+    // no read there, a short one by both groups.
+    std::vector<std::string> left, right, reads;
+    tile_reads(h.substr(0, 6400), 2000, 0, 200, left);
+    tile_reads(h.substr(5600), 2000, 0, 200, right);
+    for (size_t i = 0; i < std::max(left.size(), right.size()); ++i) {
+        if (i < left.size()) reads.push_back(left[i]);
+        if (i < right.size()) reads.push_back(right[i]);
+    }
+    const std::string across = h.substr(3000, 6000);
+
+    asm_config small, large, ladder;
+    small.lcp_level = large.lcp_level = kLevel;
+    small.lcmer_l = 3;
+    large.lcmer_l = 12;
+    ladder.multipass = {{kLevel, 3}, {kLevel, 12}};
+    REQUIRE(segment_holds(assemble(small, reads, "small"), across));
+    REQUIRE_FALSE(segment_holds(assemble(large, reads, "large"), across));
+    CHECK(segment_holds(assemble(ladder, reads, "ladder"), across));
 }
 
 // ── Characterization tests: layout_graph_emit core algorithms ──────────
