@@ -714,24 +714,29 @@ struct assembler {
                 valid_sum, all_sum);
         const auto &bf = dbgi.bf.implementation;
         const double fill = bf.fill_fraction();
-        const double est_fpr = std::pow(fill, bf.k - 1);
+        // Exact for the blocked layout, unlike the unblocked fill^(k - 1).
+        const double est_fpr = bf.fpr_for_fill(fill);
+        const double keys = bf.distinct_keys_for_fill(fill);
         fprintf(stderr,
                 "Bloom filter: %.4f of bits set, estimated false-positive "
-                "rate %.2e\n",
-                fill, est_fpr);
+                "rate %.2e (about %.4g distinct keys)\n",
+                fill, est_fpr, keys);
         // The filter meets --false-positive-probability while it holds at
         // most --projected-element-count distinct keys. Far above that a
         // false positive admits a first-sighting lcmer as a node, so the
-        // "seen twice" gate weakens. Warn at 10x the configured rate. k <= 1
-        // sets no bits: the filter is deliberately off (eps near 1).
-        if (bf.k > 1 && est_fpr > 10 * bloom.false_positive_rate) {
+        // "seen twice" gate weakens. k <= 1 sets no bits: the filter is
+        // deliberately off (eps near 1).
+        // Warn an order of magnitude above the configured rate, not at
+        // run-to-run fill noise.
+        constexpr double kWarnFactor = 10;
+        if (bf.k > 1 && est_fpr > kWarnFactor * bloom.false_positive_rate) {
             fprintf(stderr,
                     "Warning: Bloom filter estimated false-positive rate "
                     "%.2e exceeds 10x the configured %.2e; it holds about "
                     "%.3g distinct keys, so raise --projected-element-count "
                     "(now %" PRIu64 ") to at least that\n",
-                    est_fpr, bloom.false_positive_rate,
-                    bf.distinct_keys_for_fill(fill), bloom.projected_count);
+                    est_fpr, bloom.false_positive_rate, keys,
+                    bloom.projected_count);
         }
         return {};
     }

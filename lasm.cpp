@@ -133,7 +133,7 @@ class AsmProgram {
                "--projected-element-count", cfg.bloom.projected_count,
                "Distinct lcmer keys the Bloom filter is sized for at the "
                "configured false-positive probability; construction logs the "
-               "fill and estimated false-positive rate and warns when the "
+               "fill and modelled false-positive rate and warns when the "
                "filter is undersized")
             ->check(CLI::Range((int64_t)1, (int64_t)10000000000))
             ->capture_default_str();
