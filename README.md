@@ -85,7 +85,7 @@ lasm hifi <reads1> [reads2 ...] -o output.gfa -l <lcp_level> [--syncmer-k K --su
 
 ## Basic Usage
 
-Minimal example (default syncmers: k=11, open syncmer with s=4, t=5):
+Minimal example (default syncmers: k=11, open syncmer with s=4, t=6):
 
 ```bash
 build/lasm hifi reads.bam -o assembly.gfa -l 5
@@ -102,7 +102,7 @@ build/lasm hifi reads.bam \
   --lcmer-l 6 \
   --syncmer-k 11 \
   --submer-s 4 \
-  --submer-t 5 \
+  --submer-t 6 \
   --iterations 2
 ```
 
@@ -146,7 +146,7 @@ runs, not bases.
   closed syncmer (smallest s-mer at the first or last position)
 - `--submer-t`: offset of the smallest s-mer for an open syncmer,
   0 <= t <= k - s (requires `--submer-s`)
-- With neither `--submer-s` nor `--submer-t`, an open syncmer with s=4, t=5
+- With neither `--submer-s` nor `--submer-t`, an open syncmer with s=4, t=6
   is used
 
 Parallelism:

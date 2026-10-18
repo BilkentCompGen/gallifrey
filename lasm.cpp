@@ -119,7 +119,7 @@ class AsmProgram {
                "s-mer length s for syncmer selection. Without --submer-t "
                "this is a closed syncmer (smallest s-mer at the first or "
                "last position). Default when neither --submer-s nor "
-               "--submer-t is given: open syncmer, s=4, t=5.")
+               "--submer-t is given: open syncmer, s=4, t=6.")
             ->check(CLI::Range(1ul, 15ul));
         app.add_option(
                "--submer-t", cfg.syncmer.smer.t,
@@ -238,7 +238,7 @@ class SamReadTesting {
             ->capture_default_str();
         app.add_option("--submer-s", syncmer.smer.s,
                        "s-mer length (default with no --submer-t: open "
-                       "syncmer, s=4, t=5)")
+                       "syncmer, s=4, t=6)")
             ->check(CLI::Range(1ul, 15ul));
         app.add_option("--submer-t", syncmer.smer.t,
                        "Offset t of the smallest s-mer (open syncmer)")

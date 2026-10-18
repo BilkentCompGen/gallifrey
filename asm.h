@@ -18,9 +18,9 @@
 struct syncmer_params {
     // Selection packs k-mers into 32-bit codes.
     static constexpr unsigned max_k = 16;
-    // Rule used when neither s nor t is given: open syncmer, s = 4, t = 5.
+    // Rule used when neither s nor t is given: open syncmer, s = 4, t = 6.
     static constexpr unsigned long default_s = 4;
-    static constexpr unsigned long default_t = 5;
+    static constexpr unsigned long default_t = 6;
 
     enum class typeenum { OpenSyncmer, ClosedSyncmer, Invalid };
     constexpr typeenum type() const {
