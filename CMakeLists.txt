@@ -26,7 +26,6 @@ endif()
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
-enable_testing()
 # Build options
 option(LASM_NATIVE "Optimize for the build host CPU (-march=native); produces non-portable binaries" OFF)
 
@@ -140,28 +139,39 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
                       $<$<PLATFORM_ID:Linux>:rt>)
 
 # ── Unit tests (doctest) ────────────────────────────────────────────
-# The TEST_CASE bodies live inline in asm2.cpp / lcmer.cpp because they
-# exercise TU-internal functions. The production `lasm` binary strips them via
-# DOCTEST_CONFIG_DISABLE (see compile definitions below); this target recompiles
-# the same TUs together with doctest's main (tests/test_main.cpp) so the tests
-# run for real, without shipping any test code in the production binary.
-add_executable(lasm_tests
-    tests/test_main.cpp
-    tests/align_tests.cpp
-    asm2.cpp
-    lcmer.cpp
-    dump_cores.cpp
-)
-target_include_directories(lasm_tests PRIVATE . ./ext)
-target_link_libraries(lasm_tests PRIVATE
-                      PkgConfig::HTS gtl CLI11::CLI11 ksw2_extd2
-                      concurrentqueue pthread deflate z
-                      $<$<PLATFORM_ID:Linux>:rt>)
-target_compile_definitions(lasm_tests PRIVATE
-    __STDC_FORMAT_MACROS=1
-    LASM_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests"
-)
-add_test(NAME unit COMMAND lasm_tests)
+# The tests live in the galifrey-tests repository, checked out as the `tests`
+# submodule. Tests of TU-internal functions are in tests/<file>.test.inc, which
+# asm2.cpp / lcmer.cpp include at their end under LASM_UNIT_TESTS; this target
+# recompiles those TUs with it defined, plus doctest's main
+# (tests/test_main.cpp). The production `lasm` binary contains no test code.
+option(LASM_BUILD_TESTS "Build the lasm_tests unit-test binary (needs the tests submodule)" OFF)
+if(LASM_BUILD_TESTS)
+    if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_main.cpp)
+        message(FATAL_ERROR
+            "LASM_BUILD_TESTS is ON but the tests submodule is not checked out "
+            "(${CMAKE_CURRENT_SOURCE_DIR}/tests is missing or empty). Run:\n"
+            "  git submodule update --init tests")
+    endif()
+    enable_testing()
+    add_executable(lasm_tests
+        tests/test_main.cpp
+        tests/align_tests.cpp
+        asm2.cpp
+        lcmer.cpp
+        dump_cores.cpp
+    )
+    target_include_directories(lasm_tests PRIVATE . ./ext)
+    target_link_libraries(lasm_tests PRIVATE
+                          PkgConfig::HTS gtl CLI11::CLI11 ksw2_extd2
+                          concurrentqueue pthread deflate z
+                          $<$<PLATFORM_ID:Linux>:rt>)
+    target_compile_definitions(lasm_tests PRIVATE
+        __STDC_FORMAT_MACROS=1
+        LASM_UNIT_TESTS
+        LASM_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests"
+    )
+    add_test(NAME unit COMMAND lasm_tests)
+endif()
 
 # Convenience target: run the assembler on a local sample (data not in repo).
 add_custom_target(rtest COMMAND lasm hifi test/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8)
@@ -176,11 +186,8 @@ add_custom_target(debug
 
 
 # Compile definitions
-# DOCTEST_CONFIG_DISABLE strips the inline TEST_CASE bodies (in asm2.cpp /
-# lcmer.cpp) from the production binary; the tests are built into lasm_tests.
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     __STDC_FORMAT_MACROS=1
-    DOCTEST_CONFIG_DISABLE
 )
 
 

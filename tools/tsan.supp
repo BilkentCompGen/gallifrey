@@ -1,4 +1,4 @@
-# ThreadSanitizer suppressions for lasm (TSAN_OPTIONS=suppressions=tests/tsan.supp).
+# ThreadSanitizer suppressions for lasm (TSAN_OPTIONS=suppressions=tools/tsan.supp).
 #
 # moodycamel::ConcurrentQueue, implicit producers: a dequeuer reads a slot,
 # then marks it empty with a release-only fetch_add on the block's

@@ -56,6 +56,18 @@ cmake -S . -B build-prof -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLASM_NATIVE=ON
 cmake --build build-prof -j
 ```
 
+### Unit tests
+
+The tests live in a separate repository, checked out as the `tests`
+submodule. Fetch it and configure with `LASM_BUILD_TESTS` (default `OFF`):
+
+```bash
+git submodule update --init tests
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLASM_BUILD_TESTS=ON
+cmake --build build -j
+./build/lasm_tests        # or: ctest --test-dir build
+```
+
 ## Input
 
 `lasm hifi` accepts one or more read files. Supported formats:
