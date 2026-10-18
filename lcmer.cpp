@@ -382,6 +382,56 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
     free(seq_gt);
 }
 
+TEST_CASE("CrumbledSubSeq64 unpack_bytes and unpack_bytes_reversed") {
+    std::string bases(32 + 600, 'A');
+    uint64_t state = 0x9E3779B97F4A7C15ULL;
+    for (char &c : bases) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        c = "ACGT"[state & 3];
+    }
+    const size_t lengths[] = {0,  1,  15, 16, 17,  31,  32,
+                              33, 63, 64, 65, 300, 517, 600};
+    // Sub-range ends on word and half-word boundaries, and at the end.
+    const size_t marks[] = {0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 300};
+    constexpr uint8_t kGuard = 0xAA;
+    gtl::vector<uint8_t> expected, got;
+    for (size_t start = 0; start < 32; ++start) {
+        for (const size_t len : lengths) {
+            const CrumbledSubSeq64 seq{bases.c_str(), start, start + len, 0,
+                                       CrumbledSubSeq64::from_ascii{}};
+            REQUIRE(static_cast<size_t>(seq.skip_first_n) == start);
+            for (size_t i = 0; i < len; ++i)
+                REQUIRE(seq.code(i) ==
+                        CrumbledSubSeq64::base_to_code(bases[start + i]));
+            gtl::vector<size_t> ends;
+            for (const size_t m : marks)
+                if (m <= len) ends.push_back(m);
+            if (len > 0) ends.push_back(len - 1);
+            ends.push_back(len);
+            for (const size_t from : ends) {
+                for (const size_t to : ends) {
+                    if (from > to) continue;
+                    INFO("start ", start, " len ", len, " [", from, ", ", to,
+                         ")");
+                    const size_t n = to - from;
+                    expected.assign(n + 1, kGuard);
+                    for (size_t i = from; i < to; ++i)
+                        expected[i - from] = seq.code(i);
+                    got.assign(n + 1, kGuard);
+                    seq.unpack_bytes(from, to, got.data());
+                    CHECK(got == expected);
+                    std::reverse(expected.begin(), expected.begin() + n);
+                    got.assign(n + 1, kGuard);
+                    seq.unpack_bytes_reversed(from, to, got.data());
+                    CHECK(got == expected);
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE("BAM and crumbled parsers agree on homopolymer-rich sequence") {
     std::string bases;
     {

@@ -91,6 +91,11 @@ public:
                      "sequence, so cores that merely share a label are not "
                      "chained")
             ->capture_default_str();
+        app.add_flag("--end-joins,!--no-end-joins", cfg.end_joins,
+                     "Join segment ends that overlap as reverse complements "
+                     "(the two strands of one locus stopping at different "
+                     "holes) into one segment")
+            ->capture_default_str();
         app.add_option("--syncmer-k", cfg.syncmer.k,
                        "Syncmer k-mer length (in RLE runs with --rle)")
             ->check(CLI::Range(2u, syncmer_params::max_k))

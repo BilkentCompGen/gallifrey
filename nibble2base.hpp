@@ -468,6 +468,113 @@ struct CrumbledSubSeq64 {
         return *this;
     }
 
+    // 2-bit code (A=0, C=1, G=2, T=3) of base i.
+    [[nodiscard]] uint8_t code(size_t i) const noexcept {
+        const size_t bit = (static_cast<size_t>(skip_first_n) + i) * 2;
+        return (data[bit >> 6] >> (bit & 63)) & 0x3;
+    }
+
+    // Base codes of [from, to), one byte per base: out[0] is base `from`.
+    void unpack_bytes(size_t from, size_t to, uint8_t *out) const noexcept {
+        size_t i = from;
+        for (; i + bases_per_word <= to; i += bases_per_word)
+            unpack_word(word_at(i), out + (i - from));
+        for (; i < to; ++i) out[i - from] = code(i);
+    }
+
+    // The same codes last-first (out[0] is base to - 1), not complemented.
+    void unpack_bytes_reversed(size_t from, size_t to,
+                               uint8_t *out) const noexcept {
+        size_t i = to;
+        for (; i - from >= bases_per_word; i -= bases_per_word) {
+            unpack_word_reversed(word_at(i - bases_per_word), out);
+            out += bases_per_word;
+        }
+        for (; i > from; --i) *out++ = code(i - 1);
+    }
+
+    // The 32 bases from base i as one word (base i in the low bits); needs
+    // i + 32 <= len. The next word is read only when the window spans it,
+    // so it lies within storage_size(len + skip_first_n).
+    [[nodiscard]] uint64_t word_at(size_t i) const noexcept {
+        const size_t pos = static_cast<size_t>(skip_first_n) + i;
+        const size_t w = pos / bases_per_word;
+        const unsigned shift = (pos % bases_per_word) * 2;
+        if (shift == 0) return data[w];
+        return (data[w] >> shift) | (data[w + 1] << (64 - shift));
+    }
+
+    // The 32 codes of one word, one byte each. Each byte holds 4 bases low
+    // bits first: splitting every byte into its low and high nibble and
+    // interleaving them gives one nibble (2 bases) per byte in base order;
+    // splitting and interleaving the nibbles' 2-bit halves gives the codes.
+    static void unpack_word(uint64_t word, uint8_t *out) noexcept {
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__))
+        const uint8x16x2_t codes = unpack_word_neon(word);
+        vst1q_u8(out, codes.val[0]);
+        vst1q_u8(out + 16, codes.val[1]);
+#elif defined(__SSSE3__)
+        __m128i lo, hi;
+        unpack_word_sse(word, lo, hi);
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(out), lo);
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(out + 16), hi);
+#else
+        for (size_t k = 0; k < bases_per_word; ++k)
+            out[k] = (word >> (2 * k)) & 0x3;
+#endif
+    }
+
+    // unpack_word with the 32 bytes in reverse order.
+    static void unpack_word_reversed(uint64_t word, uint8_t *out) noexcept {
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__))
+        const uint8x16x2_t codes = unpack_word_neon(word);
+        const uint8x16_t lo = vrev64q_u8(codes.val[0]);
+        const uint8x16_t hi = vrev64q_u8(codes.val[1]);
+        vst1q_u8(out, vcombine_u8(vget_high_u8(hi), vget_low_u8(hi)));
+        vst1q_u8(out + 16, vcombine_u8(vget_high_u8(lo), vget_low_u8(lo)));
+#elif defined(__SSSE3__)
+        __m128i lo, hi;
+        unpack_word_sse(word, lo, hi);
+        const __m128i rev =
+            _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(out),
+                         _mm_shuffle_epi8(hi, rev));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(out + 16),
+                         _mm_shuffle_epi8(lo, rev));
+#else
+        for (size_t k = 0; k < bases_per_word; ++k)
+            out[k] = (word >> (2 * (bases_per_word - 1 - k))) & 0x3;
+#endif
+    }
+
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__))
+    // Codes of bases 0-15 (val[0]) and 16-31 (val[1]) of one word.
+    static uint8x16x2_t unpack_word_neon(uint64_t word) noexcept {
+        const uint8x8_t bytes = vcreate_u8(word);
+        const uint8x8x2_t nib =
+            vzip_u8(vand_u8(bytes, vdup_n_u8(0x0F)), vshr_n_u8(bytes, 4));
+        const uint8x16_t nibbles = vcombine_u8(nib.val[0], nib.val[1]);
+        return vzipq_u8(vandq_u8(nibbles, vdupq_n_u8(0x3)),
+                        vshrq_n_u8(nibbles, 2));
+    }
+#elif defined(__SSSE3__)
+    // Codes of bases 0-15 (lo) and 16-31 (hi) of one word.
+    static void unpack_word_sse(uint64_t word, __m128i &lo,
+                                __m128i &hi) noexcept {
+        const __m128i bytes = _mm_cvtsi64_si128(static_cast<long long>(word));
+        const __m128i nibble_mask = _mm_set1_epi8(0x0F);
+        const __m128i nibbles = _mm_unpacklo_epi8(
+            _mm_and_si128(bytes, nibble_mask),
+            _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask));
+        const __m128i code_mask = _mm_set1_epi8(0x3);
+        const __m128i low2 = _mm_and_si128(nibbles, code_mask);
+        const __m128i high2 =
+            _mm_and_si128(_mm_srli_epi16(nibbles, 2), code_mask);
+        lo = _mm_unpacklo_epi8(low2, high2);
+        hi = _mm_unpackhi_epi8(low2, high2);
+    }
+#endif
+
     char *convert_to_ascii(char *buffer) const {
         static constexpr const char *lut = "ACGT";
         size_t base_index = 0;

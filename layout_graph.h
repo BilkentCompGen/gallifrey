@@ -12,12 +12,14 @@
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <map>
+#include <optional>
 #include <queue>
 // #include <stack>
 #include <string>
 #include <thread>
 #include <tuple>
 
+#include "align.h"
 #include "graph.h"
 
 namespace layout_graph_algo {
@@ -1515,6 +1517,515 @@ inline void write_gfa(const supernode_vec &supernodes,
     flush();
 }
 
+// ── End joins: join overlapping dead segment ends ───────────────────────
+// When the + and − strand unitigs of one locus stop at different holes, the
+// two layouts end in segments whose free ends overlap as reverse complements:
+// the last bases of segment A, read toward its free end, are the reverse
+// complement of the last bases of segment B, read toward B's free end. Such a
+// pair is one sequence: A, then B read backwards.
+//
+// run() goes through five steps:
+//  1. free_ends: every free end (no link on that side), with its tail (the
+//     last kEndWindow bases, read toward the end) and the tail's cores one
+//     LCP level below the assembly level (denser cores, so overlaps of a few
+//     hundred bases hold several).
+//  2. find_overlaps: end pairs whose tails share at least two core pairs on
+//     one diagonal, confirmed by extending one shared core pair with the
+//     ksw2 aligner (align.h) to both free ends (within kBand) at
+//     >= kMinIdentity.
+//  3. pick_joins: overlaps whose ends overlap nothing else, whose end
+//     unitigs are below the locus depth limit (one locus, not a collapsed
+//     repeat) and whose tails are not tandem-periodic (collapsed satellite
+//     arrays can read below the depth limit).
+//  4. merge_chains: every chain of joined segments becomes one segment.
+//  5. rewire_links: links of merged segments move to the merged segment.
+struct EndJoin {
+    static constexpr size_t kEndWindow = 10000;
+    // Positional tolerance in bases: the extension band, the diagonal bin
+    // that shared core pairs vote in, and how far short of a free end an
+    // extension may stop.
+    static constexpr int kBand = 64;
+    static constexpr double kMinIdentity = 0.99;
+    static constexpr size_t kMaxKeyOcc = 4;
+    // Separates substantial within-window recurrence (tandem arrays) from
+    // occasional duplicate pairs, which stay well below it.
+    static constexpr double kMaxRepeatedPairFraction = 0.30;
+
+    // A free segment end. `tail` is the segment's last bases read toward the
+    // end, `tail_rc` its reverse complement (read from the end inward);
+    // `tail_cores` and `tail_rc_cores` are their cores.
+    struct end_t {
+        u64 sid;
+        bool at_end;  // the segment's end side (else its start side)
+        gtl::vector<SequenceContainerType> tail, tail_rc;  // one window each
+        lcp_read tail_cores, tail_rc_cores;
+    };
+
+    // Ends a and b overlap when tail(a) ends with the start of tail_rc(b).
+    // The join point is where their alignment ends; each end loses the
+    // bases beyond it at its free end (trim_a, trim_b).
+    struct overlap_t {
+        size_t a, b;
+        size_t trim_a, trim_b;
+    };
+
+    // A segment side: sid * 2 + at_end.
+    static u64 side(u64 sid, bool at_end) { return sid * 2 + at_end; }
+
+    // The join at one segment side: the partner side and the bases cut off
+    // this side.
+    struct join_t {
+        u64 partner;
+        size_t trim;
+    };
+    using join_map = gtl::flat_hash_map<u64, join_t>;  // side -> join
+
+    // Where a merged segment went: the merged segment's id, and whether the
+    // segment is read reversed in it.
+    struct moved_t {
+        u64 sid;
+        bool reversed;
+    };
+    using moved_map = gtl::flat_hash_map<u64, moved_t>;  // old sid -> moved
+
+    // Counts for the log line.
+    struct stats_t {
+        size_t ends = 0, candidates = 0, aligned = 0, deep = 0, tandem = 0,
+               joined = 0;
+    };
+
+    static u64 pair_key(const lcp_read &lr, size_t c) {
+        return (static_cast<u64>(lr.cores[c - 1]) << 32) | lr.cores[c];
+    }
+
+    static size_t segment_length(const supernode_out &sn) {
+        size_t len = 0;
+        for (const auto &s : sn.seqs()) len += s.len;
+        return len;
+    }
+
+    // Fraction of consecutive core-pair occurrences whose key occurs again
+    // in the same window (including the first occurrence).
+    static double repeated_pair_fraction(const lcp_read &lr) {
+        if (lr.cores.size() < 2) return 0.0;
+        gtl::flat_hash_map<u64, size_t> counts;
+        for (size_t c = 1; c < lr.cores.size(); ++c) ++counts[pair_key(lr, c)];
+        size_t repeated = 0;
+        for (const auto &[_, n] : counts)
+            if (n > 1) repeated += n;
+        return static_cast<double>(repeated) / (lr.cores.size() - 1);
+    }
+
+    static bool is_tandem(const lcp_read &window) {
+        return repeated_pair_fraction(window) >= kMaxRepeatedPairFraction;
+    }
+
+    // Per-thread buffers for confirm, reused across candidates: the unpacked
+    // bases right and left of the seed in tail(a) and tail_rc(b), and the
+    // extensions' CIGARs.
+    struct confirm_scratch {
+        aligner dp;
+        gtl::vector<uint8_t> ra, rb, la, lb;
+        cigar right, left;
+    };
+
+    // Step 1: the free ends with their tails and the tails' cores.
+    template <class AssemblerT>
+    static gtl::vector<end_t> free_ends(const AssemblerT &as,
+                                        const supernode_vec &supernodes,
+                                        const edge_map &edges, int threads) {
+        gtl::flat_hash_set<u64> linked;  // linked segment sides
+        for (const auto &[_, e] : edges) {
+            linked.insert(side(e.src_super, e.src_ori == '+'));
+            linked.insert(side(e.dst_super, e.dst_ori != '+'));
+        }
+        gtl::vector<end_t> ends;
+        for (size_t sid = 0; sid < supernodes.size(); ++sid) {
+            const auto &sn = supernodes[sid];
+            if (sn.name.empty()) continue;
+            const size_t len = segment_length(sn);
+            const size_t w = std::min(len, kEndWindow);
+            for (const bool at_end : {false, true}) {
+                if (linked.contains(side(sid, at_end))) continue;
+                // The window as stored in the segment; at the start side it
+                // is read away from the end, so the tail is its reverse
+                // complement.
+                end_t e{sid, at_end, {}, {}, {}, {}};
+                if (at_end) {
+                    SequenceContainerType fwd(sn.seqs(), len - w, len);
+                    e.tail_rc.push_back(fwd.reverse_complement());
+                    e.tail.push_back(std::move(fwd));
+                } else {
+                    SequenceContainerType fwd(sn.seqs(), 0, w);
+                    e.tail.push_back(fwd.reverse_complement());
+                    e.tail_rc.push_back(std::move(fwd));
+                }
+                ends.push_back(std::move(e));
+            }
+        }
+        const int level = std::max(1, as.lcp_level - 1);
+        parallel_for(ends.size(), threads, [&](size_t i) {
+            lps str = {0, 0, 0, 0};
+            ends[i].tail_cores = AssemblerT::build_lr_cores(
+                ends[i].tail, as.syncmer_functor, level, str);
+            ends[i].tail_rc_cores = AssemblerT::build_lr_cores(
+                ends[i].tail_rc, as.syncmer_functor, level, str);
+            free_lps(&str);
+        });
+        return ends;
+    }
+
+    // A shared core pair: its end in tail(a) and in tail_rc(b).
+    struct seed_t {
+        size_t a;
+        uint32_t pos_a, pos_b;
+    };
+
+    // For every end a > b whose tail shares core pairs with tail_rc(b) (keys
+    // occurring at most kMaxKeyOcc times among all tails), a seed on the
+    // most-voted diagonal (the position in tail(a) where tail_rc(b) starts,
+    // voted in kBand bins), kept when >= 2 core pairs vote for it.
+    using tail_index =  // core-pair key -> (end, pair end in its tail)
+        gtl::flat_hash_map<u64, gtl::vector<std::pair<uint32_t, uint32_t>>>;
+    static gtl::vector<seed_t> candidates_for(size_t b,
+                                              const gtl::vector<end_t> &ends,
+                                              const tail_index &index) {
+        struct bin_t {
+            uint32_t votes = 0;
+            uint32_t pos_a = 0, pos_b = 0;  // the last pair in the bin
+        };
+        const lcp_read &query = ends[b].tail_rc_cores;
+        gtl::flat_hash_map<std::pair<uint32_t, long>, bin_t> bins;
+        for (size_t c = 1; c < query.cores.size(); ++c) {
+            auto it = index.find(pair_key(query, c));
+            if (it == index.end() || it->second.size() > kMaxKeyOcc) continue;
+            const uint32_t pos_b = query.pos[c].second;
+            for (const auto &[a, pos_a] : it->second) {
+                if (a <= b || ends[a].sid == ends[b].sid) continue;
+                const long diagonal = (long)pos_a - (long)pos_b;
+                if (diagonal < 0) continue;
+                bin_t &bin = bins[{a, diagonal / kBand}];
+                ++bin.votes;
+                bin.pos_a = pos_a;
+                bin.pos_b = pos_b;
+            }
+        }
+        gtl::flat_hash_map<uint32_t, bin_t> best;  // a -> its best bin
+        for (const auto &[a_bin, bin] : bins)
+            if (bin.votes > best[a_bin.first].votes) best[a_bin.first] = bin;
+        gtl::vector<seed_t> out;
+        for (const auto &[a, bin] : best)
+            if (bin.votes >= 2) out.push_back({a, bin.pos_a, bin.pos_b});
+        return out;
+    }
+
+    // The overlap of ends a and b through `seed`, if extending it reaches
+    // the end of tail(a) and the start of tail_rc(b) (both free ends, within
+    // kBand) at >= kMinIdentity.
+    static std::optional<overlap_t> confirm(const gtl::vector<end_t> &ends,
+                                            size_t b, const seed_t &seed) {
+        thread_local confirm_scratch sc;
+        const SequenceContainerType &ta = ends[seed.a].tail[0];
+        const SequenceContainerType &tb = ends[b].tail_rc[0];
+        const size_t pa = seed.pos_a, pb = seed.pos_b;
+        // Right of the seed, toward the end of tail(a).
+        sc.ra.resize(ta.len - pa);
+        ta.unpack_bytes(pa, ta.len, sc.ra.data());
+        const size_t rb_to = std::min(tb.len, pb + sc.ra.size() + kBand);
+        sc.rb.resize(rb_to - pb);
+        tb.unpack_bytes(pb, rb_to, sc.rb.data());
+        sc.right.clear();
+        int right_b = 0, right_a = 0;
+        sc.dp.extend(sc.rb.data(), int(sc.rb.size()), sc.ra.data(),
+                     int(sc.ra.size()), kBand, sc.right, right_b, right_a);
+        if (pa + right_a + kBand < ta.len) return std::nullopt;
+        // Left of the seed on the reversed prefixes, toward the start of
+        // tail_rc(b).
+        size_t la_from = 0;
+        if (pa > pb + kBand) la_from = pa - pb - kBand;
+        sc.la.resize(pa - la_from);
+        ta.unpack_bytes_reversed(la_from, pa, sc.la.data());
+        sc.lb.resize(pb);
+        tb.unpack_bytes_reversed(0, pb, sc.lb.data());
+        sc.left.clear();
+        int left_b = 0, left_a = 0;
+        sc.dp.extend(sc.lb.data(), int(sc.lb.size()), sc.la.data(),
+                     int(sc.la.size()), kBand, sc.left, left_b, left_a);
+        if (size_t(left_b + kBand) < pb) return std::nullopt;
+        const align_stats r =
+            sc.dp.score_cigar(sc.right, sc.rb.data(), sc.ra.data());
+        const align_stats l =
+            sc.dp.score_cigar(sc.left, sc.lb.data(), sc.la.data());
+        const uint32_t matches = r.matches + l.matches;
+        if (matches < kMinIdentity * (matches + r.nm() + l.nm()))
+            return std::nullopt;
+        // The join point is where the right extension ends: tail(a) keeps its
+        // bases up to it, b drops its bases before it.
+        return overlap_t{seed.a, b, ta.len - (pa + right_a), pb + right_b};
+    }
+
+    // Step 2: every overlap, each end pair checked once (b < a; the other
+    // direction is its reverse complement).
+    static gtl::vector<overlap_t> find_overlaps(const gtl::vector<end_t> &ends,
+                                                int threads, stats_t &stats) {
+        tail_index index;
+        for (size_t a = 0; a < ends.size(); ++a) {
+            const lcp_read &tail = ends[a].tail_cores;
+            for (size_t c = 1; c < tail.cores.size(); ++c)
+                index[pair_key(tail, c)].emplace_back((uint32_t)a,
+                                                      tail.pos[c].second);
+        }
+        gtl::vector<gtl::vector<overlap_t>> found(ends.size());  // by b
+        std::atomic<size_t> candidates{0};
+        parallel_for(ends.size(), threads, [&](size_t b) {
+            for (const seed_t &seed : candidates_for(b, ends, index)) {
+                ++candidates;
+                if (auto overlap = confirm(ends, b, seed))
+                    found[b].push_back(*overlap);
+            }
+        });
+        gtl::vector<overlap_t> overlaps;
+        for (const auto &per_end : found)
+            overlaps.insert(overlaps.end(), per_end.begin(), per_end.end());
+        stats.candidates = candidates;
+        stats.aligned = overlaps.size();
+        return overlaps;
+    }
+
+    // Step 3: the overlaps kept as joins, recorded at both of their sides.
+    template <class EndDepth>
+    static join_map pick_joins(const gtl::vector<end_t> &ends,
+                               const gtl::vector<overlap_t> &overlaps,
+                               double locus_limit, const EndDepth &end_depth,
+                               stats_t &stats) {
+        gtl::vector<size_t> n_overlaps(ends.size(), 0);
+        for (const overlap_t &o : overlaps) {
+            ++n_overlaps[o.a];
+            ++n_overlaps[o.b];
+        }
+        auto deep = [&](size_t e) {
+            return end_depth(ends[e].sid, ends[e].at_end) >= locus_limit;
+        };
+        auto tandem = [&](size_t e) { return is_tandem(ends[e].tail_cores); };
+        auto side_of = [&](size_t e) {
+            return side(ends[e].sid, ends[e].at_end);
+        };
+        join_map joins;
+        for (const overlap_t &o : overlaps) {
+            if (n_overlaps[o.a] != 1 || n_overlaps[o.b] != 1) continue;
+            if (deep(o.a) || deep(o.b)) {
+                ++stats.deep;
+                continue;
+            }
+            if (tandem(o.a) || tandem(o.b)) {
+                ++stats.tandem;
+                continue;
+            }
+            joins[side_of(o.a)] = {side_of(o.b), o.trim_a};
+            joins[side_of(o.b)] = {side_of(o.a), o.trim_b};
+        }
+        return joins;
+    }
+
+    // A chain member: the segment, whether it is read reversed, and the
+    // bases cut off its first and last side in that direction.
+    struct member_t {
+        u64 sid;
+        bool reversed;
+        size_t trim_first, trim_last;
+    };
+
+    // The chain from segment `first`, whose free side is the chain's outer
+    // end: read forward when that is its start, reversed when its end.
+    static gtl::vector<member_t> walk_chain(const join_map &joins, u64 first,
+                                            bool reversed) {
+        gtl::vector<member_t> members;
+        size_t trim_first = 0;
+        for (u64 sid = first;;) {
+            const auto out = joins.find(side(sid, !reversed));  // side we leave
+            if (out == joins.end()) {
+                members.push_back({sid, reversed, trim_first, 0});
+                return members;
+            }
+            members.push_back({sid, reversed, trim_first, out->second.trim});
+            const u64 next = out->second.partner;
+            trim_first = joins.at(next).trim;
+            sid = next / 2;
+            reversed = next % 2;  // entered at its end: read reversed
+        }
+    }
+
+    // One segment spelling the trimmed members in order, named J<new_sid>.
+    // Its layout tags come from its first layout member (else its first
+    // member).
+    static supernode_out merged_segment(const supernode_vec &supernodes,
+                                        const gtl::vector<member_t> &members,
+                                        size_t new_sid) {
+        const supernode_out &tag_src = [&]() -> const supernode_out & {
+            for (const member_t &m : members)
+                if (supernodes[m.sid].is_layout) return supernodes[m.sid];
+            return supernodes[members[0].sid];
+        }();
+        supernode_out merged;
+        merged.name = "J" + std::to_string(new_sid);
+        merged.is_layout = tag_src.is_layout;
+        merged.aux_id = tag_src.aux_id;
+        for (const member_t &m : members) {
+            const auto &src = supernodes[m.sid];
+            const size_t len = segment_length(src);
+            if (m.trim_first + m.trim_last >= len) continue;
+            if (m.reversed)  // the kept range, cut first, then reversed
+                merged.owned_seqs.push_back(
+                    SequenceContainerType(src.seqs(), m.trim_last,
+                                          len - m.trim_first)
+                        .reverse_complement());
+            else
+                merged.owned_seqs.emplace_back(src.seqs(), m.trim_first,
+                                               len - m.trim_last);
+        }
+        return merged;
+    }
+
+    // Step 4: every chain of joined segments becomes one new segment and its
+    // members are emptied. A chain starts at a segment joined on one side
+    // only; a cycle has no such segment and is left as it is. Returns where
+    // each member went.
+    static moved_map merge_chains(supernode_vec &supernodes,
+                                  const join_map &joins, stats_t &stats) {
+        moved_map moved;
+        const size_t n_orig = supernodes.size();
+        for (u64 sid = 0; sid < n_orig; ++sid) {
+            if (supernodes[sid].name.empty()) continue;  // merged already
+            const bool start_joined = joins.contains(side(sid, false));
+            const bool end_joined = joins.contains(side(sid, true));
+            if (start_joined == end_joined) continue;  // no chain end
+            const auto members = walk_chain(joins, sid, start_joined);
+            const size_t new_sid = supernodes.size();
+            supernodes.push_back(merged_segment(supernodes, members, new_sid));
+            for (const member_t &m : members) {
+                moved[m.sid] = {new_sid, m.reversed};
+                supernodes[m.sid].name.clear();
+                gtl::vector<SequenceContainerType>().swap(
+                    supernodes[m.sid].owned_seqs);
+            }
+            stats.joined += members.size() - 1;
+        }
+        return moved;
+    }
+
+    // Step 5: links of merged segments move to the merged segment, with
+    // orientation and side flipped for reversed members; links that become
+    // identical are combined.
+    static void rewire_links(const moved_map &moved, edge_map &edges) {
+        auto move_end = [&](u64 &super, char &ori, uint8_t &side) {
+            auto m = moved.find(super);
+            if (m == moved.end()) return;
+            super = m->second.sid;
+            if (!m->second.reversed) return;
+            if (ori == '+')
+                ori = '-';
+            else
+                ori = '+';
+            if (side == SIDE_START)
+                side = SIDE_END;
+            else if (side == SIDE_END)
+                side = SIDE_START;
+        };
+        edge_map rewired;
+        for (const auto &[_, link] : edges) {
+            edge_agg e = link;
+            move_end(e.src_super, e.src_ori, e.src_side);
+            move_end(e.dst_super, e.dst_ori, e.dst_side);
+            const edge_key key{e.src_super, e.dst_super, e.src_ori,
+                               e.dst_ori,   e.src_side,  e.dst_side};
+            if (auto [it, inserted] = rewired.try_emplace(key, e); !inserted)
+                it->second.count += e.count;
+        }
+        edges.swap(rewired);
+    }
+
+    // end_depth(sid, at_end): depth of the unitig at that segment end.
+    template <class AssemblerT, class EndDepth>
+    static size_t run(const AssemblerT &as, supernode_vec &supernodes,
+                      edge_map &edges, double locus_limit,
+                      const EndDepth &end_depth) {
+        if (locus_limit <= 0.0) {
+            std::fprintf(stderr,
+                         "[end-join] skipped: no locus depth limit (no depth "
+                         "model)\n");
+            return 0;
+        }
+        const int threads = std::max(1, as.threads.work);
+        stats_t stats;
+        const gtl::vector<end_t> ends =
+            free_ends(as, supernodes, edges, threads);
+        stats.ends = ends.size();
+        const auto overlaps = find_overlaps(ends, threads, stats);
+        const join_map joins =
+            pick_joins(ends, overlaps, locus_limit, end_depth, stats);
+        const moved_map moved = merge_chains(supernodes, joins, stats);
+        if (!moved.empty()) rewire_links(moved, edges);
+        std::fprintf(stderr,
+                     "[end-join] free ends %zu, candidates %zu, aligned %zu, "
+                     "rejected deep %zu, rejected tandem %zu, joins %zu\n",
+                     stats.ends, stats.candidates, stats.aligned, stats.deep,
+                     stats.tandem, stats.joined);
+        return stats.joined;
+    }
+};
+
+// Depth of the unitig at a segment end: a C segment's own unitig, or the
+// layout member reaching furthest towards that end (0 when unknown). A layout
+// whose cores split into several components is emitted as several segments
+// (M<idx>, M<idx>_1, ...) but its members are not recorded per component, so
+// only the first segment of a layout gets a depth; the others report
+// infinity and their ends are not joined.
+class segment_end_depth {
+   public:
+    segment_end_depth(const supernode_vec &supernodes, const dbg_index &dbg,
+                      const gtl::vector<ultra_layout_job> &layout_jobs)
+        : supernodes_(supernodes), dbg_(dbg) {
+        for (const auto &job : layout_jobs) job_of_[job.layout_idx] = &job;
+        for (u64 sid = 0; sid < supernodes.size(); ++sid)
+            if (supernodes[sid].is_layout)
+                first_segment_of_.try_emplace(supernodes[sid].aux_id, sid);
+    }
+
+    double operator()(u64 sid, bool at_end) const {
+        const auto &sn = supernodes_[sid];
+        if (!sn.is_layout) return node_depth(sn.aux_id);
+        if (first_segment_of_.at(sn.aux_id) != sid)
+            return std::numeric_limits<double>::infinity();
+        auto j = job_of_.find(sn.aux_id);
+        if (j == job_of_.end() || j->second->lnodes.empty()) return 0.0;
+        const auto &ln = j->second->lnodes;
+        if (at_end) {
+            const auto furthest = std::max_element(
+                ln.begin(), ln.end(),
+                [](const auto &x, const auto &y) { return x.to < y.to; });
+            return node_depth(furthest->id);
+        }
+        const auto furthest = std::min_element(
+            ln.begin(), ln.end(),
+            [](const auto &x, const auto &y) { return x.from < y.from; });
+        return node_depth(furthest->id);
+    }
+
+   private:
+    double node_depth(u64 id) const {
+        auto it = dbg_.dbg.find(id);
+        if (it == dbg_.dbg.end() || it->second.redirected() ||
+            it->second.seq.empty())
+            return 0.0;
+        return it->second.avg_core_count();
+    }
+
+    const supernode_vec &supernodes_;
+    const dbg_index &dbg_;
+    gtl::flat_hash_map<u64, const ultra_layout_job *> job_of_;
+    gtl::flat_hash_map<u64, u64> first_segment_of_;  // layout -> segment
+};
+
 template <class AssemblerT>
 inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     INIT_TIMERS(LayoutEmit);
@@ -1598,6 +2109,13 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     // ── Phase 5: post-layout graph cleaning ─────────────────────────────
     PostLayoutCleaning::run(supernodes, merged_edges);
     TIME_CHECKPOINT(LayoutEmit, stderr, "Post-layout cleaning");
+
+    // ── Phase 5b: join overlapping dead ends of one locus ───────────────
+    if (as.end_joins) {
+        EndJoin::run(as, supernodes, merged_edges, dbg.locus_limit,
+                     segment_end_depth(supernodes, dbg, layout_jobs));
+        TIME_CHECKPOINT(LayoutEmit, stderr, "End joins");
+    }
 
     // ── Phase 6: format supernode S-lines (parallel) + write GFA ────────
     write_gfa(supernodes, merged_edges, as.threads.work, out);

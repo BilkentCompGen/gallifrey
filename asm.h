@@ -112,6 +112,9 @@ struct asm_config {
     // the same homopolymer-compressed sequence, so cores that merely share a
     // label are not chained.
     bool strict_layout_labels = true;
+    // Join segment ends that overlap as reverse complements (the two strands
+    // of one locus stopping at different holes) into one segment.
+    bool end_joins = true;
     bool silent = false;
     struct {
         uint64_t projected_count = 100'000'000;
@@ -154,6 +157,7 @@ struct asm_config {
         fprintf(f, "Prime Reverse: %s\n", prime_reverse ? "true" : "false");
         fprintf(f, "Strict Layout Labels: %s\n",
                 strict_layout_labels ? "true" : "false");
+        fprintf(f, "End Joins: %s\n", end_joins ? "true" : "false");
         fprintf(f,
                 "Graph Cleaning Parameters: \n\tIterations: %d\n\tMax Tip "
                 "Length: %d\n\tMin Bubble Length Difference: %.2f\n\tMax "

@@ -71,6 +71,7 @@ struct assembler {
     bool drop_crumbs;
     bool prime_reverse;
     bool strict_layout_labels;
+    bool end_joins;
 
     assembler(const asm_config &cfg)
         : inputs{},
@@ -85,7 +86,8 @@ struct assembler {
           parallel_file_reading{cfg.parallel_file_reading},
           drop_crumbs{cfg.drop_crumbs},
           prime_reverse{cfg.prime_reverse},
-          strict_layout_labels{cfg.strict_layout_labels} {
+          strict_layout_labels{cfg.strict_layout_labels},
+          end_joins{cfg.end_joins} {
         inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
     }
 
@@ -1518,15 +1520,20 @@ struct bubble {
     GraphCleaning::run(dbgi, cfg);
 }
 
-[[maybe_unused]] static std::string spell(const dbg_index &dbgi, u64 id) {
+[[maybe_unused]] static std::string spell(
+    const gtl::vector<SequenceContainerType> &seqs) {
     std::string out;
-    for (const auto &f : dbgi.dbg.find(id)->second.seq) {
+    for (const auto &f : seqs) {
         const size_t at = out.size();
         out.resize(at + f.len + 1);  // convert_to_ascii writes a terminator
         f.convert_to_ascii(out.data() + at);
         out.resize(at + f.len);
     }
     return out;
+}
+
+[[maybe_unused]] static std::string spell(const dbg_index &dbgi, u64 id) {
+    return spell(dbgi.dbg.find(id)->second.seq);
 }
 
 // Two-arm bubbles S -> {A0, A1} -> T whose arms are single unitigs.
@@ -2552,6 +2559,130 @@ TEST_CASE("GraphCleaning::cut_fork_tips cuts tips within one locus") {
         REQUIRE(popped.size() == 1);
         CHECK(popped[0].error);
     }
+}
+
+TEST_CASE("layout_graph_emit::EndJoin merges reverse-complement end overlaps") {
+    using namespace layout_graph_emit;
+    using fragment_test::revcomp;
+    // Genome G of 40 kb; A = G[0, 22k) and B = rc(G[20k, 40k)): A's end and
+    // B's end overlap by 2 kb as reverse complements, so A + B spells G.
+    const std::string g = fragment_test::random_dna(40000, 7);
+    auto segment = [](const std::string &s, const char *name) {
+        supernode_out sn{name, {}, nullptr, true, 0};
+        sn.owned_seqs.emplace_back(s.data(), 0, s.size(), 0,
+                                   SequenceContainerType::from_ascii{});
+        return sn;
+    };
+    asm_config cfg;
+    cfg.lcp_level = 5;
+    cfg.threads.work = 2;
+    cfg.syncmer.apply_default_rule();
+    assembler as(cfg);
+    auto make = [&](bool third) {
+        supernode_vec sv;
+        sv.push_back(segment(g.substr(0, 22000), "A"));
+        sv.push_back(segment(revcomp(g.substr(20000)), "B"));
+        // C = G[15k, 22k) lies on A's end and its end overlaps B's end: A's
+        // end and B's end then each overlap two ends.
+        if (third) sv.push_back(segment(g.substr(15000, 7000), "C"));
+        return sv;
+    };
+    auto one_copy = [](u64, bool) { return 1.0; };
+    auto deep = [](u64, bool) { return 20.0; };
+
+    SUBCASE("one partner at one-locus depth: joined, spelling G") {
+        auto sv = make(false);
+        edge_map edges;
+        CHECK(EndJoin::run(as, sv, edges, 10.0, one_copy) == 1);
+        std::vector<std::string> live;
+        for (const auto &sn : sv)
+            if (!sn.name.empty())
+                live.push_back(fragment_test::spell(sn.seqs()));
+        REQUIRE(live.size() == 1);
+        CHECK((live[0] == g || live[0] == revcomp(g)));
+    }
+    SUBCASE("deeper than one locus: not joined") {
+        auto sv = make(false);
+        edge_map edges;
+        CHECK(EndJoin::run(as, sv, edges, 10.0, deep) == 0);
+    }
+    SUBCASE("two partners: not joined") {
+        auto sv = make(true);
+        edge_map edges;
+        CHECK(EndJoin::run(as, sv, edges, 10.0, one_copy) == 0);
+    }
+    SUBCASE("a segment shorter than 1 kb is joined") {
+        // B = rc(G[21.1k, 22.05k)), 950 bases, overlaps A = G[0, 22k) by
+        // 900 and extends it by 50: A + B spells G[0, 22.05k).
+        supernode_vec sv;
+        sv.push_back(segment(g.substr(0, 22000), "A"));
+        sv.push_back(segment(revcomp(g.substr(21100, 950)), "B"));
+        edge_map edges;
+        CHECK(EndJoin::run(as, sv, edges, 10.0, one_copy) == 1);
+        const std::string joined = fragment_test::spell(sv.back().seqs());
+        CHECK((joined == g.substr(0, 22050) ||
+               joined == revcomp(g.substr(0, 22050))));
+    }
+    SUBCASE("an end differing over its last 100 bases: not joined") {
+        // The overlap alignment stops 100 bases short of A's free end, more
+        // than the band allows.
+        auto sv = make(false);
+        sv[0] = segment(g.substr(0, 21900) + fragment_test::random_dna(100, 13),
+                        "A");
+        edge_map edges;
+        CHECK(EndJoin::run(as, sv, edges, 10.0, one_copy) == 0);
+    }
+    SUBCASE("chain of three: one segment spelling G2; outer link moves") {
+        // G2 = G + 20 kb; A = rc(G2[0, 22k)), B = rc(G2[20k, 42k)) and
+        // C = G2[40k, 60k): A - B - C spells G2 with A read reversed. X
+        // links into A's free end (X+ -> A-).
+        const std::string g2 = g + fragment_test::random_dna(20000, 9);
+        supernode_vec sv;
+        sv.push_back(segment(revcomp(g2.substr(0, 22000)), "A"));
+        sv.push_back(segment(revcomp(g2.substr(20000, 22000)), "B"));
+        sv.push_back(segment(g2.substr(40000), "C"));
+        sv.push_back(segment(fragment_test::random_dna(5000, 11), "X"));
+        edge_map edges;
+        edge_agg x_to_a;
+        x_to_a.src_super = 3;
+        x_to_a.dst_super = 0;
+        x_to_a.dst_ori = '-';
+        x_to_a.src_side = SIDE_END;
+        x_to_a.dst_side = SIDE_END;
+        x_to_a.count = 1;
+        edges[{3, 0, '+', '-', SIDE_END, SIDE_END}] = x_to_a;
+        CHECK(EndJoin::run(as, sv, edges, 10.0, one_copy) == 2);
+        REQUIRE(sv.size() == 5);
+        for (u64 sid = 0; sid < 3; ++sid) CHECK(sv[sid].name.empty());
+        // A is read reversed in J when J spells G2, forward when J spells
+        // rc(G2); the link enters A's end, so J's start in the first case.
+        const std::string joined = fragment_test::spell(sv[4].seqs());
+        const bool a_reversed = joined == g2;
+        CHECK((a_reversed || joined == revcomp(g2)));
+        REQUIRE(edges.size() == 1);
+        const edge_agg &e = edges.begin()->second;
+        CHECK(e.src_super == 3);
+        CHECK(e.dst_super == 4);
+        if (a_reversed) {
+            CHECK(e.dst_ori == '+');
+            CHECK(e.dst_side == SIDE_START);
+        } else {
+            CHECK(e.dst_ori == '-');
+            CHECK(e.dst_side == SIDE_END);
+        }
+    }
+}
+
+TEST_CASE("layout_graph_emit::EndJoin::repeated_pair_fraction") {
+    auto fraction = [](std::initializer_list<uint32_t> cores) {
+        lcp_read lr;
+        for (uint32_t c : cores) lr.cores.push_back(c);
+        return layout_graph_emit::EndJoin::repeated_pair_fraction(lr);
+    };
+    // Pairs (1,2) (2,1) (1,2) (2,3): both (1,2) occurrences recur.
+    CHECK(fraction({1, 2, 1, 2, 3}) == doctest::Approx(0.5));
+    CHECK(fraction({1, 2, 3, 4}) == 0.0);
+    CHECK(fraction({7}) == 0.0);
 }
 
 TEST_CASE("GraphCleaning::simplify_simple_paths terminates on self-loops"

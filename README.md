@@ -147,6 +147,7 @@ Graph cleaning:
 Layout:
 
 - `--drop-crumbs` / `--keep-crumbs`: drop crumb nodes (too short for overlap detection) that have a single predecessor and continue into a longer node, instead of emitting them as `C` segments (default on; halves the contig count at a small genome-fraction cost)
+- `--end-joins` / `--no-end-joins`: join two free segment ends that overlap as reverse complements (the two read strands of one locus stopped at different holes) into one segment; candidates need a unique partner, one-locus depth at both ends, and end windows that are not tandem-periodic (collapsed satellite arrays) (default on)
 
 Output and debugging:
 

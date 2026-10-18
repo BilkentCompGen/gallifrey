@@ -48,6 +48,21 @@ static void for_each_map(const map &mp, const F &fCallback, int threads) {
     }
 }
 
+// Calls fn(i) for every i in [0, n) on up to `threads` threads (the calling
+// thread is one of them), handing out indices one at a time.
+template <class F>
+static void parallel_for(size_t n, int threads, F &&fn) {
+    std::atomic<size_t> next{0};
+    auto work = [&] {
+        for (size_t i = next++; i < n; i = next++) fn(i);
+    };
+    std::vector<std::thread> workers;
+    for (size_t t = 1; t < std::min<size_t>(threads, n); ++t)
+        workers.emplace_back(work);
+    work();
+    for (auto &worker : workers) worker.join();
+}
+
 template <std::integral int_type>
 consteval int_type nextpowerof2(int_type v) {
     v--;
@@ -149,6 +164,9 @@ struct dbg_index_base {
     dbg_map_t dbg;
     gtl::btree_set<u64> active_set;
     gtl::vector<popped_bubble> popped_bubbles;
+    // Depth above which a node holds more than one locus (set by cleaning;
+    // 0 when no depth model was fitted).
+    double locus_limit = 0.0;
 
     // merge_info_map_t merge_map;
     BloomFilterType bf;
@@ -1397,6 +1415,7 @@ struct GraphCleaning {
                 one_copy > 0.0 ? locus_depth_limit(dbgi.dbg, active_set,
                                                    one_copy, cfg.ploidy)
                                : 0.0;
+            dbgi.locus_limit = locus_limit;
             if (!acfg.silent)
                 std::fprintf(stderr,
                              "[graph-clean] one-copy depth %.2f, ploidy %d, "
