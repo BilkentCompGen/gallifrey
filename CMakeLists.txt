@@ -42,7 +42,7 @@ set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "-pg -no-pie")
 set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG")
 
 #We are not providing a public ABI, no need to fix this
-add_compile_options($<$<CXX_COMPILER_ID:GNU>:-Wno-interference-size>)
+add_compile_options($<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wno-interference-size>)
 
 # Optimize for the host CPU only when explicitly requested (non-portable;
 # default off so distributed binaries run on other machines). Portable x86-64
@@ -105,9 +105,37 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(concurrentqueue)
 
+# ksw2 (lh3/ksw2, minimap2's aligner): SIMD dual-affine z-drop extension for
+# the end joins (align.h). It has no CMake build, so only its dual-gap SSE
+# kernel is compiled here.
+FetchContent_Declare(
+    ksw2
+    GIT_REPOSITORY https://github.com/lh3/ksw2.git
+    GIT_TAG 289609bd9e5381a13b16239d0a7703f1ff03f9ca
+)
+FetchContent_MakeAvailable(ksw2)
+add_library(ksw2_extd2 STATIC ${ksw2_SOURCE_DIR}/ksw2_extd2_sse.c)
+target_include_directories(ksw2_extd2 SYSTEM PUBLIC ${ksw2_SOURCE_DIR})
+target_compile_options(ksw2_extd2 PRIVATE -w)
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
+    # No SSE: translate the intrinsics with sse2neon, as minimap2 does on ARM.
+    FetchContent_Declare(
+        sse2neon
+        GIT_REPOSITORY https://github.com/DLTcollab/sse2neon.git
+        GIT_TAG v1.8.0
+    )
+    FetchContent_MakeAvailable(sse2neon)
+    set(SSE2NEON_SHIM ${CMAKE_BINARY_DIR}/sse2neon_shim)
+    file(WRITE ${SSE2NEON_SHIM}/emmintrin.h "#include \"sse2neon.h\"\n")
+    file(WRITE ${SSE2NEON_SHIM}/smmintrin.h "#include \"sse2neon.h\"\n")
+    target_include_directories(ksw2_extd2 BEFORE PRIVATE
+                               ${SSE2NEON_SHIM} ${sse2neon_SOURCE_DIR})
+    target_compile_definitions(ksw2_extd2 PRIVATE __SSE2__ KSW_SSE2_ONLY)
+endif()
+
 # Link libraries
 target_link_libraries(${PROJECT_NAME} PRIVATE
-                      PkgConfig::HTS gtl CLI11::CLI11
+                      PkgConfig::HTS gtl CLI11::CLI11 ksw2_extd2
                       concurrentqueue pthread deflate z
                       $<$<PLATFORM_ID:Linux>:rt>)
 
@@ -119,13 +147,14 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 # run for real, without shipping any test code in the production binary.
 add_executable(lasm_tests
     tests/test_main.cpp
+    tests/align_tests.cpp
     asm2.cpp
     lcmer.cpp
     dump_cores.cpp
 )
 target_include_directories(lasm_tests PRIVATE . ./ext)
 target_link_libraries(lasm_tests PRIVATE
-                      PkgConfig::HTS gtl CLI11::CLI11
+                      PkgConfig::HTS gtl CLI11::CLI11 ksw2_extd2
                       concurrentqueue pthread deflate z
                       $<$<PLATFORM_ID:Linux>:rt>)
 target_compile_definitions(lasm_tests PRIVATE
