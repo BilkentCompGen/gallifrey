@@ -7,6 +7,9 @@
 #include <htslib/thread_pool.h>
 #include <stdio.h>
 #include <unistd.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -1381,6 +1384,11 @@ static int run_passes(const asm_config &cfg) {
         if (!last) {
             segments = collect_segments(as, dbg);
             graph.reset();
+#if defined(__GLIBC__)
+            // Return the freed pass graph to the OS; glibc otherwise keeps
+            // most of it in its arenas while the next pass runs.
+            malloc_trim(0);
+#endif
             IF_TIME_CHECKPOINT(!cfg.silent, MULTIPASS, stderr,
                                "pass %zu/%zu (%d:%d) done", p + 1, n,
                                as.lcp_level, as.lcmer_l);
