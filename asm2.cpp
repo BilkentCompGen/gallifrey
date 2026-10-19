@@ -100,11 +100,13 @@ struct assembler {
     }
 
     // Seeded (--multipass segment windows): the window adds no count and marks
-    // its node seeded; edges are made as for reads.
-    template <class BFT, bool Seeded = false>
+    // its node seeded; edges are made as for reads. A new node gets its first
+    // fragment, fragment(key), while the insert holds the submap lock.
+    template <class BFT, bool Seeded = false, class Fragment>
     static inline auto insert_lcmer_helper(const gtl::vector<uint64_t> &ll,
                                            const uint32_t &i,
-                                           dbg_index_base<BFT> &dbgi) -> bool {
+                                           dbg_index_base<BFT> &dbgi,
+                                           Fragment &&fragment) -> bool {
         using index_type = dbg_index_base<BFT>;
         using val_type = typename index_type::bidbg_val;
         constexpr unsigned kCount = [] {
@@ -114,9 +116,10 @@ struct assembler {
                 return 1U;
             }
         }();
-        const auto make = [](auto... args) {
+        const auto make = [&](auto... args) {
             val_type v{args...};
             if constexpr (Seeded) v.seeded = true;
+            v.seq.push_back(fragment(ll[i]));
             return v;
         };
         const auto mark = [](val_type &v) {
@@ -240,17 +243,11 @@ struct assembler {
         // key window, so a successor's fragment starts where this one ends on
         // every path, and spelling a path concatenates fragments exactly.
         for (size_t i = 1; i < ll.size() - 1; ++i) {
-            if (insert_lcmer_helper(ll, i, dbgi)) {
-                // Lets try atomic
-                dbgi.dbg.modify_if(
-                    ll[i],
-                    [&lr, i,
-                     lcmer_l](dbg_index_base<BFT>::dbg_map_t::value_type &val) {
-                        val.second.seq.emplace_back(
-                            lr.data, lr.pos[i + lcmer_l - 2].second,
-                            lr.pos[i + lcmer_l - 1].second, val.first);
-                    });
-            }
+            insert_lcmer_helper(ll, i, dbgi, [&](u64 key) {
+                return SequenceContainerType(
+                    lr.data, lr.pos[i + lcmer_l - 2].second,
+                    lr.pos[i + lcmer_l - 1].second, key);
+            });
         }
     }
 
@@ -368,13 +365,11 @@ struct assembler {
         }
         ll.push_back(0);
         for (size_t i = 1; i < ll.size() - 1; ++i) {
-            if (insert_lcmer_helper<BFT, true>(ll, i, dbgi)) {
-                dbgi.dbg.modify_if(ll[i], [&](auto &val) {
-                    val.second.seq.push_back(range_fragment(
-                        seq, from, to, rc, lr.pos[i + lcmer_l - 2].second,
-                        lr.pos[i + lcmer_l - 1].second, val.first));
-                });
-            }
+            insert_lcmer_helper<BFT, true>(ll, i, dbgi, [&](u64 key) {
+                return range_fragment(seq, from, to, rc,
+                                      lr.pos[i + lcmer_l - 2].second,
+                                      lr.pos[i + lcmer_l - 1].second, key);
+            });
         }
         return ll.size() - 2;
     }
