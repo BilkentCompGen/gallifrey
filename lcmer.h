@@ -1020,26 +1020,44 @@ inline void init_lps_crumbled(lps *lps_ptr,
     assert(lps_ptr->size < lps_ptr->capacity);
 }
 
-// Base i of BAM-style packed nibbles (high nibble first).
-inline uint8_t nibble_at(const uint8_t *p, uint32_t i) {
-    return (p[i >> 1] >> ((~i & 1u) << 2)) & 0xF;
-}
-
 // Complement of a BAM nibble (A<->T, C<->G, anything else N).
-inline uint8_t nibble_complement(uint8_t n) {
-    static constexpr uint8_t comp[16] = {15, 8,  4,  15, 2,  15, 15, 15,
-                                         1,  15, 15, 15, 15, 15, 15, 15};
+constexpr uint8_t nibble_complement(uint8_t n) {
+    constexpr uint8_t comp[16] = {15, 8,  4,  15, 2,  15, 15, 15,
+                                  1,  15, 15, 15, 15, 15, 15, 15};
     return comp[n];
 }
 
-// Reverse complement of len packed nibbles into dst.
+// Reverse complement of a byte of two packed nibbles: the nibbles swapped and
+// each complemented.
+inline constexpr std::array<uint8_t, 256> kRevcompNibblePair = [] {
+    std::array<uint8_t, 256> table{};
+    for (int b = 0; b < 256; ++b) {
+        table[b] = static_cast<uint8_t>((nibble_complement(b & 0xF) << 4) |
+                                        nibble_complement(b >> 4));
+    }
+    return table;
+}();
+
+// Reverse complement of len packed nibbles into dst, a byte at a time. For an
+// odd len the source's padding nibble would come first, so every output byte
+// takes its two nibbles from neighbouring reversed bytes, and the last low
+// nibble is 0.
 inline void revcomp_nibbles(const uint8_t *src, uint32_t len,
                             gtl::vector<uint8_t> &dst) {
-    dst.assign((len + 1) / 2, 0);
-    for (uint32_t i = 0; i < len; ++i) {
-        const uint8_t c = nibble_complement(nibble_at(src, len - 1 - i));
-        dst[i >> 1] |= (i & 1) ? c : static_cast<uint8_t>(c << 4);
+    const uint32_t bytes = (len + 1) / 2;
+    dst.resize(bytes);
+    if (len % 2 == 0) {
+        for (uint32_t j = 0; j < bytes; ++j) {
+            dst[j] = kRevcompNibblePair[src[bytes - 1 - j]];
+        }
+        return;
     }
+    for (uint32_t j = 0; j + 1 < bytes; ++j) {
+        dst[j] =
+            static_cast<uint8_t>((kRevcompNibblePair[src[bytes - 1 - j]] << 4) |
+                                 (kRevcompNibblePair[src[bytes - 2 - j]] >> 4));
+    }
+    dst[bytes - 1] = static_cast<uint8_t>(kRevcompNibblePair[src[0]] << 4);
 }
 
 inline void parse_cores_from_nibbles(const uint8_t *data, size_t len,
