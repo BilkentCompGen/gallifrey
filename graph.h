@@ -265,6 +265,15 @@ struct dbg_index_base {
             });
         });
     }
+    // Destroys every node, one submap per task on up to `threads` threads:
+    // a large graph's per-node allocations take long to free on one thread.
+    // The index stays usable (empty).
+    void clear_parallel(int threads) {
+        parallel_for(dbg.subcnt(), threads,
+                     [&](size_t submap) { dbg.clear(submap); });
+        gtl::btree_set<u64>().swap(active_set);
+        gtl::vector<popped_bubble>().swap(popped_bubbles);
+    }
     u64 emplace_nobloomfilter(const LCmer &l, u64 &idx, int tid) {
         (void)idx;
         (void)tid;

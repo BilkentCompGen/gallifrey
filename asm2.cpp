@@ -1388,6 +1388,7 @@ static int run_passes(const asm_config &cfg) {
 
         if (!last) {
             segments = collect_segments(as, dbg);
+            dbg.clear_parallel(cfg.threads.work);
             graph.reset();
 #if defined(__GLIBC__)
             // Return the freed pass graph to the OS; glibc otherwise keeps
