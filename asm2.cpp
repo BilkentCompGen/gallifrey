@@ -1281,7 +1281,7 @@ int run_assembly(const asm_config &cfg) {
     }
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "DBG construction");
 
-    dbg.count_forward_edges();
+    dbg.count_forward_edges(cfg.threads.work);
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
                        "Count forward edges");
 
@@ -1372,7 +1372,7 @@ static int run_passes(const asm_config &cfg) {
                                chunks, windows);
         }
 
-        dbg.count_forward_edges();
+        dbg.count_forward_edges(cfg.threads.work);
         IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
                            "Count forward edges");
 

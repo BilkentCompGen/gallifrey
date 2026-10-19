@@ -246,16 +246,24 @@ struct dbg_index_base {
         }
         return it == dbg_nc.end() ? lci_type::empty() : lci_type{id};
     }
-    void count_forward_edges() {
-        for (auto &node : dbg) {
-            for (auto &edge : node.second.prev) {
-                auto it = dbg.find(edge);
-                if (it == dbg.end()) {
-                    continue;
+    // Sets every node's forward_edge_count to the number of nodes listing it
+    // in prev. Submaps are split across threads; nothing is inserted or
+    // erased meanwhile, so lookups take no lock, and counts are bumped
+    // atomically (a node can be the successor of nodes in any submap).
+    void count_forward_edges(int threads) {
+        gtl::LockableBaseImpl<gtl::NullMutex>::DoNothing no_lock;
+        parallel_for(dbg.subcnt(), threads, [&](size_t submap) {
+            dbg.with_submap(submap, [&](const auto &set) {
+                for (const auto &node : set) {
+                    for (u64 edge : node.second.prev) {
+                        auto it = dbg.find(edge, dbg.hash(edge), no_lock);
+                        if (it == dbg.end()) continue;
+                        std::atomic_ref<unsigned>(it->second.forward_edge_count)
+                            .fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
-                it->second.forward_edge_count++;
-            }
-        }
+            });
+        });
     }
     u64 emplace_nobloomfilter(const LCmer &l, u64 &idx, int tid) {
         (void)idx;
