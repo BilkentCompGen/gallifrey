@@ -63,6 +63,39 @@ static void parallel_for(size_t n, int threads, F &&fn) {
     for (auto &worker : workers) worker.join();
 }
 
+// A queue holding at most `capacity` items, with the dequeue interface of
+// moodycamel::BlockingConcurrentQueue. enqueue() blocks on a semaphore of free
+// slots while the queue is full (no spinning or polling); every dequeue frees
+// a slot. The blocks for `capacity` items from `producers` producer threads
+// are allocated up front, so enqueue() never allocates.
+template <class T>
+class bounded_queue {
+   public:
+    bounded_queue(size_t capacity, size_t producers)
+        : queue_{capacity, 0, producers},
+          free_slots_{static_cast<ssize_t>(capacity), /*maxSpins=*/0} {}
+    void enqueue(T item) {
+        free_slots_.wait();
+        queue_.enqueue(std::move(item));
+    }
+    template <class Rep, class Period>
+    bool wait_dequeue_timed(T &item,
+                            std::chrono::duration<Rep, Period> timeout) {
+        if (!queue_.wait_dequeue_timed(item, timeout)) return false;
+        free_slots_.signal();
+        return true;
+    }
+    bool try_dequeue(T &item) {
+        if (!queue_.try_dequeue(item)) return false;
+        free_slots_.signal();
+        return true;
+    }
+
+   private:
+    moodycamel::BlockingConcurrentQueue<T> queue_;
+    moodycamel::LightweightSemaphore free_slots_;
+};
+
 template <std::integral int_type>
 consteval int_type nextpowerof2(int_type v) {
     v--;
@@ -1529,8 +1562,10 @@ inline void print_dbg_seqs(FILE *out, const dbg_index &dbgi, int nthreads = 0) {
         const typename dbg_index::bidbg_val *edges;
     };
 
-    using work_q = moodycamel::BlockingConcurrentQueue<WorkItem>;
-    work_q work_queue;
+    // Items in flight per worker before the producer blocks.
+    constexpr size_t kItemsPerWorker = 1024;
+    bounded_queue<WorkItem> work_queue{
+        kItemsPerWorker * static_cast<size_t>(nthreads), /*producers=*/1};
     std::atomic<bool> work_done{false};
     std::atomic<int> active_workers{nthreads};
     // ── Worker thread pool ──────────────────────────────────────────
@@ -1647,9 +1682,7 @@ inline void print_dbg_seqs(FILE *out, const dbg_index &dbgi, int nthreads = 0) {
         if (edges.counts.core_count == 0 && edges.prev.size() == 0) continue;
         if (edges.seq.size() == 0) continue;
 
-        while (!work_queue.try_enqueue(WorkItem{lval, &edges})) {
-            std::this_thread::sleep_for(std::chrono::nanoseconds(10));
-        }
+        work_queue.enqueue(WorkItem{lval, &edges});
     }
     work_done.store(true);
 

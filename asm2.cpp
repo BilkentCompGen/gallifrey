@@ -59,6 +59,9 @@ struct assembler {
 
     template <class Rec>
     using queue_of = moodycamel::BlockingConcurrentQueue<Rec *>;
+    // Records from the readers to the workers; a full queue blocks readers.
+    template <class Rec>
+    using data_queue_of = bounded_queue<Rec *>;
     using hts_queue = queue_of<bam1_t>;
     using fastx_queue = queue_of<seq_record>;
     // (path, is_compressed) -- the flag is only meaningful for FASTX inputs.
@@ -463,7 +466,7 @@ struct assembler {
 
     template <class Ops>
     static auto process_data(int thread_id, int lcp_level,
-                             queue_of<typename Ops::record> &data_queue,
+                             data_queue_of<typename Ops::record> &data_queue,
                              queue_of<typename Ops::record> &recycle_queue,
                              dbg_index &dbgi, std::atomic<bool> &done,
                              int &processed_read_count, int &all_reads,
@@ -512,7 +515,7 @@ struct assembler {
     // for the workers. Returns when `fill` reports end of input; whether that
     // end was clean is the caller's to determine from its source.
     template <class Ops, class Fill>
-    static void enqueue_records(queue_of<typename Ops::record> &data_queue,
+    static void enqueue_records(data_queue_of<typename Ops::record> &data_queue,
                                 queue_of<typename Ops::record> &recycle_queue,
                                 Fill &&fill) {
         typename Ops::record *rec = nullptr;
@@ -524,16 +527,14 @@ struct assembler {
                 Ops::destroy(rec);
                 return;
             }
-            while (!data_queue.try_enqueue(rec)) {
-                std::this_thread::sleep_for(std::chrono::nanoseconds(10));
-            }
+            data_queue.enqueue(rec);
             rec = nullptr;
         }
     }
 
     // htslib path: BAM, CRAM, SAM.
     [[nodiscard]] static bool read_hts(const stage_input &input,
-                                       hts_queue &data_queue,
+                                       data_queue_of<bam1_t> &data_queue,
                                        hts_queue &recycle_queue, int threads) {
         samFile *fp = sam_open(input.first.c_str(), "r");
         if (!fp) {
@@ -569,7 +570,7 @@ struct assembler {
     // Native FASTA/FASTQ path: no bam1_t rebuild, no quality array, bases are
     // packed into the record's nibble buffer during the block scan.
     [[nodiscard]] static bool read_fastx(const stage_input &input,
-                                         fastx_queue &data_queue,
+                                         data_queue_of<seq_record> &data_queue,
                                          fastx_queue &recycle_queue,
                                          int threads) {
         fastx_reader reader;
@@ -589,7 +590,7 @@ struct assembler {
     }
 
     template <class Ops>
-    static void drain_and_destroy(queue_of<typename Ops::record> &q) {
+    static void drain_and_destroy(auto &q) {
         typename Ops::record *rec = nullptr;
         while (q.try_dequeue(rec)) {
             Ops::destroy(rec);
@@ -602,9 +603,18 @@ struct assembler {
     bool run_stage(const gtl::vector<stage_input> &stage_inputs, Reader reader,
                    dbg_index &dbgi, auto Process_Func, u64 &valid_sum,
                    u64 &all_sum) {
-        using queue_t = queue_of<typename Ops::record>;
-        queue_t data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
-        queue_t recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
+        // Records in flight per worker before the readers block. Each holds a
+        // whole read, so the bound keeps the buffered reads small.
+        constexpr size_t kRecordsPerWorker = 64;
+        const size_t capacity =
+            kRecordsPerWorker * static_cast<size_t>(threads.work);
+        // One reader thread per input in parallel reading mode, else one.
+        const size_t producers = [&]() -> size_t {
+            if (parallel_file_reading) return stage_inputs.size();
+            return 1;
+        }();
+        data_queue_of<typename Ops::record> data_queue{capacity, producers};
+        queue_of<typename Ops::record> recycle_queue{capacity, 1, 1};
         std::atomic<bool> done{false};
 
         gtl::vector<std::thread> workers;
