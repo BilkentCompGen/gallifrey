@@ -30,15 +30,17 @@ endif()
 option(LASM_NATIVE "Optimize for the build host CPU (-march=native); produces non-portable binaries" OFF)
 
 # Compiler flags
+# Project defaults come first; a user's -DCMAKE_<LANG>_FLAGS_<CONFIG> is
+# appended so it reaches the compile line and wins over the defaults.
 # Debug flags
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG -Wall -Wextra -Wpedantic -fsanitize=undefined,null,bounds -fsanitize-trap=all")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG -Wall -Wextra -Wpedantic -fsanitize=undefined,null,bounds -fsanitize-trap=all ${CMAKE_CXX_FLAGS_DEBUG}")
 # Release flags
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -ftree-vectorize -DNDEBUG -Wall -Wextra -Wpedantic")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -ftree-vectorize -DNDEBUG -Wall -Wextra -Wpedantic ${CMAKE_CXX_FLAGS_RELEASE}")
 # RelWithDebInfo flags — includes gprof instrumentation (-pg, -no-pie)
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -pg -DNDEBUG -Wall -Wextra -ftree-vectorize")
-set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "-pg -no-pie")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -pg -DNDEBUG -Wall -Wextra -ftree-vectorize ${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
+set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "-pg -no-pie ${CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO}")
 # MinSizeRel flags
-set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG")
+set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG ${CMAKE_CXX_FLAGS_MINSIZEREL}")
 
 #We are not providing a public ABI, no need to fix this
 add_compile_options($<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wno-interference-size>)
