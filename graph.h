@@ -174,15 +174,14 @@ struct dbg_index_base {
 
         gtl::vector<SequenceContainerType> seq;
 
-        bool redirected() const {
-            return redirected_flag || (prev.size() == 1 && prev[0] == 0);
-        }
+        bool redirected() const { return redirected_flag; }
+        // An absorbed node keeps only its redirect target: seq and prev are
+        // released, so it holds no heap and lists no predecessors.
         void mark_redirected(u64 to) {
             redirected_flag = true;
             redirect_to = to;
             gtl::vector<SequenceContainerType>().swap(seq);
             gtl::vector<u64>().swap(prev);
-            prev.push_back(0);  // 0 is an illegal node id; marks redirected.
         }
 
         gtl::vector<u64> prev;
@@ -744,9 +743,9 @@ struct GraphCleaning {
     }
     // Rewrite prev edges through redirect_deleted and drop the self-edges
     // this creates. Only live nodes can change: a redirected node's prev is
-    // [0] and 0 is never a node id. Every live node is in active_set (nodes
-    // only ever leave it), so iterating it instead of all of dbg (mostly
-    // redirected husks) gives the same result; each node edits only itself.
+    // empty. Every live node is in active_set (nodes only ever leave it), so
+    // iterating it instead of all of dbg (mostly redirected husks) gives the
+    // same result; each node edits only itself.
     static void redirect_prev_edges(dbg_map_t &dbg,
                                     const redir_map &redirect_deleted,
                                     const auto &active_set) {
