@@ -717,7 +717,7 @@ struct assembler {
         }
         fprintf(stderr, "%" PRIu64 " processed\n%" PRIu64 " total reads\n",
                 valid_sum, all_sum);
-        const auto &bf = dbgi.bf.implementation;
+        const auto &bf = dbgi.bf->implementation;
         const double fill = bf.fill_fraction();
         // Exact for the blocked layout, unlike the unblocked fill^(k - 1).
         const double est_fpr = bf.fpr_for_fill(fill);
@@ -743,6 +743,9 @@ struct assembler {
                     est_fpr, bloom.false_positive_rate, keys,
                     bloom.projected_count);
         }
+        // Nothing probes the filter after the reads are in: segment seeding
+        // bypasses it and cleaning and layout never read it.
+        dbgi.bf.reset();
         return {};
     }
 

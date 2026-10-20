@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -16,11 +17,11 @@
 #include <gtl/vector.hpp>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <thread>
 #include <vector>
-#include <cinttypes>
 
 #include "asm.h"
 #include "bloomfilter.h"
@@ -221,11 +222,13 @@ struct dbg_index_base {
     double locus_limit = 0.0;
 
     // merge_info_map_t merge_map;
-    BloomFilterType bf;
+    // First-sighting filter for read lcmers. Only read insertion
+    // (construct_dbg) probes it, and construct_dbg releases it when done.
+    std::optional<BloomFilterType> bf;
 
     dbg_index_base(double false_positive_rate, uint64_t projected_count,
                    uint64_t seed)
-        : bf{false_positive_rate, projected_count, seed} {}
+        : bf{std::in_place, false_positive_rate, projected_count, seed} {}
 
     // dbg_index(const dbg_index &other)
     static constexpr u64 lcmer_id(const LCmer &l) { return l.value(); }
@@ -289,7 +292,7 @@ struct dbg_index_base {
         (void)idx;
         (void)tid;
         const auto new_hash = std::hash<LCmer>{}(l);
-        if (bf.insert_if_absent(new_hash)) {
+        if (bf->insert_if_absent(new_hash)) {
             return 0;
         }
         return lcmer_id(l);
