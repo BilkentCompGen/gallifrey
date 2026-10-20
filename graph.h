@@ -446,6 +446,11 @@ struct unitig_graph {
 
    private:
     unitig_graph() = default;
+    // Steps of the constructor: the unitig slots, ids and (unsorted) lcmer
+    // ids; the lcmer-id index; then the unitigs' data.
+    void place_unitigs(const dbg_index::dbg_map_t &dbg, int threads);
+    void index_keys(const dbg_index &cleaned, int threads);
+    void take_unitig_data(dbg_index::dbg_map_t &dbg, int threads);
 
     gtl::flat_hash_map<u64, u32> index_of_;  // live id -> position in unitigs
     // Every lcmer id that resolves to a node, sorted, and per id that node's
@@ -462,7 +467,15 @@ inline unitig_graph::unitig_graph(dbg_index &cleaned, int threads)
       popped_bubbles(std::move(cleaned.popped_bubbles)),
       locus_limit(cleaned.locus_limit),
       node_table_size(cleaned.dbg.size()) {
-    auto &dbg = cleaned.dbg;
+    place_unitigs(cleaned.dbg, threads);
+    index_keys(cleaned, threads);
+    take_unitig_data(cleaned.dbg, threads);
+    arenas_ = cleaned.take_fragment_arenas();
+    cleaned.clear_parallel(threads);
+}
+
+inline void unitig_graph::place_unitigs(const dbg_index::dbg_map_t &dbg,
+                                        int threads) {
     const size_t submaps = dbg.subcnt();
     // Live and total entries per submap, then their prefix sums.
     submap_begin.assign(submaps + 1, 0);
@@ -493,9 +506,11 @@ inline unitig_graph::unitig_graph(dbg_index &cleaned, int threads)
     index_of_.reserve(unitigs.size());
     for (size_t u = 0; u < unitigs.size(); ++u)
         index_of_.emplace(unitigs[u].id, static_cast<u32>(u));
+}
 
-    // Resolve every id through the node table; kNoNode marks the ids that
-    // resolve to no node until they are dropped.
+// Resolves every lcmer id through the node table; kNoNode marks the ids that
+// resolve to no node until they are dropped.
+inline void unitig_graph::index_keys(const dbg_index &cleaned, int threads) {
     constexpr u32 kNoNode = std::numeric_limits<u32>::max();
     assert(unitigs.size() < kNoNode);
     std::sort(keys_.begin(), keys_.end());
@@ -521,7 +536,11 @@ inline unitig_graph::unitig_graph(dbg_index &cleaned, int threads)
     targets_.resize(kept);
     keys_.shrink_to_fit();
     targets_.shrink_to_fit();
+}
 
+inline void unitig_graph::take_unitig_data(dbg_index::dbg_map_t &dbg,
+                                           int threads) {
+    const size_t submaps = dbg.subcnt();
     parallel_for(submaps, threads, [&](size_t s) {
         dbg.with_submap_m(s, [&](auto &set) {
             size_t u = submap_begin[s];
@@ -534,8 +553,6 @@ inline unitig_graph::unitig_graph(dbg_index &cleaned, int threads)
             }
         });
     });
-    arenas_ = cleaned.take_fragment_arenas();
-    cleaned.clear_parallel(threads);
 }
 
 struct FlatDBG {
