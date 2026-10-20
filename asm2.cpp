@@ -1235,21 +1235,15 @@ static bool dump_dbg(const std::string &path, const dbg_index &dbg) {
     return true;
 }
 
-// Returns memory freed by a stage to the OS; glibc otherwise keeps most of it
-// in its arenas while the next stage runs.
-static void return_freed_memory() {
-#if defined(__GLIBC__)
-    malloc_trim(0);
-#endif
-}
-
 // The cleaned graph in compact form: the node table, mostly redirect stubs,
 // is freed; its fragment arenas move to the compact graph with the sequences.
+// The freed memory stays with malloc and serves the fold and layout buffers;
+// returning it to the OS here (malloc_trim) is slow and does not lower the
+// peak.
 static std::unique_ptr<unitig_graph> compact_graph(
     std::unique_ptr<dbg_index> graph, int threads) {
     auto unitigs = std::make_unique<unitig_graph>(*graph, threads);
     graph.reset();
-    return_freed_memory();
     return unitigs;
 }
 
@@ -1409,7 +1403,11 @@ static int run_passes(const asm_config &cfg) {
             segments = collect_segments(as, *unitigs);
             unitigs->clear_parallel(cfg.threads.work);
             unitigs.reset();
-            return_freed_memory();
+#if defined(__GLIBC__)
+            // Return the freed pass graph to the OS; glibc otherwise keeps
+            // most of it in its arenas while the next pass runs.
+            malloc_trim(0);
+#endif
             IF_TIME_CHECKPOINT(!cfg.silent, MULTIPASS, stderr,
                                "pass %zu/%zu (%d:%d) done", p + 1, n,
                                as.lcp_level, as.lcmer_l);
