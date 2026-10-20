@@ -244,6 +244,14 @@ struct CrumbledSubSeq {
 // side, never share a line.
 class alignas(64) word_arena {
    public:
+    word_arena() = default;
+    // Moves hand the blocks over; the words stay where they are, so
+    // fragments borrowing them stay valid under the new owner.
+    word_arena(word_arena &&other) noexcept { take(other); }
+    word_arena &operator=(word_arena &&other) noexcept {
+        if (this != &other) take(other);
+        return *this;
+    }
     [[nodiscard]] uint64_t *allocate(size_t words) {
         if (words > left_) {
             left_ = std::max(words, kBlockWords);
@@ -263,6 +271,12 @@ class alignas(64) word_arena {
     }
 
    private:
+    void take(word_arena &other) noexcept {
+        blocks_ = std::move(other.blocks_);
+        cur_ = std::exchange(other.cur_, nullptr);
+        left_ = std::exchange(other.left_, 0);
+        other.blocks_.clear();
+    }
     // 1 MiB blocks: thousands of fragments per malloc, while the unused tail
     // of one block per thread stays negligible against a graph.
     static constexpr size_t kBlockWords = size_t{1} << 17;

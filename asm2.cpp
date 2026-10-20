@@ -38,7 +38,6 @@
 #include "layout_graph.h"
 #include "lcmer.h"
 #include "lcptools/lcptools_ho.h"
-#include "no_destructor.h"
 #include "syncmer.h"
 
 using std::string;
@@ -188,7 +187,7 @@ struct assembler {
         ll.push_back(0);
         return ll;
     }
-    static auto find_lcmer_ranges(const lcp_read &lr, const dbg_index &dbgi,
+    static auto find_lcmer_ranges(const lcp_read &lr, const unitig_graph &graph,
                                   int lcmer_l) {
         // Cores skipped at each node end before overlap-anchoring (OLC_SKIP_*
         // macros).
@@ -203,14 +202,14 @@ struct assembler {
         LCmer l{lr.cores.begin() + skip_first, lcmer_l};  // Skip first core;
         gtl::vector<std::tuple<u64, u64, u64, LCmer, LCmer>> llr;
 
-        dbg_index::lci_type lval = dbgi.get(l);
+        unitig_graph::lci_type lval = graph.get(l);
         llr.emplace_back(lval.id, skip_first, skip_first, l, l);
         // Loop bound keeps i + lcmer_l in range.
         for (long long i = skip_first + 1;
              i < ((long long)lr.cores.size() - lcmer_l - skip_last); ++i) {
             uint32_t in_core = lr.cores[i + lcmer_l - 1];
             l.update_lcmer(in_core, lr.cores[i - 1], lcmer_l);
-            lval = dbgi.get(l);
+            lval = graph.get(l);
             if (lval.id == std::get<0>(llr.back())) {  // Extend the previous
                 std::get<2>(llr.back()) = i;
                 std::get<4>(llr.back()) = l;
@@ -999,12 +998,11 @@ struct assembler {
         return {std::move(lr), std::move(core_seqs)};
     }
 
-    auto fold_dbg_graph(dbg_index &dbgi) {
-        fprintf(stderr, "dbg_size: %zu\n", dbgi.dbg.size());
+    auto fold_dbg_graph(const unitig_graph &graph) {
+        fprintf(stderr, "dbg_size: %zu\n", graph.node_table_size);
 
-        std::atomic<int> all_n{0};
+        std::atomic<int> good{0};
         std::atomic<int> hits{0};
-        std::atomic<int> bad{0};
         // Phase-0 matching diagnostics.
         std::atomic<int> too_short{0};   // < 4*lcmer_l cores → no ranges (#4)
         std::atomic<int> no_ranges{0};   // long enough but 0 lcmer hits
@@ -1012,28 +1010,15 @@ struct assembler {
         gtl::parallel_flat_hash_map_d<u64, gtl::vector<SelfMatch>, HT_SHARD_BC,
                                       std::mutex>
             matched;
-        for_each_map(
-            dbgi.dbg,
-            [&](int tid, const auto &node) {
+        graph.for_each_unitig(
+            threads.work, [&](int tid, const unitig_graph::unitig &node) {
                 (void)tid;
-                all_n.fetch_add(1);
-                if (dbgi.active_set.find(node.first) == dbgi.active_set.end()) {
-                    bad.fetch_add(1);
-                    return;
-                }
+                if (!graph.active_set.contains(node.id)) return;
 
                 lps str = {0, 0, 0, 0};
                 lcp_read lr;
-                // dbgi.dbg.for_each([&](auto &node) {
-                if (node.second.redirected()) {
-                    bad.fetch_add(1);
-                    return;
-                }
-                // good_n.fetch_add(1);
-                lr.clear();
                 gtl::vector<SequenceContainerType> rev_seqs;
-                for (auto it = node.second.seq.rbegin();
-                     it != node.second.seq.rend(); ++it) {
+                for (auto it = node.seq.rbegin(); it != node.seq.rend(); ++it) {
                     rev_seqs.emplace_back(it->reverse_complement());
                 }
                 init_lps_crumbled(&str, rev_seqs, syncmer_functor);
@@ -1044,11 +1029,10 @@ struct assembler {
                     lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
                 }
                 if (lr.cores.size() < static_cast<size_t>(lcmer_l + 1)) {
-                    bad.fetch_add(1);
-                    // good_n.fetch_sub(1);
                     free_lps(&str);
                     return;
                 }
+                good.fetch_add(1);
                 // Layout works in core-index space; find_lcmer_ranges returns
                 // inclusive [from_core,to_core]. Diagnostic below mirrors its
                 // gate via OLC_SKIP_*.
@@ -1057,7 +1041,7 @@ struct assembler {
                                         OLC_SKIP_LAST(lcmer_l))) {
                     too_short.fetch_add(1);  // fails find_lcmer_ranges gate (#4)
                 }
-                auto found_ranges = find_lcmer_ranges(lr, dbgi, lcmer_l);
+                auto found_ranges = find_lcmer_ranges(lr, graph, lcmer_l);
                 bool any_hit = false;
                 for (const auto &[id, from_core, to_core, from_lcmer,
                                   to_lcmer] : found_ranges) {
@@ -1074,7 +1058,7 @@ struct assembler {
                                 : 0;
 
                         matched.lazy_emplace_l(
-                            node.first,
+                            node.id,
                             [&](auto &val) {
                                 val.second.emplace_back(
                                     id,
@@ -1083,7 +1067,7 @@ struct assembler {
                                              core_len_steps});
                             },
                             [&](const auto &ctr) {
-                                ctr(node.first,
+                                ctr(node.id,
                                     gtl::vector<SelfMatch>{SelfMatch{
                                         id,
                                         CoreSpan{static_cast<u64>(from_core),
@@ -1098,8 +1082,7 @@ struct assembler {
                                             OLC_SKIP_LAST(lcmer_l)))
                     no_ranges.fetch_add(1);
                 free_lps(&str);
-            },
-            threads.work);
+            });
 
         gtl::btree_multimap<u64, Overlap> reciprocal;
         int non_recip = 0, recip_kept = 0;
@@ -1139,8 +1122,8 @@ struct assembler {
             }
         }
 
-        fprintf(stderr, "all:%d\ngood: %d nodes\nhits: %d\n", all_n.load(),
-                all_n.load() - bad.load(), hits.load());
+        fprintf(stderr, "all:%zu\ngood: %d nodes\nhits: %d\n",
+                graph.node_table_size, good.load(), hits.load());
         fprintf(stderr,
                 "[match-diag] too_short:%d no_ranges:%d short_drop:%d "
                 "recip_kept:%d non_recip:%d\n",
@@ -1149,7 +1132,7 @@ struct assembler {
         auto layouts =
             layout_graph_algo::connected_comp_plus_layout(reciprocal);
         gtl::flat_hash_set<u64> dropped;
-        if (drop_crumbs) dropped = find_droppable_crumbs(dbgi);
+        if (drop_crumbs) dropped = find_droppable_crumbs(graph);
         return std::make_tuple(std::move(reciprocal), std::move(layouts),
                                std::move(dropped));
     }
@@ -1160,17 +1143,15 @@ struct assembler {
     // emitted as its own C segment. Crumbs that sit between two long nodes
     // (a hub) or whose only continuation is a collapsed repeat (depth above
     // 3x the live median) are kept.
-    gtl::flat_hash_set<u64> find_droppable_crumbs(const dbg_index &dbgi) const {
+    gtl::flat_hash_set<u64> find_droppable_crumbs(
+        const unitig_graph &graph) const {
         const u64 min_cores = static_cast<u64>(lcmer_l + 1);
         gtl::vector<double> depths;
-        depths.reserve(dbgi.active_set.size());
-        for (u64 nid : dbgi.active_set) {
-            auto nit = dbgi.dbg.find(nid);
-            if (nit == dbgi.dbg.end() || nit->second.redirected() ||
-                nit->second.seq.empty()) {
-                continue;
-            }
-            depths.push_back(nit->second.avg_core_count());
+        depths.reserve(graph.active_set.size());
+        for (u64 nid : graph.active_set) {
+            const auto *node = graph.find(nid);
+            if (node == nullptr || node->seq.empty()) continue;
+            depths.push_back(node->avg_core_count());
         }
         double depth_median = 0.0;
         if (!depths.empty()) {
@@ -1180,23 +1161,16 @@ struct assembler {
         }
         constexpr double kPileupMaxMult = 3.0;
         const double pileup_cap = depth_median * kPileupMaxMult;
-        const auto fwds =
-            GraphCleaning::build_live_fwd(dbgi.dbg, dbgi.active_set);
-        auto live = [&](u64 nid) {
-            auto it = dbgi.dbg.find(nid);
-            return (it == dbgi.dbg.end() || it->second.redirected())
-                       ? dbgi.dbg.end()
-                       : it;
-        };
+        const auto fwds = GraphCleaning::build_live_fwd(graph);
 
         gtl::flat_hash_set<u64> dropped;
-        for (u64 id : dbgi.active_set) {
-            auto it = live(id);
-            if (it == dbgi.dbg.end()) continue;
-            const auto &node = it->second;
-            const u64 span = static_cast<u64>(node.seq.size());
+        for (u64 id : graph.active_set) {
+            const auto *node = graph.find(id);
+            if (node == nullptr) continue;
+            const u64 span = static_cast<u64>(node->seq.size());
             if (span == 0 || span >= min_cores) continue;
-            if (node.prev.size() != 1 || live(node.prev[0]) == dbgi.dbg.end()) {
+            if (node->prev.size() != 1 ||
+                graph.find(node->prev[0]) == nullptr) {
                 continue;
             }
             auto fit = fwds.find(id);
@@ -1204,13 +1178,12 @@ struct assembler {
             u64 long_succs = 0;
             bool continues = false;
             for (u64 q : fit->second) {
-                auto qit = live(q);
-                if (qit == dbgi.dbg.end() || qit->second.seq.empty()) continue;
-                if (static_cast<u64>(qit->second.seq.size()) >= min_cores) {
+                const auto *succ = graph.find(q);
+                if (succ == nullptr || succ->seq.empty()) continue;
+                if (static_cast<u64>(succ->seq.size()) >= min_cores) {
                     ++long_succs;
                 }
-                if (pileup_cap <= 0.0 ||
-                    qit->second.avg_core_count() <= pileup_cap) {
+                if (pileup_cap <= 0.0 || succ->avg_core_count() <= pileup_cap) {
                     continues = true;
                 }
             }
@@ -1262,15 +1235,33 @@ static bool dump_dbg(const std::string &path, const dbg_index &dbg) {
     return true;
 }
 
-// Layout of the cleaned DBG, written as the output GFA.
+// Returns memory freed by a stage to the OS; glibc otherwise keeps most of it
+// in its arenas while the next stage runs.
+static void return_freed_memory() {
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
+}
+
+// The cleaned graph in compact form: the node table, mostly redirect stubs,
+// is freed; its fragment arenas move to the compact graph with the sequences.
+static std::unique_ptr<unitig_graph> compact_graph(
+    std::unique_ptr<dbg_index> graph, int threads) {
+    auto unitigs = std::make_unique<unitig_graph>(*graph, threads);
+    graph.reset();
+    return_freed_memory();
+    return unitigs;
+}
+
+// Layout of the cleaned graph, written as the output GFA.
 static bool write_output_gfa(const asm_config &cfg, assembler &as,
-                             dbg_index &dbg) {
+                             const unitig_graph &graph) {
     FILE *out = fopen(cfg.output.c_str(), "w");
     if (!out) {
         fprintf(stderr, "Cannot open output: %s\n", cfg.output.c_str());
         return false;
     }
-    layout_graph_emit::emit_ultra_merged_graph(as, dbg, out);
+    layout_graph_emit::emit_ultra_merged_graph(as, graph, out);
     fclose(out);
     return true;
 }
@@ -1286,9 +1277,9 @@ int run_assembly(const asm_config &cfg) {
     INIT_TIMERS(HIFI_ASSEMBLY);
 
     assembler as(cfg);
-    NoDestructor<dbg_index> dbg_storage(cfg.bloom.false_positive_rate,
-                                        cfg.bloom.projected_count, cfg.seed);
-    dbg_index &dbg = *dbg_storage;
+    auto graph = std::make_unique<dbg_index>(
+        cfg.bloom.false_positive_rate, cfg.bloom.projected_count, cfg.seed);
+    dbg_index &dbg = *graph;
     if (auto r = as.construct_dbg(dbg); !r) {
         fprintf(stderr, "%s Terminating.\n", r.error().c_str());
         return 1;
@@ -1313,10 +1304,16 @@ int run_assembly(const asm_config &cfg) {
         return 1;
     }
 
-    if (!write_output_gfa(cfg, as, dbg)) return 1;
+    auto unitigs = compact_graph(std::move(graph), cfg.threads.work);
+    IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph compaction");
+
+    if (!write_output_gfa(cfg, as, *unitigs)) return 1;
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Merged/Printed");
 
+    // Never torn down: the process exits once the GFA is written, so
+    // teardown is pure overhead.
+    (void)unitigs.release();
     return 0;
 }
 
@@ -1326,13 +1323,13 @@ static size_t total_bases(const gtl::vector<SequenceContainerType> &seqs) {
     return sum;
 }
 
-// Sequences of the segments a layout of the cleaned DBG would write: the
+// Sequences of the segments a layout of the cleaned graph would write: the
 // input of the next pass.
-static gtl::vector<SequenceContainerType> collect_segments(assembler &as,
-                                                           dbg_index &dbg) {
+static gtl::vector<SequenceContainerType> collect_segments(
+    assembler &as, const unitig_graph &graph) {
     gtl::vector<SequenceContainerType> segments;
     layout_graph_emit::build_merged_graph(
-        as, dbg, "Segment collection",
+        as, graph, "Segment collection",
         [&](const layout_graph_emit::supernode_vec &supernodes,
             const layout_graph_emit::edge_map &) {
             segments = layout_graph_emit::segment_sequences(supernodes,
@@ -1400,15 +1397,19 @@ static int run_passes(const asm_config &cfg) {
         IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
                            "Graph cleaning");
 
+        if (last && cfg.print_prelayout_graph &&
+            !dump_dbg(cfg.output + ".bi.gfa", dbg)) {
+            return 1;
+        }
+        auto unitigs = compact_graph(std::move(graph), cfg.threads.work);
+        IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                           "Graph compaction");
+
         if (!last) {
-            segments = collect_segments(as, dbg);
-            dbg.clear_parallel(cfg.threads.work);
-            graph.reset();
-#if defined(__GLIBC__)
-            // Return the freed pass graph to the OS; glibc otherwise keeps
-            // most of it in its arenas while the next pass runs.
-            malloc_trim(0);
-#endif
+            segments = collect_segments(as, *unitigs);
+            unitigs->clear_parallel(cfg.threads.work);
+            unitigs.reset();
+            return_freed_memory();
             IF_TIME_CHECKPOINT(!cfg.silent, MULTIPASS, stderr,
                                "pass %zu/%zu (%d:%d) done", p + 1, n,
                                as.lcp_level, as.lcmer_l);
@@ -1420,11 +1421,7 @@ static int run_passes(const asm_config &cfg) {
             continue;
         }
 
-        if (cfg.print_prelayout_graph &&
-            !dump_dbg(cfg.output + ".bi.gfa", dbg)) {
-            return 1;
-        }
-        if (!write_output_gfa(cfg, as, dbg)) return 1;
+        if (!write_output_gfa(cfg, as, *unitigs)) return 1;
         IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
                            "Merged/Printed");
         IF_TIME_CHECKPOINT(!cfg.silent, MULTIPASS, stderr,
@@ -1434,8 +1431,8 @@ static int run_passes(const asm_config &cfg) {
             fprintf(stderr, "[multipass] pass %zu/%zu: output written\n", p + 1,
                     n);
         // The last graph is never torn down: the process exits once the GFA
-        // is written, so teardown is pure overhead (as NoDestructor).
-        (void)graph.release();
+        // is written, so teardown is pure overhead.
+        (void)unitigs.release();
     }
     return 0;
 }

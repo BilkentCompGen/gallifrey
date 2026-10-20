@@ -131,6 +131,10 @@ struct popped_bubble {
     float kept_depth;           // lowest avg_core_count on the kept path
     SequenceContainerType alt;  // best removed path, source to sink
 };
+// The word_arenas of one graph's fragments, one per worker id
+// (0..MAXIMUM_WORK_THREADS).
+using fragment_arenas = std::array<word_arena, MAXIMUM_WORK_THREADS + 1>;
+
 template <class BFT = DefaultBF>
 struct dbg_index_base {
     using BloomFilterType = BFT;
@@ -238,37 +242,37 @@ struct dbg_index_base {
 
     // The words of node fragments, from the arena of the inserting worker
     // (`tid` 0..MAXIMUM_WORK_THREADS, one thread per id at a time). Nodes
-    // borrow them; they are freed with the index or by clear_parallel.
+    // borrow them; they are freed with the index or by clear_parallel,
+    // unless take_fragment_arenas hands them to a new owner first.
     word_arena &fragment_arena(int tid) { return arenas_[tid]; }
+    // Moves the arenas out (unitig_graph takes them with the fragments).
+    fragment_arenas take_fragment_arenas() { return std::move(arenas_); }
 
    private:
-    std::array<word_arena, MAXIMUM_WORK_THREADS + 1> arenas_;
+    fragment_arenas arenas_;
 
    public:
     // dbg_index(const dbg_index &other)
     static constexpr u64 lcmer_id(const LCmer &l) { return l.value(); }
 
-    lci_type get(const LCmer &l) const {
-        u64 id = lcmer_id(l);
+    lci_type get(const LCmer &l) const { return resolve(lcmer_id(l)); }
+    // The node an lcmer id ends at after following redirects, or empty when
+    // the chain ends at an erased node. Only path simplification redirects:
+    // it merges a chain into the chain's most upstream node, which is live
+    // and not merged in the same sweep, and a redirected node is never merged
+    // or revived again. Each redirect thus points to a node redirected in a
+    // later sweep or never, so every chain ends, after at most one hop per
+    // sweep.
+    lci_type resolve(u64 id) const {
         gtl::LockableBaseImpl<gtl::NullMutex>::DoNothing no_lock;
         auto &dbg_nc = const_cast<dbg_map_t &>(dbg);
-        auto h = dbg_nc.hash(id);
-        auto it = dbg_nc.find(id, h, no_lock);
-        if (it == dbg_nc.end()) {
-            return lci_type::empty();
+        auto it = dbg_nc.find(id, dbg_nc.hash(id), no_lock);
+        while (it != dbg_nc.end() && it->second.redirected()) {
+            id = it->second.redirect_to;
+            it = dbg_nc.find(id, dbg_nc.hash(id), no_lock);
         }
-        for (int hop = 0;
-             hop < 128 && it != dbg_nc.end() && it->second.redirected();
-             ++hop) {
-            const u64 next = it->second.redirect_to;
-            if (next == 0 || next == id) {
-                return lci_type::empty();
-            }
-            id = next;
-            h = dbg_nc.hash(id);
-            it = dbg_nc.find(id, h, no_lock);
-        }
-        return it == dbg_nc.end() ? lci_type::empty() : lci_type{id};
+        if (it == dbg_nc.end()) return lci_type::empty();
+        return {id};
     }
     // Sets every node's forward_edge_count to the number of nodes listing it
     // in prev. Submaps are split across threads; nothing is inserted or
@@ -363,6 +367,176 @@ struct dbg_index_base {
 
 using dbg_index = dbg_index_base<DefaultBF>;
 using dbg_index_light = dbg_index_base<MockBF>;
+
+// The cleaned graph in compact form. After cleaning nearly every node-table
+// entry is a redirect stub, kept only so that an lcmer id resolves to its
+// final unitig (dbg_index::resolve). unitig_graph holds the live unitigs in a
+// dense array and the lcmer ids in a sorted index that answers every id as
+// resolve() did, so the node table is freed once cleaning ends.
+struct unitig_graph {
+    using lci_type = dbg_index::lci_type;
+    struct unitig {
+        u64 id;
+        unsigned core_count;
+        dbg_index::fragment_list seq;  // words borrowed from arenas_
+        dbg_index::prev_list prev;     // ids of live unitigs
+
+        double avg_core_count() const {
+            if (seq.empty()) return 0.0;
+            return (double)core_count / seq.size();
+        }
+    };
+
+    // Live unitigs in node-table iteration order; those of node-table submap
+    // s are [submap_begin[s], submap_begin[s + 1]).
+    gtl::vector<unitig> unitigs;
+    gtl::vector<size_t> submap_begin;
+    // Cleaning results read by later stages (see dbg_index_base); active_set
+    // may still name erased nodes, so look ids up with find().
+    gtl::btree_set<u64> active_set;
+    gtl::vector<popped_bubble> popped_bubbles;
+    double locus_limit = 0.0;
+    size_t node_table_size = 0;  // entries of the node table, stubs included
+
+    // Takes the live unitigs and the cleaning results out of `cleaned` and
+    // clears its node table; the caller then frees `cleaned`.
+    unitig_graph(dbg_index &cleaned, int threads);
+
+    // The live unitig `id`, or nullptr.
+    const unitig *find(u64 id) const {
+        auto it = index_of_.find(id);
+        if (it == index_of_.end()) return nullptr;
+        return &unitigs[it->second];
+    }
+    // What dbg_index::resolve(key) returned on the cleaned node table.
+    lci_type resolve(u64 key) const {
+        auto it = std::lower_bound(keys_.begin(), keys_.end(), key);
+        if (it == keys_.end() || *it != key) return lci_type::empty();
+        return {unitigs[targets_[it - keys_.begin()]].id};
+    }
+    lci_type get(const LCmer &l) const {
+        return resolve(dbg_index::lcmer_id(l));
+    }
+
+    // fn(tid, unitig) for every unitig on `threads` threads. Thread tid takes
+    // the unitigs of submaps tid, tid + threads, ...: the split for_each_map
+    // made over the node table, so per-thread results combine as before.
+    template <class F>
+    void for_each_unitig(int threads, const F &fn) const {
+        std::vector<std::thread> workers;
+        for (int tid = 0; tid < threads; ++tid) {
+            workers.emplace_back([&, tid] {
+                for (size_t s = tid; s + 1 < submap_begin.size(); s += threads)
+                    for (size_t u = submap_begin[s]; u < submap_begin[s + 1];
+                         ++u)
+                        fn(tid, unitigs[u]);
+            });
+        }
+        for (auto &worker : workers) worker.join();
+    }
+
+    // Frees everything; the fragments, many small allocations, are freed one
+    // unitig per task on up to `threads` threads.
+    void clear_parallel(int threads) {
+        parallel_for(unitigs.size(), threads, [&](size_t u) {
+            unitigs[u].seq = dbg_index::fragment_list{};
+        });
+        *this = unitig_graph{};
+    }
+
+   private:
+    unitig_graph() = default;
+
+    gtl::flat_hash_map<u64, u32> index_of_;  // live id -> position in unitigs
+    // Every lcmer id that resolves to a node, sorted, and per id that node's
+    // position in unitigs.
+    gtl::vector<u64> keys_;
+    gtl::vector<u32> targets_;
+    // The arenas holding the unitigs' fragment words, taken over from the
+    // node table: they live and die with this graph.
+    fragment_arenas arenas_;
+};
+
+inline unitig_graph::unitig_graph(dbg_index &cleaned, int threads)
+    : active_set(std::move(cleaned.active_set)),
+      popped_bubbles(std::move(cleaned.popped_bubbles)),
+      locus_limit(cleaned.locus_limit),
+      node_table_size(cleaned.dbg.size()) {
+    auto &dbg = cleaned.dbg;
+    const size_t submaps = dbg.subcnt();
+    // Live and total entries per submap, then their prefix sums.
+    submap_begin.assign(submaps + 1, 0);
+    gtl::vector<size_t> key_begin(submaps + 1, 0);
+    parallel_for(submaps, threads, [&](size_t s) {
+        dbg.with_submap(s, [&](const auto &set) {
+            for (const auto &node : set)
+                if (!node.second.redirected()) ++submap_begin[s + 1];
+            key_begin[s + 1] = set.size();
+        });
+    });
+    for (size_t s = 0; s < submaps; ++s) {
+        submap_begin[s + 1] += submap_begin[s];
+        key_begin[s + 1] += key_begin[s];
+    }
+    unitigs.resize(submap_begin.back());
+    keys_.resize(key_begin.back());
+    parallel_for(submaps, threads, [&](size_t s) {
+        dbg.with_submap(s, [&](const auto &set) {
+            size_t u = submap_begin[s];
+            size_t k = key_begin[s];
+            for (const auto &node : set) {
+                keys_[k++] = node.first;
+                if (!node.second.redirected()) unitigs[u++].id = node.first;
+            }
+        });
+    });
+    index_of_.reserve(unitigs.size());
+    for (size_t u = 0; u < unitigs.size(); ++u)
+        index_of_.emplace(unitigs[u].id, static_cast<u32>(u));
+
+    // Resolve every id through the node table; kNoNode marks the ids that
+    // resolve to no node until they are dropped.
+    constexpr u32 kNoNode = std::numeric_limits<u32>::max();
+    assert(unitigs.size() < kNoNode);
+    std::sort(keys_.begin(), keys_.end());
+    targets_.resize(keys_.size());
+    constexpr size_t kKeysPerTask = size_t{1} << 16;  // amortizes the hand-out
+    parallel_for((keys_.size() + kKeysPerTask - 1) / kKeysPerTask, threads,
+                 [&](size_t task) {
+                     const size_t end =
+                         std::min(keys_.size(), (task + 1) * kKeysPerTask);
+                     for (size_t i = task * kKeysPerTask; i < end; ++i) {
+                         auto it = index_of_.find(cleaned.resolve(keys_[i]).id);
+                         targets_[i] = kNoNode;
+                         if (it != index_of_.end()) targets_[i] = it->second;
+                     }
+                 });
+    size_t kept = 0;
+    for (size_t i = 0; i < keys_.size(); ++i) {
+        if (targets_[i] == kNoNode) continue;
+        keys_[kept] = keys_[i];
+        targets_[kept++] = targets_[i];
+    }
+    keys_.resize(kept);
+    targets_.resize(kept);
+    keys_.shrink_to_fit();
+    targets_.shrink_to_fit();
+
+    parallel_for(submaps, threads, [&](size_t s) {
+        dbg.with_submap_m(s, [&](auto &set) {
+            size_t u = submap_begin[s];
+            for (auto &node : set) {
+                if (node.second.redirected()) continue;
+                unitig &dst = unitigs[u++];
+                dst.core_count = node.second.counts.core_count;
+                dst.seq = std::move(node.second.seq);
+                dst.prev = std::move(node.second.prev);
+            }
+        });
+    });
+    arenas_ = cleaned.take_fragment_arenas();
+    cleaned.clear_parallel(threads);
+}
 
 struct FlatDBG {
     struct Node {
@@ -893,25 +1067,37 @@ struct GraphCleaning {
 
     // Live forward adjacency: successor lists derived from prev edges,
     // sorted per node for deterministic arm walking. Iterates the live
-    // active_set, not the whole dbg map.
+    // active_set, not the whole graph. `live(id)` is the live node `id` or
+    // nullptr.
+    template <class Live>
     static gtl::flat_hash_map<u64, gtl::vector<u64>> build_live_fwd(
-        const dbg_map_t &dbg, const gtl::btree_set<u64> &active_set) {
+        const gtl::btree_set<u64> &active_set, const Live &live) {
         gtl::flat_hash_map<u64, gtl::vector<u64>> fwd;
         fwd.reserve(active_set.size());
         for (u64 id : active_set) {
-            auto it = dbg.find(id);
-            if (it == dbg.end() || it->second.redirected()) continue;
-            for (u64 p : it->second.prev) {
-                auto pit = dbg.find(p);
-                if (pit != dbg.end() && !pit->second.redirected()) {
-                    fwd[p].push_back(id);
-                }
+            const auto *node = live(id);
+            if (node == nullptr) continue;
+            for (u64 p : node->prev) {
+                if (live(p) != nullptr) fwd[p].push_back(id);
             }
         }
         for (auto &[_, succs] : fwd) {
             std::sort(succs.begin(), succs.end());
         }
         return fwd;
+    }
+    static gtl::flat_hash_map<u64, gtl::vector<u64>> build_live_fwd(
+        const dbg_map_t &dbg, const gtl::btree_set<u64> &active_set) {
+        return build_live_fwd(active_set, [&](u64 id) -> const bidbg_val * {
+            auto it = dbg.find(id);
+            if (it == dbg.end() || it->second.redirected()) return nullptr;
+            return &it->second;
+        });
+    }
+    static gtl::flat_hash_map<u64, gtl::vector<u64>> build_live_fwd(
+        const unitig_graph &graph) {
+        return build_live_fwd(graph.active_set,
+                              [&](u64 id) { return graph.find(id); });
     }
 
     // Bubble search from fork `sid` (Onodera et al. 2013): a node is visited

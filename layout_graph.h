@@ -760,7 +760,7 @@ template <class AssemblerT>
 // counts to `seed_stats`.
 inline gtl::vector<gtl::vector<SequenceContainerType>>
 build_layout_sequence_from_nodes(
-    [[maybe_unused]] AssemblerT &as, dbg_index &dbg,
+    [[maybe_unused]] AssemblerT &as, const unitig_graph &graph,
     const gtl::vector<ultra_layout_node_info> &lnodes, u64 layout_idx,
     scd_seed_stats &seed_stats) {
     if (lnodes.empty()) return {};
@@ -769,10 +769,9 @@ build_layout_sequence_from_nodes(
     gtl::vector<lane_node> nodes;
     nodes.reserve(lnodes.size());
     for (const auto &n : lnodes) {
-        auto it = dbg.dbg.find(n.id);
-        if (it == dbg.dbg.end()) continue;
-        if (it->second.seq.empty()) continue;
-        nodes.push_back({n.id, n.from, n.to, n.ori, it->second.seq});
+        const auto *node = graph.find(n.id);
+        if (node == nullptr || node->seq.empty()) continue;
+        nodes.push_back({n.id, n.from, n.to, n.ori, node->seq});
     }
     if (nodes.empty()) return {};
 
@@ -912,7 +911,8 @@ using layout_seq_t = gtl::vector<layout_comp_seqs_t>;
 
 template <class AssemblerT>
 inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
-    AssemblerT &as, dbg_index &dbg, const gtl::vector<ultra_layout_job> &jobs) {
+    AssemblerT &as, const unitig_graph &graph,
+    const gtl::vector<ultra_layout_job> &jobs) {
     gtl::vector<layout_seq_t> out_seqs(jobs.size());
     if (jobs.empty()) return out_seqs;
 
@@ -938,12 +938,12 @@ inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
                     continue;
                 }
                 out_seqs[job_idx] = build_layout_sequence_from_nodes(
-                    as, dbg, jobs[job_idx].lnodes, jobs[job_idx].layout_idx,
+                    as, graph, jobs[job_idx].lnodes, jobs[job_idx].layout_idx,
                     stats);
             }
             while (job_queue.try_dequeue(job_idx)) {
                 out_seqs[job_idx] = build_layout_sequence_from_nodes(
-                    as, dbg, jobs[job_idx].lnodes, jobs[job_idx].layout_idx,
+                    as, graph, jobs[job_idx].lnodes, jobs[job_idx].layout_idx,
                     stats);
             }
         });
@@ -1233,22 +1233,21 @@ inline void build_layout_jobs(
 // subset whose connected component (over C-nodes) never touches a layout
 // boundary or an external non-layout node.
 inline gtl::flat_hash_set<u64> find_contained_cnodes(
-    dbg_index &dbg, const gtl::flat_hash_set<u64> &nodes_in_layouts,
+    const unitig_graph &graph, const gtl::flat_hash_set<u64> &nodes_in_layouts,
     const gtl::flat_hash_map<u64, uint8_t> &node_boundary_mask,
     const gtl::flat_hash_map<u64, bool> &node_layout_ori,
     gtl::flat_hash_set<u64> &candidate_set) {
     // Successor map from prev edges.
     gtl::flat_hash_map<u64, gtl::vector<u64>> successors;
-    for (const auto &[to_id, to_node] : dbg.dbg) {
-        if (to_node.redirected()) continue;
-        for (u64 from_id : to_node.prev) successors[from_id].push_back(to_id);
+    for (const auto &to_node : graph.unitigs) {
+        for (u64 from_id : to_node.prev)
+            successors[from_id].push_back(to_node.id);
     }
 
-    for (u64 node_id : dbg.active_set) {
+    for (u64 node_id : graph.active_set) {
         if (nodes_in_layouts.contains(node_id)) continue;
-        auto it = dbg.dbg.find(node_id);
-        if (it == dbg.dbg.end()) continue;
-        if (it->second.redirected() || it->second.seq.empty()) continue;
+        const auto *node = graph.find(node_id);
+        if (node == nullptr || node->seq.empty()) continue;
         candidate_set.insert(node_id);
     }
 
@@ -1270,9 +1269,8 @@ inline gtl::flat_hash_set<u64> find_contained_cnodes(
             u64 cur = bfs.front();
             bfs.pop();
             component.push_back(cur);
-            auto db_it = dbg.dbg.find(cur);
 
-            for (u64 pred_id : db_it->second.prev) {
+            for (u64 pred_id : graph.find(cur)->prev) {
                 if (candidate_set.contains(pred_id)) {
                     if (!cc_visited.contains(pred_id)) {
                         cc_visited.insert(pred_id);
@@ -1328,8 +1326,7 @@ inline gtl::flat_hash_set<u64> find_contained_cnodes(
 
     size_t contained_bp = 0;
     for (u64 node_id : contained_nodes) {
-        auto it = dbg.dbg.find(node_id);
-        for (const auto &s : it->second.seq) contained_bp += s.len;
+        for (const auto &s : graph.find(node_id)->seq) contained_bp += s.len;
     }
     if (!contained_nodes.empty() || standalone_components > 0)
         std::fprintf(stderr,
@@ -1344,18 +1341,17 @@ inline gtl::flat_hash_set<u64> find_contained_cnodes(
 // Parallel over the DBG; boundary/orientation gate which edges survive. Edges
 // between nodes of the same supernode are dropped (except self-loops).
 inline edge_map aggregate_superedges(
-    dbg_index &dbg, const gtl::flat_hash_map<u64, u64> &node_to_super,
+    const unitig_graph &graph,
+    const gtl::flat_hash_map<u64, u64> &node_to_super,
     const gtl::flat_hash_set<u64> &nodes_in_layouts,
     const gtl::flat_hash_map<u64, bool> &node_layout_ori,
     const gtl::flat_hash_map<u64, uint8_t> &node_boundary_mask, int nthreads) {
     if (nthreads < 1) nthreads = 1;
     gtl::vector<std::map<edge_key, edge_agg>> per_thread(nthreads);
 
-    for_each_map(
-        dbg.dbg,
-        [&](int tid, const auto &entry) {
-            const auto &[to_id, to_node] = entry;
-            if (to_node.redirected()) return;
+    graph.for_each_unitig(
+        nthreads, [&](int tid, const unitig_graph::unitig &to_node) {
+            const u64 to_id = to_node.id;
             auto to_super_it = node_to_super.find(to_id);
             if (to_super_it == node_to_super.end()) return;
 
@@ -1403,8 +1399,7 @@ inline edge_map aggregate_superedges(
                 }
                 agg.count++;
             }
-        },
-        nthreads);
+        });
 
     edge_map merged_edges;
     for (auto &local : per_thread)
@@ -1994,9 +1989,10 @@ struct EndJoin {
 // infinity and their ends are not joined.
 class segment_end_depth {
    public:
-    segment_end_depth(const supernode_vec &supernodes, const dbg_index &dbg,
+    segment_end_depth(const supernode_vec &supernodes,
+                      const unitig_graph &graph,
                       const gtl::vector<ultra_layout_job> &layout_jobs)
-        : supernodes_(supernodes), dbg_(dbg) {
+        : supernodes_(supernodes), graph_(graph) {
         for (const auto &job : layout_jobs) job_of_[job.layout_idx] = &job;
         for (u64 sid = 0; sid < supernodes.size(); ++sid)
             if (supernodes[sid].is_layout)
@@ -2025,15 +2021,13 @@ class segment_end_depth {
 
    private:
     double node_depth(u64 id) const {
-        auto it = dbg_.dbg.find(id);
-        if (it == dbg_.dbg.end() || it->second.redirected() ||
-            it->second.seq.empty())
-            return 0.0;
-        return it->second.avg_core_count();
+        const auto *node = graph_.find(id);
+        if (node == nullptr) return 0.0;
+        return node->avg_core_count();  // 0 without sequence
     }
 
     const supernode_vec &supernodes_;
-    const dbg_index &dbg_;
+    const unitig_graph &graph_;
     gtl::flat_hash_map<u64, const ultra_layout_job *> job_of_;
     gtl::flat_hash_map<u64, u64> first_segment_of_;  // layout -> segment
 };
@@ -2062,14 +2056,14 @@ inline gtl::vector<SequenceContainerType> segment_sequences(
     return out;
 }
 
-// Layout and emission of the cleaned DBG: fold, layout supernodes, edge
+// Layout and emission of the cleaned graph: fold, layout supernodes, edge
 // aggregation, post-layout cleaning and end joins, then
 // `sink(supernodes, edges)` (`sink_name` labels its timing line).
 template <class AssemblerT, class Sink>
-inline void build_merged_graph(AssemblerT &as, dbg_index &dbg,
+inline void build_merged_graph(AssemblerT &as, const unitig_graph &graph,
                                const char *sink_name, Sink &&sink) {
     INIT_TIMERS(LayoutEmit);
-    auto [recig, layouts, dropped_crumbs] = as.fold_dbg_graph(dbg);
+    auto [recig, layouts, dropped_crumbs] = as.fold_dbg_graph(graph);
     TIME_CHECKPOINT(LayoutEmit, stderr, "fold_dbg_graph (%zu layouts)",
                     layouts.size());
 
@@ -2077,8 +2071,8 @@ inline void build_merged_graph(AssemblerT &as, dbg_index &dbg,
     gtl::flat_hash_map<u64, u64> node_to_super;
     gtl::flat_hash_set<u64> nodes_in_layouts;
     gtl::flat_hash_map<u64, uint8_t> node_boundary_mask;
-    node_to_super.reserve(dbg.active_set.size() + 8);
-    nodes_in_layouts.reserve(dbg.active_set.size() + 8);
+    node_to_super.reserve(graph.active_set.size() + 8);
+    nodes_in_layouts.reserve(graph.active_set.size() + 8);
 
     // Resolve per-node orientation up front (see resolve_layout_orientations).
     // A nonzero conflict count means the single-owner invariant was violated.
@@ -2098,7 +2092,7 @@ inline void build_merged_graph(AssemblerT &as, dbg_index &dbg,
                       node_boundary_mask);
 
     // ── Phase 2: build layout ("M") supernode sequences in parallel ─────
-    auto layout_seqs = build_layout_sequences_parallel(as, dbg, layout_jobs);
+    auto layout_seqs = build_layout_sequences_parallel(as, graph, layout_jobs);
     TIME_CHECKPOINT(LayoutEmit, stderr, "Build layout sequences");
     for (size_t i = 0; i < layout_jobs.size(); ++i) {
         const auto &job = layout_jobs[i];
@@ -2125,25 +2119,24 @@ inline void build_merged_graph(AssemblerT &as, dbg_index &dbg,
     //             as unitig ("C") supernodes ─────────────────────────────
     gtl::flat_hash_set<u64> candidate_set;
     auto contained_nodes =
-        find_contained_cnodes(dbg, nodes_in_layouts, node_boundary_mask,
+        find_contained_cnodes(graph, nodes_in_layouts, node_boundary_mask,
                               node_layout_ori, candidate_set);
     for (u64 node_id : candidate_set) {
         if (contained_nodes.contains(node_id)) continue;
         if (dropped_crumbs.contains(node_id)) continue;
-        auto it = dbg.dbg.find(node_id);
-        if (it == dbg.dbg.end()) continue;
+        const auto *node = graph.find(node_id);
+        if (node == nullptr) continue;
         const u64 sid = supernodes.size();
         supernodes.push_back(
-            {"C" + std::to_string(node_id), {}, &it->second.seq, false, node_id});
+            {"C" + std::to_string(node_id), {}, &node->seq, false, node_id});
         node_to_super[node_id] = sid;
     }
     TIME_CHECKPOINT(LayoutEmit, stderr, "Supernode creation");
 
     // ── Phase 4: aggregate inter-supernode edges ────────────────────────
-    edge_map merged_edges =
-        aggregate_superedges(dbg, node_to_super, nodes_in_layouts,
-                             node_layout_ori, node_boundary_mask,
-                             as.threads.work);
+    edge_map merged_edges = aggregate_superedges(
+        graph, node_to_super, nodes_in_layouts, node_layout_ori,
+        node_boundary_mask, as.threads.work);
     TIME_CHECKPOINT(LayoutEmit, stderr, "Edge aggregation");
 
     // ── Phase 5: post-layout graph cleaning ─────────────────────────────
@@ -2152,8 +2145,8 @@ inline void build_merged_graph(AssemblerT &as, dbg_index &dbg,
 
     // ── Phase 5b: join overlapping dead ends of one locus ───────────────
     if (as.end_joins) {
-        EndJoin::run(as, supernodes, merged_edges, dbg.locus_limit,
-                     segment_end_depth(supernodes, dbg, layout_jobs));
+        EndJoin::run(as, supernodes, merged_edges, graph.locus_limit,
+                     segment_end_depth(supernodes, graph, layout_jobs));
         TIME_CHECKPOINT(LayoutEmit, stderr, "End joins");
     }
 
@@ -2164,17 +2157,18 @@ inline void build_merged_graph(AssemblerT &as, dbg_index &dbg,
 }
 
 template <class AssemblerT>
-inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
+inline void emit_ultra_merged_graph(AssemblerT &as, const unitig_graph &graph,
+                                    FILE *out) {
     build_merged_graph(
-        as, dbg, "GFA writing",
+        as, graph, "GFA writing",
         [&](const supernode_vec &supernodes, const edge_map &merged_edges) {
             write_gfa(supernodes, merged_edges, as.threads.work, out);
         });
 }
 
 template <class AssemblerT>
-inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg) {
-    emit_ultra_merged_graph(as, dbg, stdout);
+inline void emit_ultra_merged_graph(AssemblerT &as, const unitig_graph &graph) {
+    emit_ultra_merged_graph(as, graph, stdout);
 }
 
 }  // namespace layout_graph_emit
