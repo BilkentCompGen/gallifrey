@@ -1,20 +1,20 @@
 #ifndef NIBBLE2BASE_HPP
 #define NIBBLE2BASE_HPP
 
+#include <htslib/sam.h>
+
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <gtl/vector.hpp>
 #include <iterator>
-
-#include "kmer_bits.h"
-
+#include <memory>
+#include <span>
+#include <vector>
 
 #include "htslib/hts.h"
-
-#include <htslib/sam.h>
-
-
+#include "kmer_bits.h"
 
 static const uint8_t decode4_tbl[16] = {
     /* 0 */ 0,
@@ -237,11 +237,47 @@ struct CrumbledSubSeq {
     }
 };
 
+// Bump allocator for 2-bit words: zeroed storage carved from large blocks,
+// all freed together by release() or the destructor. Not thread-safe; each
+// inserting thread gets its own (dbg_index_base::fragment_arena). Aligned to
+// the x86-64 cache line so that arenas of concurrent workers, kept side by
+// side, never share a line.
+class alignas(64) word_arena {
+   public:
+    [[nodiscard]] uint64_t *allocate(size_t words) {
+        if (words > left_) {
+            left_ = std::max(words, kBlockWords);
+            blocks_.push_back(std::make_unique<uint64_t[]>(left_));
+            cur_ = blocks_.back().get();
+        }
+        uint64_t *out = cur_;
+        cur_ += words;
+        left_ -= words;
+        return out;
+    }
+    // Frees every block; storage handed out before is invalid afterwards.
+    void release() noexcept {
+        std::vector<std::unique_ptr<uint64_t[]>>().swap(blocks_);
+        cur_ = nullptr;
+        left_ = 0;
+    }
+
+   private:
+    // 1 MiB blocks: thousands of fragments per malloc, while the unused tail
+    // of one block per thread stays negligible against a graph.
+    static constexpr size_t kBlockWords = size_t{1} << 17;
+    std::vector<std::unique_ptr<uint64_t[]>> blocks_;
+    uint64_t *cur_ = nullptr;
+    size_t left_ = 0;
+};
 
 // 64-bit packed variant: 32 bases per word, 2 bits per base.
 struct CrumbledSubSeq64 {
-    size_t len : 58;
+    size_t len : 57;
     int skip_first_n : 6;  // offset within first word in bases (0-31)
+    // The words belong to a word_arena, not to this fragment: destruction
+    // and assignment leave them alone. Moves carry the flag along.
+    size_t borrowed : 1 = 0;
     uint64_t *data;
     uint64_t origin_node;
     struct from_ascii {};
@@ -329,10 +365,27 @@ struct CrumbledSubSeq64 {
           skip_first_n(static_cast<uint8_t>(skip_bases & 63)),
           data(new uint64_t[storage_size(length + skip_bases)]()),
           origin_node(0) {}
+    // As above, with the words from `arena` (the fragment borrows them).
+    CrumbledSubSeq64(size_t length, uint8_t skip_bases,
+                     word_arena &arena) noexcept
+        : len(length),
+          skip_first_n(static_cast<uint8_t>(skip_bases & 63)),
+          borrowed(1),
+          data(arena.allocate(storage_size(length + skip_bases))),
+          origin_node(0) {}
+    CrumbledSubSeq64(const uint8_t *nibbles, size_t from, size_t to,
+                     uint64_t origin_node, word_arena &arena) noexcept
+        : CrumbledSubSeq64(to - from, static_cast<uint8_t>(from & 31), arena) {
+        this->origin_node = origin_node;
+        pack_range(data, from & ~static_cast<size_t>(31), to, [&](size_t idx) {
+            return static_cast<uint64_t>(seq_nt16_int[bam_seqi(nibbles, idx)]);
+        });
+    }
     CrumbledSubSeq64() noexcept : CrumbledSubSeq64(0, 0) {}
     CrumbledSubSeq64(CrumbledSubSeq64 &&other) noexcept
         : len(other.len),
           skip_first_n(other.skip_first_n),
+          borrowed(other.borrowed),
           data(other.data),
           origin_node(other.origin_node) {
         other.data = nullptr;
@@ -361,9 +414,12 @@ struct CrumbledSubSeq64 {
         }
     }
 
-    CrumbledSubSeq64(const gtl::vector<CrumbledSubSeq64> &subseqs, size_t start_idx, size_t from,
-                     size_t to)
-        : len{to - from}, skip_first_n{0}, data{new uint64_t[storage_size(to - from + 32)]()}, origin_node{0} {
+    CrumbledSubSeq64(std::span<const CrumbledSubSeq64> subseqs,
+                     size_t start_idx, size_t from, size_t to)
+        : len{to - from},
+          skip_first_n{0},
+          data{new uint64_t[storage_size(to - from + 32)]()},
+          origin_node{0} {
         size_t sub_len = (from < to) ? (to - from) : 0;
         if (sub_len == 0 || subseqs.empty()) {
             return;
@@ -400,9 +456,12 @@ struct CrumbledSubSeq64 {
             cumulative += frag.len;
         }
     };
-    CrumbledSubSeq64(const gtl::vector<CrumbledSubSeq64> &subseqs, size_t from,
+    CrumbledSubSeq64(std::span<const CrumbledSubSeq64> subseqs, size_t from,
                      size_t to)
-        : len{to - from}, skip_first_n{0}, data{new uint64_t[storage_size(to - from + 32)]()}, origin_node{0} {
+        : len{to - from},
+          skip_first_n{0},
+          data{new uint64_t[storage_size(to - from + 32)]()},
+          origin_node{0} {
         size_t sub_len = (from < to) ? (to - from) : 0;
         if (sub_len == 0 || subseqs.empty()) {
             return;
@@ -454,12 +513,15 @@ struct CrumbledSubSeq64 {
     }
     CrumbledSubSeq64(const CrumbledSubSeq64 &other) = delete;
     CrumbledSubSeq64 &operator=(const CrumbledSubSeq64 &other) = delete;
-    ~CrumbledSubSeq64() { delete[] data; }
+    ~CrumbledSubSeq64() {
+        if (!borrowed) delete[] data;
+    }
     CrumbledSubSeq64 &operator=(CrumbledSubSeq64 &&other) noexcept {
         if (this != &other) {
-            delete[] data;
+            if (!borrowed) delete[] data;
             data = other.data;
             skip_first_n = other.skip_first_n;
+            borrowed = other.borrowed;
             len = other.len;
             origin_node = other.origin_node;
             other.data = nullptr;
@@ -630,6 +692,8 @@ struct CrumbledSubSeq64 {
         return rc;
     }
 };
+static_assert(sizeof(CrumbledSubSeq64) == 24,
+              "the borrowed flag shares the length word");
 struct seqveciterator {
     size_t idx = 0;
     size_t bidx = 0;

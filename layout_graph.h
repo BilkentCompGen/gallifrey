@@ -144,7 +144,7 @@ inline constexpr i64 BOUNDARY_FUZZ_SPAN_DIV = 20;
 // Reverse-complement a sequence-fragment vector: reverse fragment order and
 // reverse-complement each fragment (so the whole sequence is reverse-complemented).
 inline gtl::vector<SequenceContainerType> reverse_complement_seqs(
-    const gtl::vector<SequenceContainerType> &seqs) {
+    fragment_span seqs) {
     gtl::vector<SequenceContainerType> rev;
     rev.reserve(seqs.size());
     for (auto it = seqs.rbegin(); it != seqs.rend(); ++it)
@@ -179,7 +179,7 @@ struct lane_node {
     i64 from = 0;
     i64 to = 0;
     bool is_forward_lane = true;
-    const gtl::vector<SequenceContainerType> *raw_seqs = nullptr;
+    fragment_span raw_seqs;  // the node's fragments (borrowed)
 };
 
 struct scd_node {
@@ -209,8 +209,8 @@ using scd_adj_t = gtl::vector<std::pair<uint32_t, uint16_t>>;
 // One pass over the bases keeps the polynomial hash of all homopolymers so
 // far; each core's first and last base record it, and the span's hash is the
 // difference of the two prefixes. Memory is O(cores), not O(bases).
-inline gtl::vector<u64> core_hpc_fingerprints(
-    const gtl::vector<SequenceContainerType> &seqs, const lcp_read &lr) {
+inline gtl::vector<u64> core_hpc_fingerprints(fragment_span seqs,
+                                              const lcp_read &lr) {
     constexpr u64 mul = 0x9E3779B97F4A7C15ULL;
     const size_t M = lr.pos.size();
     // (base, 2k) for core k's first base, (base, 2k + 1) for its last.
@@ -772,7 +772,7 @@ build_layout_sequence_from_nodes(
         auto it = dbg.dbg.find(n.id);
         if (it == dbg.dbg.end()) continue;
         if (it->second.seq.empty()) continue;
-        nodes.push_back({n.id, n.from, n.to, n.ori, &it->second.seq});
+        nodes.push_back({n.id, n.from, n.to, n.ori, it->second.seq});
     }
     if (nodes.empty()) return {};
 
@@ -797,9 +797,9 @@ build_layout_sequence_from_nodes(
         if (n_fw <= 1 && n_rv <= 1 && (n_fw + n_rv) <= 2) {
             size_t fw_len = 0, rv_len = 0;
             if (fi != SIZE_MAX)
-                for (const auto &s : *nodes[fi].raw_seqs) fw_len += s.len;
+                for (const auto &s : nodes[fi].raw_seqs) fw_len += s.len;
             if (ri != SIZE_MAX)
-                for (const auto &s : *nodes[ri].raw_seqs) rv_len += s.len;
+                for (const auto &s : nodes[ri].raw_seqs) rv_len += s.len;
 
             size_t pick = (fw_len >= rv_len && fi != SIZE_MAX) ? fi : ri;
             if (pick == SIZE_MAX) return {};
@@ -807,10 +807,10 @@ build_layout_sequence_from_nodes(
             gtl::vector<gtl::vector<SequenceContainerType>> out;
             out.reserve(1);
             if (!nodes[pick].is_forward_lane) {
-                out.push_back(reverse_complement_seqs(*nodes[pick].raw_seqs));
+                out.push_back(reverse_complement_seqs(nodes[pick].raw_seqs));
                 return out;
             }
-            const auto &raw = *nodes[pick].raw_seqs;
+            const auto &raw = nodes[pick].raw_seqs;
             gtl::vector<SequenceContainerType> result;
             result.reserve(1);
             result.emplace_back(raw.begin(), raw.end());
@@ -831,19 +831,19 @@ build_layout_sequence_from_nodes(
     if (as.strict_layout_labels) core_fps.resize(nodes.size());
 
     for (size_t ci : sorted_idx) {
-        const auto &raw = *nodes[ci].raw_seqs;
+        const fragment_span raw = nodes[ci].raw_seqs;
         gtl::vector<SequenceContainerType> rev_seqs;
-        const gtl::vector<SequenceContainerType> *seqs_ptr = &raw;
+        fragment_span seqs = raw;
         if (!nodes[ci].is_forward_lane) {
             rev_seqs = reverse_complement_seqs(raw);
-            seqs_ptr = &rev_seqs;
+            seqs = rev_seqs;
         }
 
         auto [lr, cseqs] = AssemblerT::build_lr_cores_with_seqs(
-            *seqs_ptr, as.syncmer_functor, as.lcp_level, lps_buf);
+            seqs, as.syncmer_functor, as.lcp_level, lps_buf);
 
         if (lr.cores.empty()) {
-            const auto &frags = *seqs_ptr;
+            const fragment_span frags = seqs;
             size_t total_len = 0;
             for (const auto &f : frags) total_len += f.len;
             if (total_len == 0) continue;
@@ -861,7 +861,7 @@ build_layout_sequence_from_nodes(
             continue;
         }
         if (as.strict_layout_labels)
-            core_fps[ci] = core_hpc_fingerprints(*seqs_ptr, lr);
+            core_fps[ci] = core_hpc_fingerprints(seqs, lr);
         contig_lr[ci] = std::move(lr);
         contig_core_seqs[ci] = std::move(cseqs);
         contig_order.push_back(ci);
@@ -977,13 +977,14 @@ inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
 struct supernode_out {
     std::string name;
     gtl::vector<SequenceContainerType> owned_seqs;  // layout seqs (owned)
-    const gtl::vector<SequenceContainerType> *ref_seqs =
+    const dbg_index::fragment_list *ref_seqs =
         nullptr;  // unitig seqs (borrowed)
     bool is_layout;
     u64 aux_id;
 
-    const gtl::vector<SequenceContainerType> &seqs() const {
-        return ref_seqs ? *ref_seqs : owned_seqs;
+    fragment_span seqs() const {
+        if (ref_seqs) return *ref_seqs;
+        return owned_seqs;
     }
 };
 

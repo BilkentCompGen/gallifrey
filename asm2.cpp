@@ -246,7 +246,8 @@ struct assembler {
             insert_lcmer_helper(ll, i, dbgi, [&](u64 key) {
                 return SequenceContainerType(
                     lr.data, lr.pos[i + lcmer_l - 2].second,
-                    lr.pos[i + lcmer_l - 1].second, key);
+                    lr.pos[i + lcmer_l - 1].second, key,
+                    dbgi.fragment_arena(thread_id));
             });
         }
     }
@@ -329,11 +330,11 @@ struct assembler {
     }
 
     // Bases [a, b) of the range seq[from, to) in the orientation it was
-    // parsed in, as a node fragment.
+    // parsed in, as a node fragment with its words from `arena`.
     static SequenceContainerType range_fragment(
         const SequenceContainerType &seq, size_t from, size_t to, bool rc,
-        size_t a, size_t b, u64 origin_node) {
-        SequenceContainerType out{b - a, 0};
+        size_t a, size_t b, u64 origin_node, word_arena &arena) {
+        SequenceContainerType out{b - a, 0, arena};
         out.origin_node = origin_node;
         for (size_t j = a; j < b; ++j) {
             const size_t bit = (j - a) * 2;
@@ -352,7 +353,7 @@ struct assembler {
                                        const SequenceContainerType &seq,
                                        size_t from, size_t to, bool rc,
                                        dbg_index_base<BFT> &dbgi, int lcmer_l,
-                                       gtl::vector<uint64_t> &ll) {
+                                       gtl::vector<uint64_t> &ll, int tid) {
         if (lr.cores.size() < static_cast<size_t>(lcmer_l + 2)) return 0;
         uint64_t unused_index = 0;
         LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
@@ -368,7 +369,8 @@ struct assembler {
             insert_lcmer_helper<BFT, true>(ll, i, dbgi, [&](u64 key) {
                 return range_fragment(seq, from, to, rc,
                                       lr.pos[i + lcmer_l - 2].second,
-                                      lr.pos[i + lcmer_l - 1].second, key);
+                                      lr.pos[i + lcmer_l - 1].second, key,
+                                      dbgi.fragment_arena(tid));
             });
         }
         return ll.size() - 2;
@@ -404,7 +406,7 @@ struct assembler {
         std::atomic<size_t> windows{0};
         gtl::vector<std::thread> workers;
         for (int t = 0; t < threads.work; ++t) {
-            workers.emplace_back([&]() {
+            workers.emplace_back([&, t]() {
                 lps str = {0, 0, 0, 0};
                 charsi rle;
                 pos_scratch pos;
@@ -417,7 +419,7 @@ struct assembler {
                         parse_range(segments[s], from, to, rc, lcp_level, &str,
                                     syncmer_functor, rle, pos, lr);
                         n += process_seeded_cores(lr, segments[s], from, to, rc,
-                                                  dbgi, lcmer_l, ll);
+                                                  dbgi, lcmer_l, ll, t);
                     }
                 }
                 windows += n;
@@ -781,7 +783,7 @@ struct assembler {
         CoreSpan target_span;
     };
 
-    static auto build_lr_cores(const gtl::vector<SequenceContainerType> &seqs,
+    static auto build_lr_cores(fragment_span seqs,
                                const SyncmerType &syncmer_functor,
                                int lcp_level, lps &str) -> lcp_read {
         lcp_read lr;
@@ -797,9 +799,9 @@ struct assembler {
         return lr;
     }
 
-    static auto build_lr_cores_with_seqs(
-        const gtl::vector<SequenceContainerType> &seqs,
-        const SyncmerType &syncmer_functor, int lcp_level, lps &str)
+    static auto build_lr_cores_with_seqs(fragment_span seqs,
+                                         const SyncmerType &syncmer_functor,
+                                         int lcp_level, lps &str)
         -> std::pair<lcp_read, gtl::vector<SequenceContainerType>> {
         lcp_read lr;
         lr.clear();
@@ -884,10 +886,9 @@ struct assembler {
         return {std::move(lr), std::move(core_seqs)};
     }
 
-    static auto build_rev_lr_cores(
-        const gtl::vector<SequenceContainerType> &seqs,
-        const SyncmerType &syncmer_functor, int lcp_level, lps &str)
-        -> lcp_read {
+    static auto build_rev_lr_cores(fragment_span seqs,
+                                   const SyncmerType &syncmer_functor,
+                                   int lcp_level, lps &str) -> lcp_read {
         lcp_read lr;
         lr.clear();
 
@@ -905,9 +906,9 @@ struct assembler {
         return lr;
     }
 
-    static auto build_rev_lr_cores_with_seqs(
-        const gtl::vector<SequenceContainerType> &seqs,
-        const SyncmerType &syncmer_functor, int lcp_level, lps &str)
+    static auto build_rev_lr_cores_with_seqs(fragment_span seqs,
+                                             const SyncmerType &syncmer_functor,
+                                             int lcp_level, lps &str)
         -> std::pair<lcp_read, gtl::vector<SequenceContainerType>> {
         lcp_read lr;
         lr.clear();

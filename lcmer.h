@@ -23,6 +23,9 @@
 #include "nibble2base.hpp"
 #include "syncmer.h"
 using SequenceContainerType = CrumbledSubSeq64;
+// The fragments of one sequence, in order, wherever they are stored (a node's
+// fragment list, a layout's vector).
+using fragment_span = std::span<const SequenceContainerType>;
 
 struct lcp_bit_type {
     uint64_t hi;
@@ -948,9 +951,9 @@ inline uint64_t parse1_2bit_syncmers(const uint8_t *data, int64_t len,
     return parse1_rle_syncmers(rle_buf.data, pos_buf.data, rle_len, len, str,
                                syncmer_functor);
 }
-inline uint64_t parse1_CrumbledSubSeqs_syncmers(
-    const gtl::vector<SequenceContainerType> &sseqs, struct lps *str,
-    const auto &syncmer_functor) {
+inline uint64_t parse1_CrumbledSubSeqs_syncmers(fragment_span sseqs,
+                                                struct lps *str,
+                                                const auto &syncmer_functor) {
     if (sseqs.empty()) {
         fprintf(stderr, "Error: Empty sequence list\n");
         return 0;
@@ -1010,8 +1013,7 @@ inline void prepare_lps(lps *lps_ptr, size_t len) {
         }
     }
 }
-inline void init_lps_crumbled(lps *lps_ptr,
-                              const gtl::vector<SequenceContainerType> &sseqs,
+inline void init_lps_crumbled(lps *lps_ptr, fragment_span sseqs,
                               const auto &syncmer_functor) {
     size_t len = 0;
 

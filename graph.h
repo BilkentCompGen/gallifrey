@@ -26,6 +26,7 @@
 #include "asm.h"
 #include "bloomfilter.h"
 #include "config.h"
+#include "inline_vec.h"
 #include "lcmer.h"
 
 template <class map, class F>
@@ -114,7 +115,6 @@ consteval int_type nextpowerof2(int_type v) {
     return v;
 }
 
-
 using u64 = uint64_t;
 using i64 = int64_t;
 using u32 = uint32_t;
@@ -137,6 +137,8 @@ struct dbg_index_base {
     static constexpr u64 lcindex_increment =
         nextpowerof2((u64)MAXIMUM_WORK_THREADS);
     using mutex_type = std::mutex;
+    using fragment_list = inline_vec<SequenceContainerType, 1>;
+    using prev_list = inline_vec<u64, 1>;
     struct bidbg_val {
         struct counts_t {
             unsigned core_count;
@@ -146,16 +148,14 @@ struct dbg_index_base {
             : redirected_flag(false),
               seeded(false),
               forward_edge_count(0),
-              counts{core_count},
-              seq{},
-              prev{} {}
+              counts{core_count} {}
         bidbg_val(unsigned core_count, u64 prev)
             : redirected_flag(false),
               seeded(false),
               forward_edge_count(0),
-              counts{core_count},
-              seq{},
-              prev{prev} {}
+              counts{core_count} {
+            this->prev.push_back(prev);
+        }
 
         bool redirected_flag;
         // Holds a window of an earlier pass's segment (--multipass): admitted
@@ -173,7 +173,10 @@ struct dbg_index_base {
             u64 redirect_to;
         };
 
-        gtl::vector<SequenceContainerType> seq;
+        // The node's sequence: one fragment per absorbed lcmer node, in path
+        // order. A fresh node has one, held inline; its words come from the
+        // inserting thread's fragment_arena.
+        fragment_list seq;
 
         bool redirected() const { return redirected_flag; }
         // An absorbed node keeps only its redirect target: seq and prev are
@@ -181,11 +184,12 @@ struct dbg_index_base {
         void mark_redirected(u64 to) {
             redirected_flag = true;
             redirect_to = to;
-            gtl::vector<SequenceContainerType>().swap(seq);
-            gtl::vector<u64>().swap(prev);
+            seq = fragment_list{};
+            prev = prev_list{};
         }
 
-        gtl::vector<u64> prev;
+        // Predecessor node ids; a node usually has one, held inline.
+        prev_list prev;
         void emplace_prev(u64 val) {
             if (val == 0) return;
             auto it = std::find(prev.begin(), prev.end(), val);
@@ -202,6 +206,8 @@ struct dbg_index_base {
             return seq.empty() ? 0.0 : (double)counts.core_count / seq.size();
         }
     };
+    // One fragment and one predecessor inline keep a node at one 64 B value.
+    static_assert(sizeof(bidbg_val) == 64);
     using dbg_map_t = gtl::parallel_flat_hash_map<
         u64, bidbg_val, std::hash<u64>, gtl::priv::hash_default_eq<u64>,
         std::allocator<std::pair<const u64, bidbg_val>>, HT_SHARD_BC,
@@ -230,6 +236,15 @@ struct dbg_index_base {
                    uint64_t seed)
         : bf{std::in_place, false_positive_rate, projected_count, seed} {}
 
+    // The words of node fragments, from the arena of the inserting worker
+    // (`tid` 0..MAXIMUM_WORK_THREADS, one thread per id at a time). Nodes
+    // borrow them; they are freed with the index or by clear_parallel.
+    word_arena &fragment_arena(int tid) { return arenas_[tid]; }
+
+   private:
+    std::array<word_arena, MAXIMUM_WORK_THREADS + 1> arenas_;
+
+   public:
     // dbg_index(const dbg_index &other)
     static constexpr u64 lcmer_id(const LCmer &l) { return l.value(); }
 
@@ -280,6 +295,7 @@ struct dbg_index_base {
     void clear_parallel(int threads) {
         parallel_for(dbg.subcnt(), threads,
                      [&](size_t submap) { dbg.clear(submap); });
+        for (auto &a : arenas_) a.release();
         gtl::btree_set<u64>().swap(active_set);
         gtl::vector<popped_bubble>().swap(popped_bubbles);
     }
@@ -636,13 +652,13 @@ struct GraphCleaning {
 
         current->second.forward_edge_count = first_fec;
         current->second.counts.core_count += cc_sum;
+        size_t merged_frags = current->second.seq.size();
+        for (const auto &m : merged) merged_frags += m->second.seq.size();
+        current->second.seq.reserve(merged_frags);
         for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
-            // for (auto &seq : (*it)->second.seq)
-            gtl::vector<SequenceContainerType> &seqs = (*it)->second.seq;
-            for (auto sit = seqs.begin(); sit != seqs.end(); ++sit) {
-                current->second.seq.emplace_back(std::move(*sit));
+            for (auto &frag : (*it)->second.seq) {
+                current->second.seq.push_back(std::move(frag));
             }
-            seqs.clear();
             current->second.seeded |= (*it)->second.seeded;
             (*it)->second.mark_redirected(current->first);
         }
@@ -1259,7 +1275,8 @@ struct GraphCleaning {
                     if (auto f = fwd.find(xid); f != fwd.end())
                         branches = f->second;
                 } else {
-                    branches = xit->second.prev;
+                    branches.assign(xit->second.prev.begin(),
+                                    xit->second.prev.end());
                 }
                 branches.erase(
                     std::remove_if(branches.begin(), branches.end(),
