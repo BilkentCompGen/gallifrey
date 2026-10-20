@@ -66,8 +66,11 @@ static void parallel_for(size_t n, int threads, F &&fn) {
 // A queue holding at most `capacity` items, with the dequeue interface of
 // moodycamel::BlockingConcurrentQueue. enqueue() blocks on a semaphore of free
 // slots while the queue is full (no spinning or polling); every dequeue frees
-// a slot. The blocks for `capacity` items from `producers` producer threads
-// are allocated up front, so enqueue() never allocates.
+// a slot. Blocks for `capacity` items from `producers` producer threads are
+// allocated up front, but enqueue() can still allocate one: a block returns
+// to the pool only once all of its items are dequeued, so partly dequeued
+// blocks can use up the pool. Blocks allocated this way are freed when
+// emptied.
 template <class T>
 class bounded_queue {
    public:

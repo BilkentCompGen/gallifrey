@@ -97,10 +97,12 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(gtl)
 
+# v1.0.5 orders an implicit-producer block's reuse after every dequeue from
+# it (upstream 0d54c67, e74b07d); v1.0.4 left that a data race.
 FetchContent_Declare(
     concurrentqueue
     GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
-    GIT_TAG v1.0.4
+    GIT_TAG v1.0.5
 )
 FetchContent_MakeAvailable(concurrentqueue)
 
