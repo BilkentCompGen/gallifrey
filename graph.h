@@ -81,6 +81,10 @@ class bounded_queue {
         free_slots_.wait();
         queue_.enqueue(std::move(item));
     }
+    void wait_dequeue(T &item) {
+        queue_.wait_dequeue(item);
+        free_slots_.signal();
+    }
     template <class Rep, class Period>
     bool wait_dequeue_timed(T &item,
                             std::chrono::duration<Rep, Period> timeout) {

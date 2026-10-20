@@ -9,6 +9,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <map>
@@ -1416,62 +1417,42 @@ inline edge_map aggregate_superedges(
     return merged_edges;
 }
 
+// One supernode's complete `S` line (prefix + sequence + tags) in `dst`;
+// `chs` is the caller's conversion scratch.
+inline void format_s_line(const supernode_out &sn, charsi &chs,
+                          std::string &dst) {
+    const auto &sn_seqs = sn.seqs();
+    size_t total_len = 0;
+    for (const auto &s : sn_seqs) total_len += s.len;
+
+    dst.reserve(total_len + sn.name.size() + 48);
+    dst.append("S\t");
+    dst.append(sn.name);
+    dst.push_back('\t');
+
+    const size_t seq_start = dst.size();
+    for (const auto &s : sn_seqs) {
+        // No gap fabrication: skip zero-length entries rather than emitting a
+        // run of 'N'.
+        if (s.len == 0) continue;
+        chs.require(s.len + 32);
+        s.convert_to_ascii((char *)chs.data);
+        dst.append((const char *)chs.data, s.len);
+    }
+    if (dst.size() == seq_start) dst.push_back('*');  // no seq
+
+    dst.append("\tTP:Z:");
+    dst.append(sn.is_layout ? "layout" : "unitig");
+    dst.push_back('\t');
+    dst.append(sn.is_layout ? "LY" : "UI");
+    dst.append(":i:");
+    dst.append(std::to_string(static_cast<uint64_t>(sn.aux_id)));
+    dst.push_back('\n');
+}
+
 // ── Phase: format supernode S-lines (parallel) and write the GFA ────────
 inline void write_gfa(const supernode_vec &supernodes,
                       const edge_map &merged_edges, int nthreads, FILE *out) {
-    // Each worker converts a supernode's sequences to ASCII and builds the
-    // complete `S` line (prefix + sequence + tags) off the serial write path.
-    const size_t n_super = supernodes.size();
-    gtl::vector<std::string> super_line_strs(n_super);
-    {
-        int nthreads_print = nthreads < 1 ? 1 : nthreads;
-        nthreads_print = std::min<int>(nthreads_print, n_super);
-
-        std::atomic<size_t> next_idx{0};
-        gtl::vector<std::thread> workers;
-        workers.reserve(nthreads_print);
-        for (int t = 0; t < nthreads_print; ++t) {
-            workers.emplace_back([&]() {
-                charsi local_chs;
-                while (true) {
-                    size_t i = next_idx.fetch_add(1);
-                    if (i >= n_super) break;
-                    const auto &sn = supernodes[i];
-                    if (sn.name.empty()) continue;  // removed
-                    const auto &sn_seqs = sn.seqs();
-                    std::string &dst = super_line_strs[i];
-                    size_t total_len = 0;
-                    for (const auto &s : sn_seqs) total_len += s.len;
-
-                    dst.reserve(total_len + sn.name.size() + 48);
-                    dst.append("S\t");
-                    dst.append(sn.name);
-                    dst.push_back('\t');
-
-                    const size_t seq_start = dst.size();
-                    for (const auto &s : sn_seqs) {
-                        // No gap fabrication: skip zero-length entries rather
-                        // than emitting a run of 'N'.
-                        if (s.len == 0) continue;
-                        local_chs.require(s.len + 32);
-                        s.convert_to_ascii((char *)local_chs.data);
-                        dst.append((const char *)local_chs.data, s.len);
-                    }
-                    if (dst.size() == seq_start) dst.push_back('*');  // no seq
-
-                    dst.append("\tTP:Z:");
-                    dst.append(sn.is_layout ? "layout" : "unitig");
-                    dst.push_back('\t');
-                    dst.append(sn.is_layout ? "LY" : "UI");
-                    dst.append(":i:");
-                    dst.append(std::to_string(static_cast<uint64_t>(sn.aux_id)));
-                    dst.push_back('\n');
-                }
-            });
-        }
-        for (auto &w : workers) w.join();
-    }
-
     // Accumulate output into a 4 MiB buffer, flushing in large fwrites.
     // Oversized lines (megabase S-lines) bypass the buffer with a direct write.
     constexpr size_t FLUSH_AT = size_t{1} << 22;  // 4 MiB
@@ -1493,10 +1474,39 @@ inline void write_gfa(const supernode_vec &supernodes,
         wbuf.append(data, len);
     };
 
-    for (size_t i = 0; i < n_super; ++i) {
-        if (super_line_strs[i].empty()) continue;  // removed
-        emit(super_line_strs[i].data(), super_line_strs[i].size());
+    // S lines in supernode order, formatted off the serial write path: worker
+    // t formats supernodes t, t + T, t + 2T, ... and hands each line to its
+    // own one-line queue; this thread writes line i from queue i mod T. A
+    // worker runs at most one line ahead of the writer, so about 2T lines
+    // exist at once rather than the whole graph as ASCII. Removed supernodes
+    // (empty name) are skipped on both sides.
+    const size_t n_super = supernodes.size();
+    const size_t n_workers =
+        std::min<size_t>(static_cast<size_t>(std::max(1, nthreads)), n_super);
+    std::deque<bounded_queue<std::string>> lines;
+    for (size_t t = 0; t < n_workers; ++t) {
+        lines.emplace_back(/*capacity=*/1, /*producers=*/1);
     }
+    gtl::vector<std::thread> workers;
+    workers.reserve(n_workers);
+    for (size_t t = 0; t < n_workers; ++t) {
+        workers.emplace_back([&, t]() {
+            charsi chs;
+            for (size_t i = t; i < n_super; i += n_workers) {
+                if (supernodes[i].name.empty()) continue;
+                std::string line;
+                format_s_line(supernodes[i], chs, line);
+                lines[t].enqueue(std::move(line));
+            }
+        });
+    }
+    for (size_t i = 0; i < n_super; ++i) {
+        if (supernodes[i].name.empty()) continue;
+        std::string line;
+        lines[i % n_workers].wait_dequeue(line);
+        emit(line.data(), line.size());
+    }
+    for (auto &w : workers) w.join();
 
     char lbuf[1024];
     for (const auto &[_, edge] : merged_edges) {
