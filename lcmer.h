@@ -883,6 +883,22 @@ inline uint64_t sel_mask64(const uint8_t *s) {
 #endif
 }
 
+// Grows str's core array to at least `need` cores; growing by 1.5x keeps
+// reallocations rare across calls.
+inline void lps_reserve(lps *str, int64_t need) {
+    if (str->capacity >= need) return;
+    const int64_t cap =
+        std::max<int64_t>(need, str->capacity + str->capacity / 2);
+    struct core *p =
+        (struct core *)realloc(str->cores, cap * sizeof(struct core));
+    if (p == nullptr) {
+        fprintf(stderr, "lps_reserve: out of memory\n");
+        abort();
+    }
+    str->cores = p;
+    str->capacity = static_cast<int>(cap);
+}
+
 inline uint64_t parse1_rle_syncmers(const uint8_t *rle_data,
                                     const uint32_t *rle_pos, int64_t rle_len,
                                     int64_t seq_len, struct lps *str,
@@ -904,24 +920,12 @@ inline uint64_t parse1_rle_syncmers(const uint8_t *rle_data,
     syncmer_functor.select_live(rle_data, rle_len, scratch);
     const uint8_t *q = scratch.codes();
     const uint32_t kmask = static_cast<uint32_t>((1ULL << (2 * k)) - 1);
-    // Room for the selected k-mers only (a fraction of the windows); growing
-    // by 1.5x keeps reallocations rare across reads.
+    // Room for the selected k-mers only (a fraction of the windows).
     int64_t selected = 0;
     for (int64_t base = 0; base < rle_len; base += kBlock)
         selected += std::popcount(sel_mask64(sel + base));
-    if (str->capacity <=
-        selected) {  // init_lps_crumbled asserts size < capacity
-        const int64_t newcap =
-            std::max<int64_t>(selected + 1, str->capacity + str->capacity / 2);
-        struct core *p =
-            (struct core *)realloc(str->cores, newcap * sizeof(struct core));
-        if (p == nullptr) {
-            fprintf(stderr, "parse1_rle_syncmers: out of memory\n");
-            abort();
-        }
-        str->cores = p;
-        str->capacity = static_cast<int>(newcap);
-    }
+    lps_reserve(str,
+                selected + 1);  // init_lps_crumbled asserts size < capacity
     int core_index = 0;
     auto *cores = str->cores;
     for (int64_t base = 0; base < rle_len; base += kBlock) {
@@ -951,42 +955,44 @@ inline uint64_t parse1_2bit_syncmers(const uint8_t *data, int64_t len,
     return parse1_rle_syncmers(rle_buf.data, pos_buf.data, rle_len, len, str,
                                syncmer_functor);
 }
+// Level-1 cores of bases [from, to) of the concatenated fragments, with
+// positions in whole-sequence coordinates: the RLE stream of the range is
+// windowed with the same code as the read path. A run is NOT restarted when
+// the next fragment begins with the run's base; the range's first run starts
+// at `from`, and a k-mer ending in its last run ends at `to`.
 inline uint64_t parse1_CrumbledSubSeqs_syncmers(fragment_span sseqs,
+                                                size_t from, size_t to,
                                                 struct lps *str,
                                                 const auto &syncmer_functor) {
     if (sseqs.empty()) {
         fprintf(stderr, "Error: Empty sequence list\n");
         return 0;
     }
-    // Materialize the RLE stream of the concatenated fragments in original
-    // (l_so_far) coordinates, then window it with the same code as the read
-    // path. A run is NOT restarted when the next fragment begins with the
-    // run's base.
-    size_t total_len = 0;
-    for (const auto &s : sseqs) total_len += s.len;
     gtl::vector<uint8_t> rle_data;
     gtl::vector<uint32_t> rle_pos;
-    rle_data.reserve(total_len);
-    rle_pos.reserve(total_len);
+    rle_data.reserve(to - from);
+    rle_pos.reserve(to - from);
     size_t l_so_far = 0;
     uint8_t prev_base = 255;
     for (const auto &s : sseqs) {
-        const size_t cap = s.len + s.skip_first_n;
-        for (size_t idx = s.skip_first_n; idx < cap; ++idx) {
-            const uint8_t b =
-                KmerViewOnCrumbs64<uint64_t>::base_at(s.data, idx);
+        if (l_so_far >= to) break;
+        // [lo, hi): the part of this fragment inside the range.
+        const size_t lo = std::max(from, l_so_far) - l_so_far;
+        const size_t hi = std::min(to, l_so_far + s.len) - l_so_far;
+        for (size_t i = lo; i < hi; ++i) {
+            const uint8_t b = KmerViewOnCrumbs64<uint64_t>::base_at(
+                s.data, s.skip_first_n + i);
             if (b != prev_base) {
                 rle_data.push_back(b);
-                rle_pos.push_back(
-                    static_cast<uint32_t>(l_so_far + idx - s.skip_first_n));
+                rle_pos.push_back(static_cast<uint32_t>(l_so_far + i));
                 prev_base = b;
             }
         }
         l_so_far += s.len;
     }
-    return parse1_rle_syncmers(
-        rle_data.data(), rle_pos.data(), static_cast<int64_t>(rle_data.size()),
-        static_cast<int64_t>(total_len), str, syncmer_functor);
+    return parse1_rle_syncmers(rle_data.data(), rle_pos.data(),
+                               static_cast<int64_t>(rle_data.size()),
+                               static_cast<int64_t>(to), str, syncmer_functor);
 }
 
 inline void prepare_lps(lps *lps_ptr, size_t len) {
@@ -1021,9 +1027,181 @@ inline void init_lps_crumbled(lps *lps_ptr, fragment_span sseqs,
         len += sseq.len;
     }
     prepare_lps(lps_ptr, len);
-    lps_ptr->size =
-        parse1_CrumbledSubSeqs_syncmers(sseqs, lps_ptr, syncmer_functor);
+    lps_ptr->size = parse1_CrumbledSubSeqs_syncmers(sseqs, 0, len, lps_ptr,
+                                                    syncmer_functor);
     assert(lps_ptr->size < lps_ptr->capacity);
+}
+
+// Bases per window of lps_parse_crumbled. Windows bound the per-thread parse
+// buffers (tens of bytes per base) independently of the sequence length,
+// except where an exact periodic stretch longer than the window forces the
+// window to double until it covers the stretch; the whole-sequence parse
+// holds that stretch anyway. The window is large against the re-parsed
+// overlap (the context of a few final-level cores), so re-parsing stays a
+// small fraction of the work.
+inline constexpr uint64_t kLpsWindowBases = uint64_t{1} << 17;
+
+// Window start of a core that no later window can be anchored on.
+inline constexpr uint64_t kLpsNoReq = UINT64_MAX;
+
+// A window's cores and the per-core req of lps_deepen_window, with that
+// function's scratch, reused across the windows of one lps_parse_crumbled.
+struct lps_window {
+    lps cores = {0, 0, 0, nullptr};
+    gtl::vector<uint64_t> req;
+    gtl::vector<uint64_t> starts, next_req;
+};
+
+// One lps_deepen1 step on a window's cores. `w.cores` holds a run of
+// consecutive whole-parse cores; `left_open`: the run does not start the
+// sequence.
+// - Right end: DCT compresses a core against its left neighbour, and parse3
+//   decides at position j from positions j-1..j+3 and the equal-core run
+//   after j. A decision that would need cores past the end is not taken
+//   (no LMAX in the last 3 positions, no RINT on a run that reaches the
+//   end) and nothing is taken after it, so the outputs of a prefix are a
+//   prefix of the outputs.
+// - Left end: position 0 is not compressed and is never a constituent, and
+//   only an LMAX at position 1 (parse3's begin) would read it; an SSEQ core
+//   is emitted only between two special cores. So the window can miss the
+//   whole parse's outputs before its first special core but emits no core
+//   the whole parse lacks: its outputs are again a run of consecutive
+//   whole-parse cores, and none is trimmed.
+// - req[i] is a window start that guarantees core i: a window starting
+//   there, or earlier, emits it if it reaches far enough right. Output i-1,
+//   if special, is decided at its first constituent first[i-1]; if an SSEQ
+//   core, output i is special and decided after it. A window holding input
+//   core first[i-1] - 2 decides both at position 2 or later, where every
+//   decision is the whole parse's, so req[i] is that core's req.
+// Returns lps_deepen1's result: false ends the parse (fewer than two cores).
+inline bool lps_deepen_window(lps_window &w, bool left_open) {
+    lps *s = &w.cores;
+    const int n = s->size;
+    w.starts.resize(n);
+    for (int j = 0; j < n; ++j) w.starts[j] = s->cores[j].start;
+    if (!lps_deepen1(s)) return false;
+    const int m = s->size;
+    w.next_req.resize(m);
+    uint32_t prev_first = 0;  // first[i - 1]; 0 before output 0
+    for (int i = 0, j = 0; i < m; ++i) {
+        uint64_t r = 0;  // a window starting at the sequence start emits it
+        if (prev_first >= 2) {
+            r = w.req[prev_first - 2];
+        } else if (left_open) {
+            r = kLpsNoReq;
+        }
+        w.next_req[i] = r;
+        // A compressed core takes its left neighbour's start, so an output
+        // starts where the input core before its first constituent starts.
+        while (j < n && w.starts[j] != s->cores[i].start) ++j;
+        if (j == n) {
+            fprintf(stderr,
+                    "lps_deepen_window: core start not found; the window "
+                    "parse expects strictly increasing core starts with "
+                    "lcptools' start convention\n");
+            abort();
+        }
+        prev_first = static_cast<uint32_t>(j + 1);
+    }
+    std::swap(w.req, w.next_req);
+    return true;
+}
+
+// Cores of bases [from, to) of `total`, deepened to `lcp_level` and trimmed
+// to those equal to the whole-sequence parse; req as in lps_deepen_window.
+// A level-1 core (an RLE k-mer) is exact unless its first run may be cut by
+// `from` or it ends at `to`; a window starting before it keeps it.
+inline void lps_parse_window(lps_window &w, fragment_span sseqs, uint64_t from,
+                             uint64_t to, uint64_t total,
+                             const auto &syncmer_functor, int lcp_level) {
+    const bool left_open = from > 0;
+    const bool right_open = to < total;
+    lps *win = &w.cores;
+    win->level = 1;
+    win->size =
+        parse1_CrumbledSubSeqs_syncmers(sseqs, from, to, win, syncmer_functor);
+    int lo = 0;
+    int hi = win->size;
+    if (left_open && hi > 0 && win->cores[0].start == from) lo = 1;
+    if (right_open && hi > lo && win->cores[hi - 1].end == to) --hi;
+    win->size = std::max(hi - lo, 0);
+    std::memmove(win->cores, win->cores + lo, win->size * sizeof(struct core));
+    w.req.resize(win->size);
+    for (int i = 0; i < win->size; ++i)
+        w.req[i] = std::max<uint64_t>(win->cores[i].start, 1) - 1;
+    while (win->level < lcp_level && lps_deepen_window(w, left_open)) {
+    }
+}
+
+inline void lps_append(lps *out, const struct core *src, int n) {
+    if (n <= 0) return;
+    lps_reserve(out, int64_t{out->size} + n);
+    std::memcpy(out->cores + out->size, src, n * sizeof(struct core));
+    out->size += n;
+}
+
+// Index of the first core after `anchor` among a window's cores, or -1 when
+// the window does not hold the anchor.
+inline int lps_after_anchor(const lps *win, const struct core &anchor) {
+    int i = 0;
+    while (i < win->size && win->cores[i].start < anchor.start) ++i;
+    if (i < win->size && win->cores[i].end == anchor.end &&
+        win->cores[i].label == anchor.label)
+        return i + 1;
+    return -1;
+}
+
+// Level-`lcp_level` cores of the concatenated fragments, equal to
+// init_lps_crumbled + lps_deepen on the whole sequence, parsed in windows of
+// `window` bases so the buffers do not grow with the sequence. Each later
+// window starts at the req of the last core appended to `out`, so it parses
+// that anchor core again and the two runs of cores join there. A window
+// that cannot reach past its anchor doubles until it can.
+inline void lps_parse_crumbled(lps *out, fragment_span sseqs,
+                               const auto &syncmer_functor, int lcp_level,
+                               uint64_t window = kLpsWindowBases) {
+    uint64_t total = 0;
+    for (const auto &s : sseqs) total += s.len;
+    lps_window w;
+    const lps &win = w.cores;
+    out->size = 0;
+    uint64_t from = 0;
+    uint64_t span = window;
+    for (;;) {
+        const uint64_t to = std::min(total, from + span);
+        lps_parse_window(w, sseqs, from, to, total, syncmer_functor, lcp_level);
+        int i = 0;
+        if (out->size > 0)
+            i = lps_after_anchor(&win, out->cores[out->size - 1]);
+        if (i < 0 && to < total) {
+            span *= 2;
+            continue;
+        }
+        if (i < 0) {
+            fprintf(stderr, "lps_parse_crumbled: windows do not join\n");
+            abort();
+        }
+        if (to == total) {
+            lps_append(out, win.cores + i, win.size - i);
+            out->level = win.level;
+            break;
+        }
+        int a = win.size - 1;
+        while (a >= i && w.req[a] == kLpsNoReq) --a;
+        if (a < i) {
+            span *= 2;
+            continue;
+        }
+        lps_append(out, win.cores + i, a + 1 - i);
+        // From the same start the window would repeat, holding nothing past a.
+        if (w.req[a] == from) {
+            span *= 2;
+        } else {
+            span = window;
+        }
+        from = w.req[a];
+    }
+    free_lps(&w.cores);
 }
 
 // Complement of a BAM nibble (A<->T, C<->G, anything else N).

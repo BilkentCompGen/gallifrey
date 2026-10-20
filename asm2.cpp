@@ -788,8 +788,7 @@ struct assembler {
         lcp_read lr;
         lr.clear();
 
-        init_lps_crumbled(&str, seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
+        lps_parse_crumbled(&str, seqs, syncmer_functor, lcp_level);
 
         for (int i = 0; i < str.size; ++i) {
             lr.cores.emplace_back(str.cores[i].label);
@@ -806,8 +805,7 @@ struct assembler {
         lr.clear();
         gtl::vector<SequenceContainerType> core_seqs;
 
-        init_lps_crumbled(&str, seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
+        lps_parse_crumbled(&str, seqs, syncmer_functor, lcp_level);
 
         if (str.size == 0 || seqs.empty()) {
             return {std::move(lr), std::move(core_seqs)};
@@ -895,8 +893,7 @@ struct assembler {
         for (auto it = seqs.rbegin(); it != seqs.rend(); ++it) {
             rev_seqs.emplace_back(it->reverse_complement());
         }
-        init_lps_crumbled(&str, rev_seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
+        lps_parse_crumbled(&str, rev_seqs, syncmer_functor, lcp_level);
 
         for (int i = 0; i < str.size; ++i) {
             lr.cores.emplace_back(str.cores[i].label);
@@ -919,8 +916,7 @@ struct assembler {
             rev_seqs.emplace_back(it->reverse_complement());
         }
 
-        init_lps_crumbled(&str, rev_seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
+        lps_parse_crumbled(&str, rev_seqs, syncmer_functor, lcp_level);
 
         if (str.size == 0 || rev_seqs.empty()) {
             return {std::move(lr), std::move(core_seqs)};
@@ -1021,8 +1017,7 @@ struct assembler {
                 for (auto it = node.seq.rbegin(); it != node.seq.rend(); ++it) {
                     rev_seqs.emplace_back(it->reverse_complement());
                 }
-                init_lps_crumbled(&str, rev_seqs, syncmer_functor);
-                lps_deepen(&str, lcp_level);
+                lps_parse_crumbled(&str, rev_seqs, syncmer_functor, lcp_level);
 
                 for (int i = 0; i < str.size; ++i) {
                     lr.cores.emplace_back(str.cores[i].label);
