@@ -2068,11 +2068,24 @@ struct EndJoin {
             free_ends(as, supernodes, edges, threads);
         stats.ends = ends.size();
         const auto overlaps = find_overlaps(ends, threads, stats);
+        // One log line per overlap rejected as recurring, naming its ends.
+        auto name = [&](const end_t &e) {
+            const std::string &segment = supernodes[e.sid].name;
+            if (e.at_end) return segment + ":end";
+            return segment + ":start";
+        };
         auto recurs = [&](const overlap_t &o) {
             const end_t &a = ends[o.a], &b = ends[o.b];
-            return overlap_recurs(as, supernodes[a.sid], a.at_end, o.trim_a,
-                                  o.trim_b) ||
-                   overlap_recurs(as, supernodes[b.sid], b.at_end, 0, o.trim_b);
+            const bool recurring =
+                overlap_recurs(as, supernodes[a.sid], a.at_end, o.trim_a,
+                               o.trim_b) ||
+                overlap_recurs(as, supernodes[b.sid], b.at_end, 0, o.trim_b);
+            if (recurring)
+                std::fprintf(stderr,
+                             "[end-join] rejected recurring %s %s: overlap "
+                             "%zu bp\n",
+                             name(a).c_str(), name(b).c_str(), o.trim_b);
+            return recurring;
         };
         const join_map joins =
             pick_joins(ends, overlaps, locus_limit, end_depth, recurs, stats);
