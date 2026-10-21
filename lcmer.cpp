@@ -12,20 +12,6 @@
 #include "nibble2base.hpp"
 #include "syncmer.h"
 
-int onehotto2bitDNA2(const uint8_t *data, char *ret) {
-    for (size_t i = 0;; ++i) {
-        int clz = std::countl_zero(static_cast<unsigned>(data[i]));
-        int ctz = std::countr_zero(static_cast<unsigned>(data[i]));
-
-        if (clz < 0 || ctz > 3) {
-            ret[i] = 0;
-            return i;
-        }
-        ret[2 * i] = kBaseLetters[27 - clz];
-        ret[2 * i + 1] = kBaseLetters[ctz];
-    }
-    return -1;
-}
 uint8_t *onehotto2bitDNA(uint8_t *data, size_t len) {
     uint8_t *ret = (uint8_t *)malloc(len);
     for (size_t i = 0; i < len / 2; ++i) {

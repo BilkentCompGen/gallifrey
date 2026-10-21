@@ -79,7 +79,6 @@ struct charsi_base {
 };
 using charsi = charsi_base<uint8_t, 2.0, 5>;
 using pos_scratch = charsi_base<uint32_t, 2.0, 5>;
-int onehotto2bitDNA2(const uint8_t *data, char *ret);
 struct sv {
     char *from;
     char *to;
@@ -368,14 +367,6 @@ struct KmerViewOnCrumbs64 {
         return index + 1;
     }
     constexpr int_type get() const noexcept { return value; }
-    char *to_string() const {
-        char *buffer = malloc(k + 1);
-        for (int i = 0; i < k; i++) {
-            buffer[i] = kBaseLetters[(value >> (2 * (k - i - 1))) & 3];
-        }
-        buffer[k] = '\0';
-        return buffer;
-    }
 };
 
 template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
