@@ -1542,8 +1542,10 @@ inline void write_gfa(const supernode_vec &supernodes,
 //     >= kMinIdentity.
 //  3. pick_joins: overlaps whose ends overlap nothing else, whose end
 //     unitigs are below the locus depth limit (one locus, not a collapsed
-//     repeat) and whose tails are not tandem-periodic (collapsed satellite
-//     arrays can read below the depth limit).
+//     repeat), whose tails are not tandem-periodic (collapsed satellite
+//     arrays can read below the depth limit) and whose overlap does not
+//     recur in either end's flank (an array period longer than the
+//     tandem test sees).
 //  4. merge_chains: every chain of joined segments becomes one segment.
 //  5. rewire_links: links of merged segments move to the merged segment.
 struct EndJoin {
@@ -1598,7 +1600,7 @@ struct EndJoin {
     // Counts for the log line.
     struct stats_t {
         size_t ends = 0, candidates = 0, aligned = 0, deep = 0, tandem = 0,
-               joined = 0;
+               recurring = 0, joined = 0;
     };
 
     static u64 pair_key(const lcp_read &lr, size_t c) {
@@ -1627,14 +1629,71 @@ struct EndJoin {
         return repeated_pair_fraction(window) >= kMaxRepeatedPairFraction;
     }
 
-    // Per-thread buffers for confirm, reused across candidates: the unpacked
-    // bases right and left of the seed in tail(a) and tail_rc(b), and the
-    // extensions' CIGARs.
-    struct confirm_scratch {
-        aligner dp;
-        gtl::vector<uint8_t> ra, rb, la, lb;
-        cigar right, left;
+    // Cores one LCP level below the assembly level: denser, so overlaps of a
+    // few hundred bases hold several.
+    template <class AssemblerT>
+    static lcp_read end_level_cores(
+        const AssemblerT &as, const gtl::vector<SequenceContainerType> &seqs) {
+        lps str = {0, 0, 0, 0};
+        lcp_read lr = AssemblerT::build_lr_cores(
+            seqs, as.syncmer_functor, std::max(1, as.lcp_level - 1), str);
+        free_lps(&str);
+        return lr;
+    }
+
+    // A seed extended both ways with the ksw2 aligner (align.h): query
+    // [q_lo, q_hi) aligned to target [t_lo, t_hi), with each extension's
+    // statistics.
+    struct extension_t {
+        size_t q_lo, q_hi, t_lo, t_hi;
+        align_stats right, left;
+
+        bool similar() const {
+            const uint32_t matches = right.matches + left.matches;
+            return matches >= kMinIdentity * (matches + right.nm() + left.nm());
+        }
     };
+
+    // The stretch [from, to) of `seq` that an extension may cover, with the
+    // seed at `seed`.
+    struct stretch_t {
+        const SequenceContainerType &seq;
+        size_t from, seed, to;
+    };
+
+    static extension_t extend_seed(const stretch_t &q, const stretch_t &t) {
+        // Per-thread buffers reused across seeds: the unpacked bases right
+        // and left of the seed, and the extensions' CIGARs.
+        struct scratch_t {
+            aligner dp;
+            gtl::vector<uint8_t> rq, rt, lq, lt;
+            cigar right, left;
+        };
+        thread_local scratch_t sc;
+        sc.rq.resize(q.to - q.seed);
+        q.seq.unpack_bytes(q.seed, q.to, sc.rq.data());
+        sc.rt.resize(t.to - t.seed);
+        t.seq.unpack_bytes(t.seed, t.to, sc.rt.data());
+        sc.right.clear();
+        int right_q = 0, right_t = 0;
+        sc.dp.extend(sc.rq.data(), int(sc.rq.size()), sc.rt.data(),
+                     int(sc.rt.size()), kBand, sc.right, right_q, right_t);
+        // Left of the seed on the reversed prefixes.
+        sc.lq.resize(q.seed - q.from);
+        q.seq.unpack_bytes_reversed(q.from, q.seed, sc.lq.data());
+        sc.lt.resize(t.seed - t.from);
+        t.seq.unpack_bytes_reversed(t.from, t.seed, sc.lt.data());
+        sc.left.clear();
+        int left_q = 0, left_t = 0;
+        sc.dp.extend(sc.lq.data(), int(sc.lq.size()), sc.lt.data(),
+                     int(sc.lt.size()), kBand, sc.left, left_q, left_t);
+        return {q.seed - left_q,
+                q.seed + right_q,
+                t.seed - left_t,
+                t.seed + right_t,
+                sc.dp.score_cigar(sc.right, sc.rq.data(), sc.rt.data()),
+                sc.dp.score_cigar(sc.left, sc.lq.data(), sc.lt.data())};
+    }
 
     // Step 1: the free ends with their tails and the tails' cores.
     template <class AssemblerT>
@@ -1670,14 +1729,9 @@ struct EndJoin {
                 ends.push_back(std::move(e));
             }
         }
-        const int level = std::max(1, as.lcp_level - 1);
         parallel_for(ends.size(), threads, [&](size_t i) {
-            lps str = {0, 0, 0, 0};
-            ends[i].tail_cores = AssemblerT::build_lr_cores(
-                ends[i].tail, as.syncmer_functor, level, str);
-            ends[i].tail_rc_cores = AssemblerT::build_lr_cores(
-                ends[i].tail_rc, as.syncmer_functor, level, str);
-            free_lps(&str);
+            ends[i].tail_cores = end_level_cores(as, ends[i].tail);
+            ends[i].tail_rc_cores = end_level_cores(as, ends[i].tail_rc);
         });
         return ends;
     }
@@ -1728,47 +1782,23 @@ struct EndJoin {
 
     // The overlap of ends a and b through `seed`, if extending it reaches
     // the end of tail(a) and the start of tail_rc(b) (both free ends, within
-    // kBand) at >= kMinIdentity.
+    // kBand) at >= kMinIdentity. Each tail is cut kBand past where the other
+    // ends, as the band cannot reach further.
     static std::optional<overlap_t> confirm(const gtl::vector<end_t> &ends,
                                             size_t b, const seed_t &seed) {
-        thread_local confirm_scratch sc;
         const SequenceContainerType &ta = ends[seed.a].tail[0];
         const SequenceContainerType &tb = ends[b].tail_rc[0];
         const size_t pa = seed.pos_a, pb = seed.pos_b;
-        // Right of the seed, toward the end of tail(a).
-        sc.ra.resize(ta.len - pa);
-        ta.unpack_bytes(pa, ta.len, sc.ra.data());
-        const size_t rb_to = std::min(tb.len, pb + sc.ra.size() + kBand);
-        sc.rb.resize(rb_to - pb);
-        tb.unpack_bytes(pb, rb_to, sc.rb.data());
-        sc.right.clear();
-        int right_b = 0, right_a = 0;
-        sc.dp.extend(sc.rb.data(), int(sc.rb.size()), sc.ra.data(),
-                     int(sc.ra.size()), kBand, sc.right, right_b, right_a);
-        if (pa + right_a + kBand < ta.len) return std::nullopt;
-        // Left of the seed on the reversed prefixes, toward the start of
-        // tail_rc(b).
-        size_t la_from = 0;
-        if (pa > pb + kBand) la_from = pa - pb - kBand;
-        sc.la.resize(pa - la_from);
-        ta.unpack_bytes_reversed(la_from, pa, sc.la.data());
-        sc.lb.resize(pb);
-        tb.unpack_bytes_reversed(0, pb, sc.lb.data());
-        sc.left.clear();
-        int left_b = 0, left_a = 0;
-        sc.dp.extend(sc.lb.data(), int(sc.lb.size()), sc.la.data(),
-                     int(sc.la.size()), kBand, sc.left, left_b, left_a);
-        if (size_t(left_b + kBand) < pb) return std::nullopt;
-        const align_stats r =
-            sc.dp.score_cigar(sc.right, sc.rb.data(), sc.ra.data());
-        const align_stats l =
-            sc.dp.score_cigar(sc.left, sc.lb.data(), sc.la.data());
-        const uint32_t matches = r.matches + l.matches;
-        if (matches < kMinIdentity * (matches + r.nm() + l.nm()))
+        const size_t b_to = std::min(tb.len, pb + (ta.len - pa) + kBand);
+        size_t a_from = 0;
+        if (pa > pb + kBand) a_from = pa - pb - kBand;
+        const extension_t x =
+            extend_seed({tb, 0, pb, b_to}, {ta, a_from, pa, ta.len});
+        if (x.t_hi + kBand < ta.len || x.q_lo > size_t(kBand) || !x.similar())
             return std::nullopt;
         // The join point is where the right extension ends: tail(a) keeps its
         // bases up to it, b drops its bases before it.
-        return overlap_t{seed.a, b, ta.len - (pa + right_a), pb + right_b};
+        return overlap_t{seed.a, b, ta.len - x.t_hi, x.q_hi};
     }
 
     // Step 2: every overlap, each end pair checked once (b < a; the other
@@ -1799,12 +1829,78 @@ struct EndJoin {
         return overlaps;
     }
 
+    // The last `w` bases of a segment's end side (else its start side), read
+    // toward that end.
+    static SequenceContainerType toward_end(const supernode_out &sn,
+                                            bool at_end, size_t w) {
+        const size_t len = segment_length(sn);
+        if (at_end) return SequenceContainerType(sn.seqs(), len - w, len);
+        return SequenceContainerType(sn.seqs(), 0, w).reverse_complement();
+    }
+
+    // Whether an end's side of an overlap, the `len` bases ending `trim`
+    // before its free end, recurs in the end's flank: a copy up to
+    // kEndWindow bases further in, seeded by shared core pairs (>= 2 voting
+    // for one shift, in kBand bins, as in candidates_for) and extended over
+    // the whole overlap (within kBand) at >= kMinIdentity. Inside a tandem
+    // array such a copy lies a period or more inward; it matches the partner
+    // as well as the overlap does, so where the two ends meet, and whether
+    // they overlap at all, is ambiguous. This catches arrays whose period is
+    // too long for is_tandem, which sees only one or two copies in a window.
+    template <class AssemblerT>
+    static bool overlap_recurs(const AssemblerT &as, const supernode_out &sn,
+                               bool at_end, size_t trim, size_t len) {
+        const size_t w = std::min(segment_length(sn), trim + len + kEndWindow);
+        gtl::vector<SequenceContainerType> seqs;
+        seqs.push_back(toward_end(sn, at_end, w));
+        const SequenceContainerType &s = seqs[0];
+        // An overlap may cover a whole short segment, and len counts the
+        // partner's side, which may be a few indels longer.
+        const size_t o_to = w - trim, o_from = o_to - std::min(o_to, len);
+        const lcp_read lr = end_level_cores(as, seqs);
+        gtl::flat_hash_map<u64, gtl::vector<uint32_t>> at;  // pair -> ends
+        for (size_t c = 1; c < lr.cores.size(); ++c)
+            at[pair_key(lr, c)].push_back(lr.pos[c].second);
+        struct bin_t {
+            uint32_t votes = 0;
+            uint32_t pos_o = 0, pos_c = 0;  // the last pair in the bin
+        };
+        gtl::flat_hash_map<size_t, bin_t> bins;  // shift / kBand -> bin
+        for (size_t c = 1; c < lr.cores.size(); ++c) {
+            const uint32_t pos_o = lr.pos[c].second;
+            if (pos_o < o_from || pos_o >= o_to) continue;
+            for (const uint32_t pos_c : at[pair_key(lr, c)]) {
+                if (pos_c + kBand >= pos_o) continue;  // itself, or outward
+                bin_t &bin = bins[(pos_o - pos_c) / kBand];
+                ++bin.votes;
+                bin.pos_o = pos_o;
+                bin.pos_c = pos_c;
+            }
+        }
+        for (const auto &[_, seed] : bins) {
+            if (seed.votes < 2) continue;
+            const size_t c_to =
+                std::min(w, size_t(seed.pos_c) + (o_to - seed.pos_o) + kBand);
+            const size_t c_from =
+                seed.pos_c -
+                std::min<size_t>(seed.pos_c, seed.pos_o - o_from + kBand);
+            const extension_t x = extend_seed({s, o_from, seed.pos_o, o_to},
+                                              {s, c_from, seed.pos_c, c_to});
+            if (x.q_lo <= o_from + kBand && x.q_hi + kBand >= o_to &&
+                x.similar())
+                return true;
+        }
+        return false;
+    }
+
     // Step 3: the overlaps kept as joins, recorded at both of their sides.
-    template <class EndDepth>
+    // recurs(o) tells whether o's overlap recurs in the flank of one of its
+    // ends; it is asked last, of overlaps passing every other check.
+    template <class EndDepth, class Recurs>
     static join_map pick_joins(const gtl::vector<end_t> &ends,
                                const gtl::vector<overlap_t> &overlaps,
                                double locus_limit, const EndDepth &end_depth,
-                               stats_t &stats) {
+                               const Recurs &recurs, stats_t &stats) {
         gtl::vector<size_t> n_overlaps(ends.size(), 0);
         for (const overlap_t &o : overlaps) {
             ++n_overlaps[o.a];
@@ -1826,6 +1922,10 @@ struct EndJoin {
             }
             if (tandem(o.a) || tandem(o.b)) {
                 ++stats.tandem;
+                continue;
+            }
+            if (recurs(o)) {
+                ++stats.recurring;
                 continue;
             }
             joins[side_of(o.a)] = {side_of(o.b), o.trim_a};
@@ -1968,15 +2068,22 @@ struct EndJoin {
             free_ends(as, supernodes, edges, threads);
         stats.ends = ends.size();
         const auto overlaps = find_overlaps(ends, threads, stats);
+        auto recurs = [&](const overlap_t &o) {
+            const end_t &a = ends[o.a], &b = ends[o.b];
+            return overlap_recurs(as, supernodes[a.sid], a.at_end, o.trim_a,
+                                  o.trim_b) ||
+                   overlap_recurs(as, supernodes[b.sid], b.at_end, 0, o.trim_b);
+        };
         const join_map joins =
-            pick_joins(ends, overlaps, locus_limit, end_depth, stats);
+            pick_joins(ends, overlaps, locus_limit, end_depth, recurs, stats);
         const moved_map moved = merge_chains(supernodes, joins, stats);
         if (!moved.empty()) rewire_links(moved, edges);
         std::fprintf(stderr,
                      "[end-join] free ends %zu, candidates %zu, aligned %zu, "
-                     "rejected deep %zu, rejected tandem %zu, joins %zu\n",
+                     "rejected deep %zu, rejected tandem %zu, rejected "
+                     "recurring %zu, joins %zu\n",
                      stats.ends, stats.candidates, stats.aligned, stats.deep,
-                     stats.tandem, stats.joined);
+                     stats.tandem, stats.recurring, stats.joined);
         return stats.joined;
     }
 };
