@@ -67,42 +67,55 @@ static void parallel_for(size_t n, int threads, F &&fn) {
 
 // A queue holding at most `capacity` items, with the dequeue interface of
 // moodycamel::BlockingConcurrentQueue. enqueue() blocks on a semaphore of free
-// slots while the queue is full (no spinning or polling); every dequeue frees
-// a slot. Blocks for `capacity` items from `producers` producer threads are
-// allocated up front, but enqueue() can still allocate one: a block returns
-// to the pool only once all of its items are dequeued, so partly dequeued
-// blocks can use up the pool. Blocks allocated this way are freed when
-// emptied.
+// slots while the queue is full (no spinning or polling). Dequeues free slots
+// in groups of up to kSlotGroup: while the queue stays full, every freed slot
+// would otherwise wake a blocked producer through the kernel. A group never
+// exceeds the capacity, so a full queue always holds enough items to free one.
+// Blocks for `capacity` items from `producers` producer threads are allocated
+// up front, but enqueue() can still allocate one: a block returns to the pool
+// only once all of its items are dequeued, so partly dequeued blocks can use
+// up the pool. Blocks allocated this way are freed when emptied.
 template <class T>
 class bounded_queue {
    public:
+    // Enough to make the wake-up negligible next to a producer's work for the
+    // group, small next to the capacities in use.
+    static constexpr size_t kSlotGroup = 16;
     bounded_queue(size_t capacity, size_t producers)
         : queue_{capacity, 0, producers},
-          free_slots_{static_cast<ssize_t>(capacity), /*maxSpins=*/0} {}
+          free_slots_{static_cast<ssize_t>(capacity), /*maxSpins=*/0},
+          group_{std::min(capacity, kSlotGroup)} {}
     void enqueue(T item) {
         free_slots_.wait();
         queue_.enqueue(std::move(item));
     }
     void wait_dequeue(T &item) {
         queue_.wait_dequeue(item);
-        free_slots_.signal();
+        free_slot();
     }
     template <class Rep, class Period>
     bool wait_dequeue_timed(T &item,
                             std::chrono::duration<Rep, Period> timeout) {
         if (!queue_.wait_dequeue_timed(item, timeout)) return false;
-        free_slots_.signal();
+        free_slot();
         return true;
     }
     bool try_dequeue(T &item) {
         if (!queue_.try_dequeue(item)) return false;
-        free_slots_.signal();
+        free_slot();
         return true;
     }
 
    private:
+    void free_slot() {
+        if (dequeued_.fetch_add(1) % group_ == group_ - 1) {
+            free_slots_.signal(static_cast<ssize_t>(group_));
+        }
+    }
     moodycamel::BlockingConcurrentQueue<T> queue_;
     moodycamel::LightweightSemaphore free_slots_;
+    const size_t group_;
+    std::atomic<size_t> dequeued_{0};
 };
 
 template <std::integral int_type>
