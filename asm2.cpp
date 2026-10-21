@@ -459,6 +459,17 @@ struct assembler {
         static size_t len(const record *r) { return r->len; }
     };
 
+    // Waits for the next item; false once the producers are done (`done`) and
+    // the queue is empty. An item enqueued just before `done` was set may
+    // still arrive after the wait timed out, hence the final try_dequeue.
+    static bool next_item(auto &queue, const std::atomic<bool> &done,
+                          auto &item) {
+        while (!queue.wait_dequeue_timed(item, WAIT_QUEUE_TIMEOUT)) {
+            if (done.load()) return queue.try_dequeue(item);
+        }
+        return true;
+    }
+
     template <class Ops>
     static auto process_data(int thread_id, int lcp_level,
                              data_queue_of<typename Ops::record> &data_queue,
@@ -474,13 +485,7 @@ struct assembler {
         pos_scratch pos_buf;
         lcp_read lr;
         gtl::vector<uint8_t> rc_nibbles;
-        while (true) {
-            if (!data_queue.wait_dequeue_timed(data_p, WAIT_QUEUE_TIMEOUT)) {
-                if (done.load()) {
-                    break;
-                }
-                continue;
-            }
+        while (next_item(data_queue, done, data_p)) {
             all_reads++;
             lr.clear();
             parse_cores_from_nibbles(Ops::seq(data_p), Ops::len(data_p),
