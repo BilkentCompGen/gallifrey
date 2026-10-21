@@ -16,97 +16,11 @@
 #include "htslib/hts.h"
 #include "kmer_bits.h"
 
-static const uint8_t decode4_tbl[16] = {
-    /* 0 */ 0,
-    /* 1 */ 0,
-    /* 2 */ 1,
-    /* 3 */ 0,
-    /* 4 */ 2,
-    /* 5 */ 0,
-    /* 6 */ 0,
-    /* 7 */ 0,
-    /* 8 */ 3,
-    /* 9 */ 0,
-    /* A */ 0,
-    /* B */ 0,
-    /* C */ 0,
-    /* D */ 0,
-    /* E */ 0,
-    /* F */ 0};
-
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
-
 #include <arm_neon.h>
-#include <stddef.h>
-#include <stdint.h>
-
-inline void onehotto2bitDNA_neon(
-    const uint8_t *__restrict data, size_t len, uint8_t *__restrict low,
-    uint8_t *__restrict high) {
-    const uint8x16_t tbl = vld1q_u8(decode4_tbl);
-    const uint8x16_t mask = vdupq_n_u8(0x0F);
-    size_t i = 0;
-    for (; i + 16 <= len; i += 16) {
-        uint8x16_t v = vld1q_u8(data + i);
-        uint8x16_t lo = vandq_u8(v, mask);
-        uint8x16_t hi = vshrq_n_u8(v, 4);
-        uint8x16_t dlo = vqtbl1q_u8(tbl, lo);
-        uint8x16_t dhi = vqtbl1q_u8(tbl, hi);
-        vst1q_u8(low + i, dlo);
-        vst1q_u8(high + i, dhi);
-    }
-    for (; i < len; ++i) {
-        uint8_t b = data[i];
-        low[i] = decode4_tbl[b & 0x0F];
-        high[i] = decode4_tbl[b >> 4];
-    }
-}
-
 #elif defined(__SSSE3__)
-
 #include <tmmintrin.h>
-#include <stddef.h>
-#include <stdint.h>
-
-inline void onehotto2bitDNA_sse(
-    const uint8_t *__restrict data, size_t len, uint8_t *__restrict low,
-    uint8_t *__restrict high) {
-    const __m128i tbl = _mm_loadu_si128(reinterpret_cast<const __m128i *>(decode4_tbl));
-    const __m128i mask = _mm_set1_epi8(0x0F);
-    size_t i = 0;
-    for (; i + 16 <= len; i += 16) {
-        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + i));
-        __m128i lo = _mm_and_si128(v, mask);
-        __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), mask);
-        __m128i dlo = _mm_shuffle_epi8(tbl, lo);
-        __m128i dhi = _mm_shuffle_epi8(tbl, hi);
-        _mm_storeu_si128(reinterpret_cast<__m128i *>(low + i), dlo);
-        _mm_storeu_si128(reinterpret_cast<__m128i *>(high + i), dhi);
-    }
-    for (; i < len; ++i) {
-        uint8_t b = data[i];
-        low[i] = decode4_tbl[b & 0x0F];
-        high[i] = decode4_tbl[b >> 4];
-    }
-}
-
 #endif
-
-inline void onehotto2bitDNA_vector(const uint8_t *__restrict data, size_t len,
-                                   uint8_t *__restrict low,
-                                   uint8_t *__restrict high) {
-#if (defined(__ARM_NEON) || defined(__ARM_NEON__))
-    return onehotto2bitDNA_neon(data, len, low, high);
-#elif defined(__SSSE3__)
-    return onehotto2bitDNA_sse(data, len, low, high);
-#else
-    for (size_t i = 0; i < len; ++i) {
-        uint8_t b = data[i];
-        low[i] = decode4_tbl[b & 0x0F];
-        high[i] = decode4_tbl[b >> 4];
-    }
-#endif
-}
 
 // Bump allocator for 2-bit words: zeroed storage carved from large blocks,
 // all freed together by release() or the destructor. Not thread-safe; each
