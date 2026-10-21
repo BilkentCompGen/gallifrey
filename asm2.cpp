@@ -1238,7 +1238,7 @@ static int run_passes(const asm_config &cfg) {
         as.lcmer_l = passes[p].lcmer_l;
         if (!cfg.silent)
             fprintf(stderr,
-                    "[multipass] pass %zu/%zu: level %d, lcmer-l %d, seeding "
+                    "[multipass] pass %zu/%zu: level %d, window %d, seeding "
                     "%zu segments (%zu bp, both strands)\n",
                     p + 1, n, as.lcp_level, as.lcmer_l, segments.size(),
                     total_bases(segments));

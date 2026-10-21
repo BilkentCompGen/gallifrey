@@ -87,7 +87,7 @@ build/lasm hifi reads.bam \
   -l 5 \
   -t 16 \
   -@ 8 \
-  --lcmer-l 6 \
+  -w 6 \
   --syncmer-k 11 \
   --submer-s 4 \
   --submer-t 6 \
@@ -113,12 +113,11 @@ Parallelism and input:
 
 Assembly:
 
-- `--lcmer-l`: rolling `lcmer` window length (cores) used for DBG construction
-  and overlap detection (default 6). `--dbg-lcmer-l` is accepted as the old
-  name; `--olc-lcmer-l` is ignored.
-- `--multipass LEVEL:L[,LEVEL:L...]`: multi-pass assembly, e.g.
-  `4:8,5:6,5:10`; each item is the LCP level and lcmer window length of one
-  pass, replacing `-l` and `--lcmer-l`. Each pass assembles the reads together
+- `-w, --window`: cores per lcmer window, used for DBG construction and
+  overlap detection (default 6)
+- `--multipass LEVEL:WINDOW[,LEVEL:WINDOW...]`: multi-pass assembly, e.g.
+  `4:8,5:6,5:10`; each item is the LCP level and window of one
+  pass, replacing `-l` and `-w`. Each pass assembles the reads together
   with the previous pass's contigs; only the last pass writes the output (and
   the `--print-raw-dbg`/`--print-bi-dbg` dumps). Small windows bridge
   construction holes and large ones resolve repeats, so order the passes from

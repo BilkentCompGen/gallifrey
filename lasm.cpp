@@ -81,24 +81,23 @@ class AsmProgram {
         auto *level_opt =
             app.add_option("-l,--level", cfg.lcp_level, "LCP level to compute")
                 ->check(CLI::Range(1, 64));
-        auto *lcmer_opt =
-            app.add_option("--lcmer-l,--dbg-lcmer-l", cfg.lcmer_l,
-                           "LCMER window length, used for DBG construction "
-                           "and overlap detection (--dbg-lcmer-l is the old "
-                           "name)")
+        auto *window_opt =
+            app.add_option("-w,--window", cfg.lcmer_l,
+                           "Cores per lcmer window, used for DBG construction "
+                           "and overlap detection")
                 ->check(CLI::Range(1, 64))
                 ->capture_default_str();
         auto *multipass_opt =
             app.add_option(
                    "--multipass", multipass_text,
-                   "Multi-pass assembly: LEVEL:L[,LEVEL:L...] gives the LCP "
-                   "level and lcmer window length of each pass, e.g. "
-                   "4:8,5:6,5:10 (replaces -l and --lcmer-l). Each pass "
+                   "Multi-pass assembly: LEVEL:WINDOW[,LEVEL:WINDOW...] gives "
+                   "the LCP level and cores per lcmer window of each pass, "
+                   "e.g. 4:8,5:6,5:10 (replaces -l and -w). Each pass "
                    "assembles the reads together with the previous pass's "
                    "contigs; only the last pass writes the output. Order "
                    "the passes from small to large windows.")
                 ->excludes(level_opt)
-                ->excludes(lcmer_opt);
+                ->excludes(window_opt);
         app.add_option("--ploidy", cfg.graph_cleaning.ploidy,
                        "Copies of a locus (1 or 2): bubbles whose nodes read "
                        "at most this many copies are popped, deeper ones are "
@@ -107,7 +106,7 @@ class AsmProgram {
             ->capture_default_str();
         app.add_flag("--silent", cfg.silent, "Do not print progress to stderr");
         app.add_option("--olc-lcmer-l", olc_lcmer_l_ignored,
-                       "Ignored; overlap detection uses --lcmer-l")
+                       "Ignored; overlap detection uses --window")
             ->group("");
 
         const std::string kmer_group = advanced("k-mer selection");
@@ -189,7 +188,7 @@ class AsmProgram {
         const std::string layout_group = advanced("layout");
         app.add_flag("--drop-crumbs,!--keep-crumbs", cfg.drop_crumbs,
                      with_default(
-                         "Drop crumb nodes (fewer than lcmer-l+1 cores, so "
+                         "Drop crumb nodes (fewer than window+1 cores, so "
                          "invisible to overlap detection) that have a single "
                          "predecessor and continue into a longer node, instead "
                          "of emitting them as C segments. Halves the contig "
@@ -224,7 +223,7 @@ class AsmProgram {
             if (olc_lcmer_l_ignored != 0) {
                 std::fprintf(stderr,
                              "[config] --olc-lcmer-l is ignored; overlap "
-                             "detection uses --lcmer-l (%d)\n",
+                             "detection uses --window (%d)\n",
                              cfg.lcmer_l);
             }
             if (multipass_opt->count() > 0) {

@@ -95,7 +95,7 @@ struct pass_params {
 // edge between consecutive windows.
 inline constexpr int kMinPassLevel = 1, kMaxPassLevel = 64;
 inline constexpr int kMinPassLcmer = 2, kMaxPassLcmer = 64;
-// Parses "LEVEL:L[,LEVEL:L...]" (at least one pass, bounds above).
+// Parses "LEVEL:WINDOW[,LEVEL:WINDOW...]" (at least one pass, bounds above).
 inline std::expected<std::vector<pass_params>, std::string> parse_multipass(
     const std::string &text) {
     std::vector<pass_params> out;
@@ -116,14 +116,15 @@ inline std::expected<std::vector<pass_params>, std::string> parse_multipass(
         }
         if (colon == std::string::npos || level_len != colon ||
             lcmer_len == 0 || colon + 1 + lcmer_len != item.size()) {
-            return std::unexpected("--multipass: expected LEVEL:L, got \"" +
-                                   item + "\"");
+            return std::unexpected(
+                "--multipass: expected LEVEL:WINDOW, got \"" + item + "\"");
         }
         if (level < kMinPassLevel || level > kMaxPassLevel ||
             lcmer < kMinPassLcmer || lcmer > kMaxPassLcmer) {
             return std::unexpected("--multipass: " + item + " needs level " +
                                    std::to_string(kMinPassLevel) + "-" +
-                                   std::to_string(kMaxPassLevel) + " and L " +
+                                   std::to_string(kMaxPassLevel) +
+                                   " and window " +
                                    std::to_string(kMinPassLcmer) + "-" +
                                    std::to_string(kMaxPassLcmer));
         }
@@ -192,7 +193,7 @@ struct asm_config {
         fprintf(f, "Output: %s\n", output.c_str());
         if (multipass.empty()) {
             fprintf(f, "LCP Level: %d\n", lcp_level);
-            fprintf(f, "LCMER Length: %d\n", lcmer_l);
+            fprintf(f, "Window: %d\n", lcmer_l);
         } else {
             fprintf(f, "Multipass:");
             const char *sep = " ";

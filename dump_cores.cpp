@@ -138,9 +138,9 @@ DumpCoresProgram::DumpCoresProgram(CLI::App &parent) {
         ->capture_default_str();
     app.add_option("-l,--level", lcp_level, "LCP level to compute")
         ->capture_default_str();
-    app.add_option("--lcmer-l", lcmer_l,
-                   "Dump lcmer keys of this window length (DBG node keys) "
-                   "instead of cores; 0 dumps cores")
+    app.add_option("-w,--window", lcmer_l,
+                   "Dump lcmer keys of windows of this many cores (DBG node "
+                   "keys) instead of cores; 0 dumps cores")
         ->capture_default_str();
     app.add_option("--seed", seed, "Seed of the syncmer s-mer hash (32-bit)")
         ->check(CLI::Range(uint64_t{0}, uint64_t{UINT32_MAX}))
