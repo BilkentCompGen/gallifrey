@@ -124,15 +124,11 @@ Assembly:
 - `--silent`: reduce progress logging (with `--multipass`, every pass logs its
   settings, the segments it uses and keeps, and its wall/CPU time)
 
-## Advanced Parameters
+K-mer selection:
 
-The defaults suit most runs.
-
-### Advanced: k-mer selection
-
-Syncmer selection (Edgar 2021). A k-mer is selected by the position of its
-smallest s-mer; selection is computed on the fly from s-mer hashes, with no
-per-k-mer table. K-mers and s-mers count run-length runs, not bases.
+A k-mer is selected by the position of its smallest s-mer; selection is
+computed on the fly from s-mer hashes, with no per-k-mer table. K-mers and
+s-mers count run-length runs, not bases.
 
 - `--syncmer K/S[/T]`: syncmer k-mer length `K` (at most 16), s-mer length
   `S` (1 <= S < K) and, for an open syncmer, offset `T` of the smallest s-mer
@@ -140,7 +136,11 @@ per-k-mer table. K-mers and s-mers count run-length runs, not bases.
   the first or last position). Default `11/4/6`
 - `--random-seed`: seed of the s-mer hash
 
-### Advanced: Bloom filter
+## Advanced Parameters
+
+The defaults suit most runs.
+
+### Bloom filter
 
 - `--projected-element-count`: distinct lcmer keys the Bloom filter is sized
   for (default 100000000); construction warns when the filter is undersized
@@ -151,14 +151,14 @@ per-k-mer table. K-mers and s-mers count run-length runs, not bases.
   count or edge), so reads of the other strand are admitted at their first
   sighting (default on)
 
-### Advanced: graph cleaning
+### Graph cleaning
 
 - `--iterations`: number of graph-cleaning passes (default 6)
 - `--max-tip-length`: maximum tip length in cores (default 16)
 - `--max-bubble-length`: largest bubble to pop, in inner cores (default 1024); `0` disables bubble popping
 - `--min-bubble-length-difference`: maximum length ratio of a bubble's removed nodes to its kept path (default 2)
 
-### Advanced: layout
+### Layout
 
 - `--drop-crumbs` / `--keep-crumbs`: drop crumb nodes (too short for overlap detection) that have a single predecessor and continue into a longer node, instead of emitting them as `C` segments (default on; halves the contig count at a small genome-fraction cost)
 - `--strict-layout-labels` / `--no-strict-layout-labels`: accept a core-label
@@ -166,7 +166,7 @@ per-k-mer table. K-mers and s-mers count run-length runs, not bases.
   sequence, so cores that merely share a label are not chained (default on)
 - `--end-joins` / `--no-end-joins`: join two free segment ends that overlap as reverse complements (the two read strands of one locus stopped at different holes) into one segment; candidates need a unique partner, one-locus depth at both ends, end windows that are not tandem-periodic (collapsed satellite arrays), and an overlap that does not recur near either end (a longer-period array, where the overlap's position is ambiguous) (default on)
 
-### Advanced: other
+### Other
 
 - `--print-raw-dbg`: write the pre-cleaning graph with `.raw.gfa` suffix
 - `--print-bi-dbg`: write the graph before layout with `.bi.gfa` suffix

@@ -56,7 +56,7 @@ class AsmProgram {
         app.set_help_all_flag("--help-all",
                               "Print help including advanced options and exit");
         auto advanced = [show_advanced](const std::string &heading) {
-            if (show_advanced) return "Advanced: " + heading;
+            if (show_advanced) return heading;
             return std::string{};
         };
         app.add_option("input", cfg.inputs,
@@ -110,13 +110,11 @@ class AsmProgram {
                        "Ignored; overlap detection uses --window")
             ->group("");
 
-        const std::string kmer_group = advanced("k-mer selection");
-        add_syncmer_option(app, cfg.syncmer)->group(kmer_group);
+        add_syncmer_option(app, cfg.syncmer);
         app.add_option("--random-seed", cfg.seed,
                        "Seed of the syncmer s-mer hash (32-bit)")
             ->check(CLI::Range(uint64_t{0}, uint64_t{UINT32_MAX}))
-            ->capture_default_str()
-            ->group(kmer_group);
+            ->capture_default_str();
 
         const std::string bloom_group = advanced("Bloom filter");
         app.add_option(
@@ -142,7 +140,7 @@ class AsmProgram {
                          cfg.prime_reverse))
             ->group(bloom_group);
 
-        const std::string cleaning_group = advanced("graph cleaning");
+        const std::string cleaning_group = advanced("Graph cleaning");
         app.add_option("--iterations", cfg.graph_cleaning.iterations,
                        "Number of iterations of graph cleaning")
             ->check(CLI::Range(0, 100))
@@ -167,7 +165,7 @@ class AsmProgram {
             ->capture_default_str()
             ->group(cleaning_group);
 
-        const std::string layout_group = advanced("layout");
+        const std::string layout_group = advanced("Layout");
         app.add_flag("--drop-crumbs,!--keep-crumbs", cfg.drop_crumbs,
                      with_default(
                          "Drop crumb nodes (fewer than window+1 cores, so "
@@ -194,7 +192,7 @@ class AsmProgram {
                          cfg.end_joins))
             ->group(layout_group);
 
-        const std::string other_group = advanced("other");
+        const std::string other_group = advanced("Other");
         app.add_flag("--print-raw-dbg", cfg.print_precleanup_graph,
                      "Print DBG before cleanup (with .raw.gfa suffix)")
             ->group(other_group);
