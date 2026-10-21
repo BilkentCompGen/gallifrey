@@ -6,6 +6,9 @@
 // Low-level 2-bit-packed k-mer bit tricks with no project/htslib
 // dependencies, shareable by nibble2base.hpp and syncmer.h.
 
+// Letter of each 2-bit base code (A=0, C=1, G=2, T=3).
+inline constexpr char kBaseLetters[4] = {'A', 'C', 'G', 'T'};
+
 // https://github.com/ruanjue/wtdbg2/blob/b77c5657c8095412317e4a20fe3668f5bde6b1ac/dna.h#L108
 template <class T>
 T reverse_complement_kmer(T kmer, int K) {

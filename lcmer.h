@@ -369,10 +369,9 @@ struct KmerViewOnCrumbs64 {
     }
     constexpr int_type get() const noexcept { return value; }
     char *to_string() const {
-        static const char *lut = "ACGT";
         char *buffer = malloc(k + 1);
         for (int i = 0; i < k; i++) {
-            buffer[i] = lut[(value >> (2 * (k - i - 1))) & 3];
+            buffer[i] = kBaseLetters[(value >> (2 * (k - i - 1))) & 3];
         }
         buffer[k] = '\0';
         return buffer;

@@ -107,135 +107,6 @@ inline void onehotto2bitDNA_vector(const uint8_t *__restrict data, size_t len,
     }
 #endif
 }
-struct CrumbledSubSeq {
-    size_t len : 62;
-    uint8_t skip_first_n : 2;
-    uint8_t *data;
-    struct from_ascii {};
-    struct from_nibbles {};
-    static constexpr size_t storage_size(size_t bases) noexcept {
-        return bases / 4 + 4;
-    }
-    uint8_t *nibble2crumb(uint8_t *dest, const uint8_t *src, size_t from,
-                          size_t to) {
-        size_t _from = from & (~3);
-        size_t _to = to & (~3);
-        if (_to != to) {
-            _to += 4;
-        }
-        for (size_t i = _from; i < _to; i += 4) {
-            size_t write_idx = (i - _from) / 4;
-            dest[write_idx] = seq_nt16_int[bam_seqi(src, i)] |
-                              seq_nt16_int[bam_seqi(src, i + 1)] << 2 |
-                              seq_nt16_int[bam_seqi(src, i + 2)] << 4 |
-                              seq_nt16_int[bam_seqi(src, i + 3)] << 6;
-            // dest[write_idx] = 0xff;
-        }
-        skip_first_n = from - _from;
-
-        return dest;
-    }
-    uint8_t *chars2crumb(uint8_t *dest, const char *src, size_t from,
-                         size_t to) {
-        for (size_t i = from; i < to; i++) {
-            size_t write_index = (i - from) / 4;
-            size_t write_crumb = (i - from) % 4;
-            if (write_crumb == 0) {
-                dest[write_index] = 0;
-            }
-            switch (src[i]) {
-                case 'a':
-                case 'A':
-                    break;
-                case 'c':
-                case 'C':
-                    dest[write_index] |= 1 << (2 * write_crumb);
-                    break;
-                case 'g':
-                case 'G':
-                    dest[write_index] |= 2 << (2 * write_crumb);
-                    break;
-                case 'U':
-                case 'u':
-                case 'T':
-                case 't':
-                    dest[write_index] |= 3 << (2 * write_crumb);
-                    break;
-                default:
-                    break;
-            }
-        }
-        return dest;
-    }
-    char *crumb2base(char *dest, const uint8_t *src, size_t len) const {
-        static constexpr const char *lut = "ACGT";
-        for (size_t i = skip_first_n; i < len + skip_first_n; ++i) {
-            dest[i - skip_first_n] = lut[(src[i / 4] >> (2 * (i % 4))) & 3];
-        }
-        return dest;
-    }
-    CrumbledSubSeq(const char *nibbles, size_t from, size_t to,
-                   from_ascii) noexcept
-        : len((to - from)),
-          skip_first_n(0),
-          data(new uint8_t[len / 4 + 4]) {  //(skip_first?1:0)]) {
-        chars2crumb(data, nibbles, from, to);
-    }
-    CrumbledSubSeq(const uint8_t *nibbles, size_t from, size_t to,
-                   from_nibbles) noexcept
-        : len((to - from)),
-          skip_first_n(from & 3),
-          data(new uint8_t[len / 4 + 4]) {  //(skip_first?1:0)]) {
-        nibble2crumb(data, nibbles, from, to);
-    }
-    CrumbledSubSeq(const uint8_t *nibbles, size_t from, size_t to) noexcept
-        : len((to - from)),
-          skip_first_n(from & 3),
-          data(new uint8_t[len / 4 + 4]) {  //(skip_first?1:0)]) {
-        nibble2crumb(data, nibbles, from, to);
-    }
-    CrumbledSubSeq(size_t length, uint8_t skip) noexcept
-        : len(length),
-          skip_first_n(skip),
-          data(new uint8_t[storage_size(length)]()) {}
-    CrumbledSubSeq() noexcept : CrumbledSubSeq(0, 0) {}
-    CrumbledSubSeq(CrumbledSubSeq &&other) noexcept
-        : len(other.len), skip_first_n(other.skip_first_n), data(other.data) {
-        other.data = nullptr;
-    }
-    CrumbledSubSeq(const CrumbledSubSeq &other) = delete;
-    CrumbledSubSeq &operator=(const CrumbledSubSeq &other) = delete;
-    ~CrumbledSubSeq() { delete[] data; }
-    CrumbledSubSeq &operator=(CrumbledSubSeq &&other) noexcept {
-        if (this != &other) {
-            delete[] data;
-            data = other.data;
-            skip_first_n = other.skip_first_n;
-            len = other.len;
-            other.data = nullptr;
-        }
-        return *this;
-    }
-    char *convert_to_ascii(char *buffer) const {
-        crumb2base(buffer, data, len);
-        buffer[len] = '\0';
-        return buffer;
-    }
-    [[nodiscard]] CrumbledSubSeq reverse_complement() const {
-        CrumbledSubSeq rc{len, 0};
-        for (size_t i = 0; i < len; ++i) {
-            const size_t src_pos = len - 1 - i + skip_first_n;
-            const size_t src_byte = src_pos / 4;
-            const size_t src_shift = (src_pos % 4) * 2;
-            const uint8_t code = (data[src_byte] >> src_shift) & 0x3;
-            const uint8_t complement = static_cast<uint8_t>(code ^ 0x3);
-            const size_t dst_byte = i / 4;
-            const size_t dst_shift = (i % 4) * 2;
-            rc.data[dst_byte] |= static_cast<uint8_t>(complement << dst_shift);
-        }
-        return rc;
-    }
-};
 
 // Bump allocator for 2-bit words: zeroed storage carved from large blocks,
 // all freed together by release() or the destructor. Not thread-safe; each
@@ -651,21 +522,12 @@ struct CrumbledSubSeq64 {
     }
 #endif
 
+    // The bases as letters, then '\0' at buffer[len]; needs len + 1 bytes.
+    // The codes are unpacked into the buffer and turned into letters in place.
     char *convert_to_ascii(char *buffer) const {
-        static constexpr const char *lut = "ACGT";
-        size_t base_index = 0;
-
-        auto scalar_emit = [&](size_t count) {
-            const size_t bit_base = static_cast<size_t>(skip_first_n) * 2;
-            for (size_t i = 0; i < count; ++i) {
-                const size_t bit_index = bit_base + (base_index + i) * 2;
-                const uint64_t word = data[bit_index >> 6];
-                buffer[base_index + i] = lut[(word >> (bit_index & 63)) & 0x3];
-            }
-            base_index += count;
-        };
-
-        scalar_emit(len);
+        uint8_t *codes = reinterpret_cast<uint8_t *>(buffer);
+        unpack_bytes(0, len, codes);
+        for (size_t i = 0; i < len; ++i) buffer[i] = kBaseLetters[codes[i]];
         buffer[len] = '\0';
         return buffer;
     }

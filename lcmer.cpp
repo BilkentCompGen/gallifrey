@@ -13,7 +13,6 @@
 #include "syncmer.h"
 
 int onehotto2bitDNA2(const uint8_t *data, char *ret) {
-    static char table[] = {'A', 'C', 'G', 'T'};
     for (size_t i = 0;; ++i) {
         int clz = std::countl_zero(static_cast<unsigned>(data[i]));
         int ctz = std::countr_zero(static_cast<unsigned>(data[i]));
@@ -22,8 +21,8 @@ int onehotto2bitDNA2(const uint8_t *data, char *ret) {
             ret[i] = 0;
             return i;
         }
-        ret[2 * i] = table[27 - clz];
-        ret[2 * i + 1] = table[ctz];
+        ret[2 * i] = kBaseLetters[27 - clz];
+        ret[2 * i + 1] = kBaseLetters[ctz];
     }
     return -1;
 }
