@@ -1,7 +1,8 @@
 #include <CLI/CLI.hpp>
 #include <map>
 #include <string>
-// #include <vector>
+#include <string_view>
+#include <vector>
 
 #include "CLI/CLI.hpp"
 
@@ -11,6 +12,28 @@
 #include "dump_cores.h"
 #include "ext/lcptools/lcptools_ho.h"
 using std::string;
+
+// Lists an option's names without the "{false}" CLI11 appends to negated flag
+// names (--no-end-joins{false}), which reads as the flag's default.
+class HelpFormatter : public CLI::Formatter {
+   public:
+    std::string make_option_name(const CLI::Option *opt,
+                                 bool is_positional) const override {
+        if (is_positional) {
+            return CLI::Formatter::make_option_name(opt, true);
+        }
+        std::vector<std::string> names;
+        for (const auto &s : opt->get_snames()) names.push_back("-" + s);
+        for (const auto &l : opt->get_lnames()) names.push_back("--" + l);
+        return CLI::detail::join(names);
+    }
+};
+
+// CLI11 shows no default for flags, so negatable flags state it in their help.
+static std::string with_default(const std::string &desc, bool on) {
+    if (on) return desc + " (default: on)";
+    return desc + " (default: off)";
+}
 
 // Each subcommand is a command object that owns its parsed parameters and
 // registers itself with the parent CLI::App on construction. The objects
@@ -24,8 +47,17 @@ class AsmProgram {
     std::string multipass_text;
 
    public:
-    explicit AsmProgram(CLI::App &parent) {
+    // show_advanced: --help-all is on the command line. CLI11 hides options
+    // whose group is "", so the advanced groups get headings only then; they
+    // parse either way.
+    AsmProgram(CLI::App &parent, bool show_advanced) {
         auto &app = *parent.add_subcommand("hifi", "run hifi assembly");
+        app.set_help_all_flag("--help-all",
+                              "Print help including advanced options and exit");
+        auto advanced = [show_advanced](const std::string &heading) {
+            if (show_advanced) return "Advanced: " + heading;
+            return std::string{};
+        };
         app.add_option("input", cfg.inputs,
                        "Input read files: BAM, CRAM, SAM, or FASTA/FASTQ "
                        "(plain or gzipped). Format is detected from content; "
@@ -33,6 +65,19 @@ class AsmProgram {
             ->required();
         app.add_option("-o,--output", cfg.output, "Output gfa file")
             ->required();
+        app.add_option("-t,--threads", cfg.threads.work,
+                       "Number of worker threads")
+            ->check(CLI::Range(1, MAXIMUM_WORK_THREADS))
+            ->capture_default_str();
+        app.add_option(
+               "-@,--io-threads", cfg.threads.io,
+               "Number of IO threads (Used by htslib for decompressing)")
+            ->check(CLI::Range(0, 64))
+            ->capture_default_str();
+        app.add_option("--file-reading-mode", file_reading_mode,
+                       "Input reader mode: parallel or sequential")
+            ->check(CLI::IsMember({"parallel", "sequential"}))
+            ->capture_default_str();
         auto *level_opt =
             app.add_option("-l,--level", cfg.lcp_level, "LCP level to compute")
                 ->check(CLI::Range(1, 64));
@@ -54,121 +99,127 @@ class AsmProgram {
                    "the passes from small to large windows.")
                 ->excludes(level_opt)
                 ->excludes(lcmer_opt);
+        app.add_option("--ploidy", cfg.graph_cleaning.ploidy,
+                       "Copies of a locus (1 or 2): bubbles whose nodes read "
+                       "at most this many copies are popped, deeper ones are "
+                       "repeats and kept; 2 also cuts allele tips at forks")
+            ->check(CLI::Range(1, 2))
+            ->capture_default_str();
+        app.add_flag("--silent", cfg.silent, "Do not print progress to stderr");
         app.add_option("--olc-lcmer-l", olc_lcmer_l_ignored,
                        "Ignored; overlap detection uses --lcmer-l")
             ->group("");
-        app.add_option("-t,--threads", cfg.threads.work,
-                       "Number of worker threads")
-            ->check(CLI::Range(1, MAXIMUM_WORK_THREADS))
-            ->capture_default_str();
-        app.add_option("-@,--io-threads", cfg.threads.io,
-                       "Number of IO threads (Used by htslib for decompressing)")
-            ->check(CLI::Range(0, 64))
-            ->capture_default_str();
-        app.add_option("--random-seed", cfg.seed,
-                       "Seed of the syncmer s-mer hash (32-bit)")
-            ->check(CLI::Range(uint64_t{0}, uint64_t{UINT32_MAX}))
-            ->capture_default_str();
-        app.add_option("--file-reading-mode", file_reading_mode,
-                       "Input reader mode: parallel or sequential")
-            ->check(CLI::IsMember({"parallel", "sequential"}))
-            ->capture_default_str();
 
-        app.add_flag("--rle", cfg.rle, "Enable Run Length Encoding")
-            ->capture_default_str();
-
-        app.add_flag("--print-raw-dbg", cfg.print_precleanup_graph,
-                     "Print DBG before cleanup (with .raw.gfa suffix)")
-            ->capture_default_str();
-        app.add_flag("--print-bi-dbg", cfg.print_prelayout_graph,
-                     "Print DBG before layout (with .bi.gfa suffix)")
-            ->capture_default_str();
-        app.add_flag("--silent", cfg.silent, "Do not print progress to stderr")
-            ->capture_default_str();
-        app.add_flag("--drop-crumbs,!--keep-crumbs", cfg.drop_crumbs,
-                     "Drop crumb nodes (fewer than lcmer-l+1 cores, so "
-                     "invisible to overlap detection) that have a single "
-                     "predecessor and continue into a longer node, instead of "
-                     "emitting them as C segments. Halves the contig count at "
-                     "a small genome-fraction cost.")
-            ->capture_default_str();
-        app.add_flag("--prime-reverse,!--no-prime-reverse", cfg.prime_reverse,
-                     "Also parse each read's reverse complement and insert "
-                     "its lcmer keys into the Bloom filter only (no node, "
-                     "count or edge), so reads of the other strand are "
-                     "admitted at their first sighting")
-            ->capture_default_str();
-        app.add_flag("--strict-layout-labels,!--no-strict-layout-labels",
-                     cfg.strict_layout_labels,
-                     "Layout: accept a core-label match as a seed only if "
-                     "both cores have the same homopolymer-compressed "
-                     "sequence, so cores that merely share a label are not "
-                     "chained")
-            ->capture_default_str();
-        app.add_flag("--end-joins,!--no-end-joins", cfg.end_joins,
-                     "Join segment ends that overlap as reverse complements "
-                     "(the two strands of one locus stopping at different "
-                     "holes) into one segment")
-            ->capture_default_str();
+        const std::string kmer_group = advanced("k-mer selection");
         app.add_option("--syncmer-k", cfg.syncmer.k,
-                       "Syncmer k-mer length (in RLE runs with --rle)")
+                       "Syncmer k-mer length, in homopolymer-compressed bases")
             ->check(CLI::Range(2u, syncmer_params::max_k))
-            ->capture_default_str();
+            ->capture_default_str()
+            ->group(kmer_group);
         app.add_option(
                "--submer-s", cfg.syncmer.smer.s,
                "s-mer length s for syncmer selection. Without --submer-t "
                "this is a closed syncmer (smallest s-mer at the first or "
                "last position). Default when neither --submer-s nor "
                "--submer-t is given: open syncmer, s=4, t=6.")
-            ->check(CLI::Range(1ul, 15ul));
+            ->check(CLI::Range(1ul, 15ul))
+            ->group(kmer_group);
         app.add_option(
                "--submer-t", cfg.syncmer.smer.t,
                "Offset t of the smallest s-mer: selects an open syncmer "
                "(smallest s-mer at position t).")
             ->check(CLI::Range(0ul, 15ul))
-            ->needs("--submer-s");
-        auto bfg = app.add_option_group("bloomfilter",
-                                        "Parameters to setup bloom filter");
-        bfg->add_option(
+            ->needs("--submer-s")
+            ->group(kmer_group);
+        app.add_option("--random-seed", cfg.seed,
+                       "Seed of the syncmer s-mer hash (32-bit)")
+            ->check(CLI::Range(uint64_t{0}, uint64_t{UINT32_MAX}))
+            ->capture_default_str()
+            ->group(kmer_group);
+
+        const std::string bloom_group = advanced("Bloom filter");
+        app.add_option(
                "--projected-element-count", cfg.bloom.projected_count,
                "Distinct lcmer keys the Bloom filter is sized for at the "
                "configured false-positive probability; construction logs the "
                "fill and modelled false-positive rate and warns when the "
                "filter is undersized")
             ->check(CLI::Range((int64_t)1, (int64_t)10000000000))
-            ->capture_default_str();
-        bfg->add_option("--false-positive-probability",
-                        cfg.bloom.false_positive_rate,
-                        "False positive probability")
-            ->capture_default_str();
-        auto gcg = app.add_option_group("graphcleaning",
-                                        "Parameters to setup graph cleaning");
-        gcg->add_option("--iterations", cfg.graph_cleaning.iterations,
-                        "Number of iterations of graph cleaning")
+            ->capture_default_str()
+            ->group(bloom_group);
+        app.add_option("--false-positive-probability",
+                       cfg.bloom.false_positive_rate,
+                       "False positive probability")
+            ->capture_default_str()
+            ->group(bloom_group);
+        app.add_flag("--prime-reverse,!--no-prime-reverse", cfg.prime_reverse,
+                     with_default(
+                         "Also parse each read's reverse complement and insert "
+                         "its lcmer keys into the Bloom filter only (no node, "
+                         "count or edge), so reads of the other strand are "
+                         "admitted at their first sighting",
+                         cfg.prime_reverse))
+            ->group(bloom_group);
+
+        const std::string cleaning_group = advanced("graph cleaning");
+        app.add_option("--iterations", cfg.graph_cleaning.iterations,
+                       "Number of iterations of graph cleaning")
             ->check(CLI::Range(0, 100))
-            ->capture_default_str();
-        gcg->add_option("--max-tip-length", cfg.graph_cleaning.max_tip_length,
-                        "Maximum tip length to cut in terms of cores")
+            ->capture_default_str()
+            ->group(cleaning_group);
+        app.add_option("--max-tip-length", cfg.graph_cleaning.max_tip_length,
+                       "Maximum tip length to cut in terms of cores")
             ->check(CLI::Range(0, 1000000))
-            ->capture_default_str();
-        gcg->add_option(
-               "--min-bubble-length-difference",
-               cfg.graph_cleaning.min_bubble_length_difference,
-               "Maximum length ratio of a bubble's removed nodes to its kept "
-               "path; more divergent bubbles are kept.")
-            ->capture_default_str();
-        gcg->add_option("--max-bubble-length",
-                        cfg.graph_cleaning.max_bubble_length,
-                        "Maximum inner length (in cores) of a bubble to pop; 0 "
-                        "disables bubble popping.")
+            ->capture_default_str()
+            ->group(cleaning_group);
+        app.add_option("--min-bubble-length-difference",
+                       cfg.graph_cleaning.min_bubble_length_difference,
+                       "Maximum length ratio of a bubble's removed nodes to "
+                       "its kept path; more divergent bubbles are kept.")
+            ->capture_default_str()
+            ->group(cleaning_group);
+        app.add_option("--max-bubble-length",
+                       cfg.graph_cleaning.max_bubble_length,
+                       "Maximum inner length (in cores) of a bubble to pop; 0 "
+                       "disables bubble popping.")
             ->check(CLI::Range(0, 1000000))
-            ->capture_default_str();
-        gcg->add_option("--ploidy", cfg.graph_cleaning.ploidy,
-                        "Copies of a locus (1 or 2): bubbles whose nodes read "
-                        "at most this many copies are popped, deeper ones are "
-                        "repeats and kept; 2 also cuts allele tips at forks")
-            ->check(CLI::Range(1, 2))
-            ->capture_default_str();
+            ->capture_default_str()
+            ->group(cleaning_group);
+
+        const std::string layout_group = advanced("layout");
+        app.add_flag("--drop-crumbs,!--keep-crumbs", cfg.drop_crumbs,
+                     with_default(
+                         "Drop crumb nodes (fewer than lcmer-l+1 cores, so "
+                         "invisible to overlap detection) that have a single "
+                         "predecessor and continue into a longer node, instead "
+                         "of emitting them as C segments. Halves the contig "
+                         "count at a small genome-fraction cost.",
+                         cfg.drop_crumbs))
+            ->group(layout_group);
+        app.add_flag(
+               "--strict-layout-labels,!--no-strict-layout-labels",
+               cfg.strict_layout_labels,
+               with_default("Accept a core-label match as a seed only if both "
+                            "cores have the same homopolymer-compressed "
+                            "sequence, so cores that merely share a label are "
+                            "not chained",
+                            cfg.strict_layout_labels))
+            ->group(layout_group);
+        app.add_flag("--end-joins,!--no-end-joins", cfg.end_joins,
+                     with_default(
+                         "Join segment ends that overlap as reverse "
+                         "complements (the two strands of one locus stopping "
+                         "at different holes) into one segment",
+                         cfg.end_joins))
+            ->group(layout_group);
+
+        const std::string other_group = advanced("other");
+        app.add_flag("--print-raw-dbg", cfg.print_precleanup_graph,
+                     "Print DBG before cleanup (with .raw.gfa suffix)")
+            ->group(other_group);
+        app.add_flag("--print-bi-dbg", cfg.print_prelayout_graph,
+                     "Print DBG before layout (with .bi.gfa suffix)")
+            ->group(other_group);
         app.callback([this, level_opt, multipass_opt]() {
             if (olc_lcmer_l_ignored != 0) {
                 std::fprintf(stderr,
@@ -281,9 +332,13 @@ class SamReadTesting {
 int main(int argc, char **argv) {
     CLI::App app("lasm");
     app.require_subcommand(1);
-    // app.set_help_all_flag("--help-all", "Expand all help");
+    app.formatter(std::make_shared<HelpFormatter>());
 
-    AsmProgram hifi{app};
+    bool show_advanced = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--help-all") show_advanced = true;
+    }
+    AsmProgram hifi{app, show_advanced};
     SamReadTesting bamdoctor{app};
     DumpCoresProgram dumpcores{app};
 

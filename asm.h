@@ -147,7 +147,6 @@ struct asm_config {
         int work = 8;
     } threads;
     uint32_t seed = kDefaultRandomSeed;
-    bool rle = true;
     bool parallel_file_reading = true;
     syncmer_params syncmer;
     bool print_precleanup_graph = false;
@@ -205,7 +204,6 @@ struct asm_config {
         }
         fprintf(f, "Threads:\n\tIO: %d\n\tWork: %d\n", threads.io, threads.work);
         fprintf(f, "Seed: %" PRIu32 "\n", seed);
-        fprintf(f, "RLE: %s\n", rle ? "true" : "false");
         fprintf(f, "File Reading Mode: %s\n",
                 parallel_file_reading ? "parallel" : "sequential");
         syncmer.print_cfg(f);

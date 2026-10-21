@@ -96,26 +96,26 @@ build/lasm hifi reads.bam \
 
 ## Main Parameters
 
+`lasm hifi --help` lists these; `lasm hifi --help-all` shows every option,
+including the advanced ones below.
+
 Required:
 
 - `input`: one or more BAM/CRAM/SAM or FASTA/FASTQ(.gz) read files
 - `-o, --output`: output GFA path
 - `-l, --level`: LCP/core depth (or `--multipass`)
 
-Core assembly controls:
+Parallelism and input:
+
+- `-t, --threads`: worker thread count
+- `-@, --io-threads`: decompression thread count per input file (BAM/CRAM/SAM and gzipped FASTA/FASTQ; no effect on uncompressed FASTA/FASTQ)
+- `--file-reading-mode`: `sequential` or `parallel`
+
+Assembly:
 
 - `--lcmer-l`: rolling `lcmer` window length (cores) used for DBG construction
   and overlap detection (default 6). `--dbg-lcmer-l` is accepted as the old
   name; `--olc-lcmer-l` is ignored.
-- `--random-seed`: hash/random seed
-- `--prime-reverse` / `--no-prime-reverse`: also parse each read's reverse
-  complement and insert its lcmer keys into the Bloom filter only (no node,
-  count or edge), so reads of the other strand are admitted at their first
-  sighting (default on)
-- `--strict-layout-labels` / `--no-strict-layout-labels`: during layout,
-  accept a core-label match as a seed only if both cores have the same
-  homopolymer-compressed sequence, so cores that merely share a label are not
-  chained (default on)
 - `--multipass LEVEL:L[,LEVEL:L...]`: multi-pass assembly, e.g.
   `4:8,5:6,5:10`; each item is the LCP level and lcmer window length of one
   pass, replacing `-l` and `--lcmer-l`. Each pass assembles the reads together
@@ -123,11 +123,19 @@ Core assembly controls:
   the `--print-raw-dbg`/`--print-bi-dbg` dumps). Small windows bridge
   construction holes and large ones resolve repeats, so order the passes from
   small to large windows
+- `--ploidy`: copies of a locus, `1` (default) or `2`; a bubble whose nodes all stay within the depth of one locus (its measured depth plus three times its spread) holds alleles or read errors and is popped, a deeper one is a repeat and is kept. With `2`, short dead-end branches at one-locus forks (allele tips) are cut as well
+- `--silent`: reduce progress logging (with `--multipass`, every pass logs its
+  settings, the segments it uses and keeps, and its wall/CPU time)
+
+## Advanced Parameters
+
+The defaults suit most runs.
+
+### Advanced: k-mer selection
 
 Syncmer selection (Edgar 2021). A k-mer is selected by the position of its
 smallest s-mer; selection is computed on the fly from s-mer hashes, with no
-per-k-mer table. With `--rle` (default), k-mers and s-mers count run-length
-runs, not bases.
+per-k-mer table. K-mers and s-mers count run-length runs, not bases.
 
 - `--syncmer-k`: k-mer length, at most 16 (default 11)
 - `--submer-s`: s-mer length, 1 <= s < k. Without `--submer-t` this is a
@@ -136,32 +144,38 @@ runs, not bases.
   0 <= t <= k - s (requires `--submer-s`)
 - With neither `--submer-s` nor `--submer-t`, an open syncmer with s=4, t=6
   is used
+- `--random-seed`: seed of the s-mer hash
 
-Parallelism:
+### Advanced: Bloom filter
 
-- `-t, --threads`: worker thread count
-- `-@, --io-threads`: decompression thread count per input file (BAM/CRAM/SAM and gzipped FASTA/FASTQ; no effect on uncompressed FASTA/FASTQ)
-- `--file-reading-mode`: `sequential` or `parallel`
+- `--projected-element-count`: distinct lcmer keys the Bloom filter is sized
+  for (default 100000000); construction warns when the filter is undersized
+- `--false-positive-probability`: target false-positive probability
+  (default 0.001)
+- `--prime-reverse` / `--no-prime-reverse`: also parse each read's reverse
+  complement and insert its lcmer keys into the Bloom filter only (no node,
+  count or edge), so reads of the other strand are admitted at their first
+  sighting (default on)
 
-Graph cleaning:
+### Advanced: graph cleaning
 
 - `--iterations`: number of graph-cleaning passes (default 6)
-- `--max-tip-length`: maximum tip length in cores
-- `--ploidy`: copies of a locus, `1` (default) or `2`; a bubble whose nodes all stay within the depth of one locus (its measured depth plus three times its spread) holds alleles or read errors and is popped, a deeper one is a repeat and is kept. With `2`, short dead-end branches at one-locus forks (allele tips) are cut as well
+- `--max-tip-length`: maximum tip length in cores (default 16)
 - `--max-bubble-length`: largest bubble to pop, in inner cores (default 1024); `0` disables bubble popping
 - `--min-bubble-length-difference`: maximum length ratio of a bubble's removed nodes to its kept path (default 2)
 
-Layout:
+### Advanced: layout
 
 - `--drop-crumbs` / `--keep-crumbs`: drop crumb nodes (too short for overlap detection) that have a single predecessor and continue into a longer node, instead of emitting them as `C` segments (default on; halves the contig count at a small genome-fraction cost)
+- `--strict-layout-labels` / `--no-strict-layout-labels`: accept a core-label
+  match as a seed only if both cores have the same homopolymer-compressed
+  sequence, so cores that merely share a label are not chained (default on)
 - `--end-joins` / `--no-end-joins`: join two free segment ends that overlap as reverse complements (the two read strands of one locus stopped at different holes) into one segment; candidates need a unique partner, one-locus depth at both ends, end windows that are not tandem-periodic (collapsed satellite arrays), and an overlap that does not recur near either end (a longer-period array, where the overlap's position is ambiguous) (default on)
 
-Output and debugging:
+### Advanced: other
 
 - `--print-raw-dbg`: write the pre-cleaning graph with `.raw.gfa` suffix
 - `--print-bi-dbg`: write the graph before layout with `.bi.gfa` suffix
-- `--silent`: reduce progress logging (with `--multipass`, every pass logs its
-  settings, the segments it uses and keeps, and its wall/CPU time)
 
 ## Output Files
 
