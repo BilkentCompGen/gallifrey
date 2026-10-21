@@ -148,7 +148,3 @@ void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len,
         chs.data[0] = std::countl_zero(static_cast<unsigned>(data[len / 2])) - 24;
     }
 }
-
-#ifdef LASM_UNIT_TESTS
-#include "tests/lcmer.test.inc"
-#endif

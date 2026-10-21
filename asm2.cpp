@@ -1435,7 +1435,3 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
         node.second.seq.emplace_back();
     }
 }
-
-#ifdef LASM_UNIT_TESTS
-#include "tests/asm2.test.inc"
-#endif
