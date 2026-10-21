@@ -1,5 +1,4 @@
 #include <CLI/CLI.hpp>
-#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -8,7 +7,7 @@
 
 #define LCPTOOLS_IMPL
 #include "asm.h"
-#include "bamdoctor.h"
+#include "config.h"
 #include "dump_cores.h"
 #include "ext/lcptools/lcptools_ho.h"
 #include "syncmer_option.h"
@@ -60,7 +59,7 @@ class AsmProgram {
             return std::string{};
         };
         app.add_option("input", cfg.inputs,
-                       "Input read files: BAM, CRAM, SAM, or FASTA/FASTQ "
+                       "Input read files: BAM or FASTA/FASTQ "
                        "(plain or gzipped). Format is detected from content; "
                        "formats may be mixed.")
             ->required();
@@ -72,7 +71,8 @@ class AsmProgram {
             ->capture_default_str();
         app.add_option(
                "-@,--io-threads", cfg.threads.io,
-               "Number of IO threads (Used by htslib for decompressing)")
+               "Number of decompression threads per BGZF input (BAM, bgzipped "
+               "FASTA/FASTQ)")
             ->check(CLI::Range(0, 64))
             ->capture_default_str();
         app.add_option("--file-reading-mode", file_reading_mode,
@@ -247,54 +247,6 @@ class AsmProgram {
     AsmProgram &operator=(const AsmProgram &) = delete;
 };
 
-class SamReadTesting {
-    string input;
-    int lcp_level = 5;
-    int threads = 8;
-    SamReadTestingMode mode = SamReadTestingMode::BASIC;
-    string job = "read_count";
-    syncmer_params syncmer;
-
-   public:
-    explicit SamReadTesting(CLI::App &parent) {
-        auto &app = *parent.add_subcommand("bamdoctor", "read bam file fast");
-        app.add_option("input", input, "Input bam file")->required();
-        app.add_option("-l,--level", lcp_level, "LCP level to compute")
-            ->required();
-        app.add_option("-t,--threads", threads, "Number of threads")
-            ->check(CLI::Range(1, MAXIMUM_WORK_THREADS))
-            ->capture_default_str();
-        add_syncmer_option(app, syncmer);
-
-        std::map<std::string, SamReadTestingMode> SamReadTestingMode_map = {
-            {"basic", SamReadTestingMode::BASIC},
-            {"pool", SamReadTestingMode::POOL},
-        };
-        std::map<std::string, std::string> job_map = {
-            {"read_count", "read_count"},
-            {"core_count", "core_count"},
-        };
-        app.add_option("--job", job, "Job to run")
-            ->required()
-            ->transform(CLI::CheckedTransformer(job_map, CLI::ignore_case));
-        app.add_option("--mode", mode, "Mode to run")
-            ->required()
-            ->transform(CLI::CheckedTransformer(SamReadTestingMode_map,
-                                                CLI::ignore_case));
-        app.callback([this]() {
-            // CLI11 callbacks return void; re-raise a nonzero rc as a CLI error
-            // so it reaches the process exit status.
-            if (int rc = run_sam_read_testing(input, threads, lcp_level, mode,
-                                              job, syncmer);
-                rc != 0) {
-                throw CLI::RuntimeError("bamdoctor failed", rc);
-            }
-        });
-    }
-    SamReadTesting(const SamReadTesting &) = delete;
-    SamReadTesting &operator=(const SamReadTesting &) = delete;
-};
-
 int main(int argc, char **argv) {
     CLI::App app("lasm");
     app.require_subcommand(1);
@@ -305,7 +257,6 @@ int main(int argc, char **argv) {
         if (std::string_view(argv[i]) == "--help-all") show_advanced = true;
     }
     AsmProgram hifi{app, show_advanced};
-    SamReadTesting bamdoctor{app};
     DumpCoresProgram dumpcores{app};
 
     CLI11_PARSE(app, argc, argv);

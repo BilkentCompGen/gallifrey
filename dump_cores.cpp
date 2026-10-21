@@ -15,14 +15,6 @@
 #include "syncmer.h"
 #include "syncmer_option.h"
 
-static input_format dump_input_format(const std::string &path) {
-    const input_format f = detect_input_format(path);
-    if (f == input_format::fastx_plain || f == input_format::fastx_compressed) {
-        return f;
-    }
-    return input_format::invalid;
-}
-
 static int run_dump_cores(const std::string &input_path,
                           const std::string &output_path,
                           const syncmer_params &spara, int lcp_level,
@@ -45,14 +37,14 @@ static int run_dump_cores(const std::string &input_path,
             out,
             "read_name\tread_len\tcore_idx\tcore_label\tstart\tend\tspan\n");
 
-    const input_format fmt = dump_input_format(input_path);
-    if (fmt == input_format::invalid) {
+    const auto fmt = detect_input_format(input_path);
+    if (!fmt || *fmt != input_format::fastx) {
         fprintf(stderr, "Not a FASTA/FASTQ input: %s\n", input_path.c_str());
         fclose(out);
         return 1;
     }
     fastx_reader reader;
-    if (!reader.open(input_path, fmt == input_format::fastx_compressed, 1)) {
+    if (!reader.open(input_path, 0)) {
         fprintf(stderr, "Cannot open input: %s\n", input_path.c_str());
         fclose(out);
         return 1;

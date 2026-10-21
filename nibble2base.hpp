@@ -1,8 +1,6 @@
 #ifndef NIBBLE2BASE_HPP
 #define NIBBLE2BASE_HPP
 
-#include <htslib/sam.h>
-
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -13,8 +11,8 @@
 #include <span>
 #include <vector>
 
-#include "htslib/hts.h"
 #include "kmer_bits.h"
+#include "nt16.h"
 
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
 #include <arm_neon.h>

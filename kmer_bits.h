@@ -3,8 +3,8 @@
 
 #include <cstdint>
 
-// Low-level 2-bit-packed k-mer bit tricks with no project/htslib
-// dependencies, shareable by nibble2base.hpp and syncmer.h.
+// Low-level 2-bit-packed k-mer bit tricks with no project dependencies,
+// shareable by nibble2base.hpp and syncmer.h.
 
 // Letter of each 2-bit base code (A=0, C=1, G=2, T=3).
 inline constexpr char kBaseLetters[4] = {'A', 'C', 'G', 'T'};

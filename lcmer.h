@@ -7,7 +7,6 @@
 #include "nibble2base.hpp"
 #ifndef LCMER_H
 #define LCMER_H
-#include <htslib/sam.h>
 #include <stdint.h>
 
 #include <algorithm>
@@ -21,6 +20,7 @@
 
 #include "kmer_lcp.h"
 #include "nibble2base.hpp"
+#include "nt16.h"
 #include "syncmer.h"
 using SequenceContainerType = CrumbledSubSeq64;
 // The fragments of one sequence, in order, wherever they are stored (a node's

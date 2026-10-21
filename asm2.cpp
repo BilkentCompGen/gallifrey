@@ -1,10 +1,5 @@
 #include <blockingconcurrentqueue.h>
 #include <fcntl.h>
-#include <htslib/bgzf.h>
-#include <htslib/hfile.h>
-#include <htslib/hts.h>
-#include <htslib/sam.h>
-#include <htslib/thread_pool.h>
 #include <stdio.h>
 #include <unistd.h>
 #if defined(__GLIBC__)
@@ -32,6 +27,7 @@
 #include <vector>
 
 #include "asm.h"
+#include "bam_reader.h"
 #include "config.h"
 #include "fastx.h"
 #include "graph.h"
@@ -61,10 +57,7 @@ struct assembler {
     // Records from the readers to the workers; a full queue blocks readers.
     template <class Rec>
     using data_queue_of = bounded_queue<Rec *>;
-    using hts_queue = queue_of<bam1_t>;
-    using fastx_queue = queue_of<seq_record>;
-    // (path, is_compressed) -- the flag is only meaningful for FASTX inputs.
-    using stage_input = std::pair<string, bool>;
+    using record_queue = queue_of<seq_record>;
     gtl::vector<string> inputs;
     string output;
     decltype(asm_config::threads) threads;
@@ -528,18 +521,8 @@ struct assembler {
     }
 
     // Record traits. The worker loop only needs the packed nt16 sequence and
-    // its base count, so each input path keeps its own record type and the
-    // htslib (BAM/CRAM/SAM) path stays copy-free.
-    struct hts_record_ops {
-        using record = bam1_t;
-        static record *create() { return bam_init1(); }
-        static void destroy(record *r) { bam_destroy1(r); }
-        static const uint8_t *seq(const record *r) { return bam_get_seq(r); }
-        static size_t len(const record *r) {
-            return static_cast<size_t>(r->core.l_qseq);
-        }
-    };
-    struct fastx_record_ops {
+    // its base count; every reader fills the same recycled seq_record.
+    struct seq_record_ops {
         using record = seq_record;
         static record *create() { return seq_record_init(); }
         static void destroy(record *r) { seq_record_destroy(r); }
@@ -618,58 +601,50 @@ struct assembler {
         }
     }
 
-    // htslib path: BAM, CRAM, SAM.
-    [[nodiscard]] static bool read_hts(const stage_input &input,
-                                       data_queue_of<bam1_t> &data_queue,
-                                       hts_queue &recycle_queue, int threads) {
-        samFile *fp = sam_open(input.first.c_str(), "r");
-        if (!fp) {
-            std::cerr << "Error: Could not open " << input.first << std::endl;
+    [[nodiscard]] static bool read_bam(const string &path,
+                                       data_queue_of<seq_record> &data_queue,
+                                       record_queue &recycle_queue,
+                                       int threads) {
+        bam_reader reader;
+        if (!reader.open(path, threads)) {
+            std::cerr << "Error: Could not read " << path << ": "
+                      << reader.error() << std::endl;
             return false;
         }
-        hts_set_threads(fp, threads);
-        bam_hdr_t *hdr = sam_hdr_read(fp);
-        if (!hdr) {
-            std::cerr << "Error: Could not read header of " << input.first
-                      << std::endl;
-            sam_close(fp);
-            return false;
-        }
-        // sam_read1: >= 0 record, -1 clean EOF, < -1 truncated/corrupt input.
         // A truncated file must fail the run, not silently assemble a subset.
-        int rc = 0;
-        enqueue_records<hts_record_ops>(data_queue, recycle_queue,
-                                        [&](bam1_t *rec) {
-                                            rc = sam_read1(fp, hdr, rec);
-                                            return rc >= 0;
-                                        });
-        bam_hdr_destroy(hdr);
-        sam_close(fp);
-        if (rc < -1) {
-            std::cerr << "Error: truncated or corrupt input " << input.first
-                      << " (sam_read1 rc=" << rc << ")" << std::endl;
+        enqueue_records<seq_record_ops>(
+            data_queue, recycle_queue,
+            [&](seq_record *rec) { return reader.next(*rec); });
+        if (reader.failed()) {
+            std::cerr << "Error: truncated or corrupt input " << path << " ("
+                      << reader.error() << ")" << std::endl;
             return false;
         }
         return true;
     }
 
-    // Native FASTA/FASTQ path: no bam1_t rebuild, no quality array, bases are
-    // packed into the record's nibble buffer during the block scan.
-    [[nodiscard]] static bool read_fastx(const stage_input &input,
+    // FASTA/FASTQ: bases are packed into the record's nibble buffer during
+    // the block scan.
+    [[nodiscard]] static bool read_fastx(const string &path,
                                          data_queue_of<seq_record> &data_queue,
-                                         fastx_queue &recycle_queue,
+                                         record_queue &recycle_queue,
                                          int threads) {
         fastx_reader reader;
-        if (!reader.open(input.first, input.second, threads)) {
-            std::cerr << "Error: Could not open " << input.first << std::endl;
+        if (!reader.open(path, threads)) {
+            std::cerr << "Error: Could not open " << path << std::endl;
             return false;
         }
-        enqueue_records<fastx_record_ops>(
+        enqueue_records<seq_record_ops>(
             data_queue, recycle_queue,
             [&](seq_record *rec) { return reader.next(*rec); });
+        if (!reader.stream_error().empty()) {
+            std::cerr << "Error: truncated or corrupt input " << path << " ("
+                      << reader.stream_error() << ")" << std::endl;
+            return false;
+        }
         if (reader.failed()) {
             std::cerr << "Error: malformed or unreadable FASTA/FASTQ input "
-                      << input.first << std::endl;
+                      << path << std::endl;
             return false;
         }
         return true;
@@ -686,7 +661,7 @@ struct assembler {
     // One worker pool over one group of same-format inputs. Returns false if
     // any reader failed. Read counts are accumulated into the caller's sums.
     template <class Ops, class Reader>
-    bool run_stage(const gtl::vector<stage_input> &stage_inputs, Reader reader,
+    bool run_stage(const gtl::vector<string> &stage_inputs, Reader reader,
                    dbg_index &dbgi, auto Process_Func, u64 &valid_sum,
                    u64 &all_sum) {
         // Records in flight per worker before the readers block. Each holds a
@@ -724,7 +699,7 @@ struct assembler {
                 readers.emplace_back([&, input]() {
                     if (!reader(input, data_queue, recycle_queue, threads.io)) {
                         fprintf(stderr, "Failed to read from input %s\n",
-                                input.first.c_str());
+                                input.c_str());
                         read_failed.store(true);
                     }
                 });
@@ -736,7 +711,7 @@ struct assembler {
             for (const auto &input : stage_inputs) {
                 if (!reader(input, data_queue, recycle_queue, threads.io)) {
                     fprintf(stderr, "Failed to read from input %s\n",
-                            input.first.c_str());
+                            input.c_str());
                     read_failed.store(true);
                     break;
                 }
@@ -757,37 +732,33 @@ struct assembler {
         return !read_failed.load();
     }
 
-    // Runs `Process_Func` over every input, routing each file to the htslib
-    // reader or the native FASTX reader according to its detected format.
+    // Runs `Process_Func` over every input, routing each file to the BAM
+    // reader or the FASTX reader according to its detected format.
     bool run_over_inputs(dbg_index &dbgi, auto Process_Func, u64 &valid_sum,
                          u64 &all_sum) {
-        gtl::vector<stage_input> hts_inputs;
-        gtl::vector<stage_input> fastx_inputs;
+        gtl::vector<string> bam_inputs;
+        gtl::vector<string> fastx_inputs;
         for (const auto &input : inputs) {
-            switch (detect_input_format(input)) {
-                case input_format::htslib:
-                    hts_inputs.emplace_back(input, false);
-                    break;
-                case input_format::fastx_plain:
-                    fastx_inputs.emplace_back(input, false);
-                    break;
-                case input_format::fastx_compressed:
-                    fastx_inputs.emplace_back(input, true);
-                    break;
-                case input_format::invalid:
-                    fprintf(stderr, "Error: cannot open input %s\n",
-                            input.c_str());
-                    return false;
+            const auto format = detect_input_format(input);
+            if (!format) {
+                fprintf(stderr, "Error: input %s: %s\n", input.c_str(),
+                        format.error().c_str());
+                return false;
+            }
+            if (*format == input_format::fastx) {
+                fastx_inputs.push_back(input);
+            } else {
+                bam_inputs.push_back(input);
             }
         }
         bool ok = true;
-        if (!hts_inputs.empty()) {
-            ok = run_stage<hts_record_ops>(hts_inputs, read_hts, dbgi,
+        if (!bam_inputs.empty()) {
+            ok = run_stage<seq_record_ops>(bam_inputs, read_bam, dbgi,
                                            Process_Func, valid_sum, all_sum);
         }
         if (ok && !fastx_inputs.empty()) {
-            ok = run_stage<fastx_record_ops>(fastx_inputs, read_fastx, dbgi,
-                                             Process_Func, valid_sum, all_sum);
+            ok = run_stage<seq_record_ops>(fastx_inputs, read_fastx, dbgi,
+                                           Process_Func, valid_sum, all_sum);
         }
         return ok;
     }

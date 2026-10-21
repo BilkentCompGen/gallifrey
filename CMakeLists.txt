@@ -72,8 +72,10 @@ endif()
 #     # Remove optimization that can interfere with debugging
 #     string(REPLACE "-Wno-interference-size" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 # endif()
+# libdeflate inflates BGZF blocks; zlib streams plain gzip.
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(HTS REQUIRED IMPORTED_TARGET htslib)
+pkg_check_modules(DEFLATE REQUIRED IMPORTED_TARGET libdeflate)
+pkg_check_modules(ZLIB REQUIRED IMPORTED_TARGET zlib)
 
 set(SOURCE_FILES lasm.cpp asm2.cpp dump_cores.cpp)
 
@@ -138,8 +140,8 @@ endif()
 
 # Link libraries
 target_link_libraries(${PROJECT_NAME} PRIVATE
-                      PkgConfig::HTS gtl CLI11::CLI11 ksw2_extd2
-                      concurrentqueue pthread deflate z
+                      PkgConfig::DEFLATE PkgConfig::ZLIB gtl CLI11::CLI11 ksw2_extd2
+                      concurrentqueue pthread
                       $<$<PLATFORM_ID:Linux>:rt>)
 
 # Convenience target: run the assembler on a local sample (data not in repo).

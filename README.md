@@ -6,7 +6,7 @@ Requirements:
 
 - CMake >= 3.20
 - C++23 compiler
-- `htslib`
+- `libdeflate`
 - `zlib`
 - POSIX threads
 
@@ -60,8 +60,12 @@ cmake --build build-prof -j
 
 `lasm hifi` accepts one or more read files. Supported formats:
 
-- BAM, CRAM, SAM (unmapped reads are fine; CRAM with mapped reads needs the reference available to htslib)
-- FASTA and FASTQ, plain or gzipped
+- BAM (mapped or unmapped; every record's sequence is used)
+- FASTA and FASTQ, plain, gzipped or bgzipped
+
+SAM and CRAM are not read directly; convert them first, for example with
+`samtools view -b -o reads.bam reads.sam` (or `reads.cram`), or
+`samtools fastq reads.cram > reads.fq`.
 
 The format is detected from the file content, so any file name works. Read
 names and quality values are ignored; only sequences are used. Different
@@ -99,14 +103,14 @@ including the advanced ones below.
 
 Required:
 
-- `input`: one or more BAM/CRAM/SAM or FASTA/FASTQ(.gz) read files
+- `input`: one or more BAM or FASTA/FASTQ(.gz) read files
 - `-o, --output`: output GFA path
 - `-l, --level`: LCP/core depth (or `--multipass`)
 
 Parallelism and input:
 
 - `-t, --threads`: worker thread count
-- `-@, --io-threads`: decompression thread count per input file (BAM/CRAM/SAM and gzipped FASTA/FASTQ; no effect on uncompressed FASTA/FASTQ)
+- `-@, --io-threads`: decompression thread count per BGZF input file (BAM and bgzipped FASTA/FASTQ; plain gzip is decompressed on one thread, uncompressed input needs none)
 - `--file-reading-mode`: `sequential` or `parallel`
 
 Assembly:
