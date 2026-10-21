@@ -251,23 +251,25 @@ struct assembler {
         }
     }
 
-    // --prime-reverse: parses the read's reverse complement from its nibbles
-    // and inserts those lcmer keys into the Bloom filter only (no node, count
-    // or edge), so the first sighting of the sequence on the other strand is
-    // admitted. The windows are the ones process_cores would take. `rc` and
-    // `lr` are caller scratch.
+    // --prime-reverse: parses the read's reverse complement and inserts those
+    // lcmer keys into the Bloom filter only (no node, count or edge), so the
+    // first sighting of the sequence on the other strand is admitted. The
+    // windows are the ones process_cores would take. chs/pos_buf hold the
+    // read's run-length stream of rle_len runs, as parse_cores_from_nibbles
+    // left it; it is turned into the reverse complement's in place. `lr` is
+    // caller scratch.
     template <class BFT>
-    static void prime_reverse_complement(const uint8_t *nibbles, size_t len,
-                                         int lcp_level, core_buf *str,
-                                         const SyncmerType &syncmer_functor,
-                                         charsi &chs, pos_scratch &pos_buf,
-                                         gtl::vector<uint8_t> &rc, lcp_read &lr,
-                                         dbg_index_base<BFT> &dbgi,
-                                         int lcmer_l) {
-        revcomp_nibbles(nibbles, static_cast<uint32_t>(len), rc);
+    static void prime_reverse_complement(
+        const uint8_t *nibbles, size_t len, int64_t rle_len, int lcp_level,
+        core_buf *str, const SyncmerType &syncmer_functor, charsi &chs,
+        pos_scratch &pos_buf, lcp_read &lr, dbg_index_base<BFT> &dbgi,
+        int lcmer_l) {
+        const int64_t rc_len =
+            rle_reverse_complement(nibbles, static_cast<int64_t>(len), chs.data,
+                                   pos_buf.data, rle_len);
         lr.clear();
-        parse_cores_from_nibbles(rc.data(), len, lcp_level, str,
-                                 syncmer_functor, chs, lr, pos_buf);
+        parse_cores_from_rle(chs.data, pos_buf.data, rc_len, len, lcp_level,
+                             str, syncmer_functor, lr);
         if (lr.cores.size() < static_cast<size_t>(lcmer_l + 2)) {
             return;
         }
@@ -475,22 +477,20 @@ struct assembler {
         charsi chs;
         pos_scratch pos_buf;
         lcp_read lr;
-        gtl::vector<uint8_t> rc_nibbles;
         while (next_item(data_queue, done, data_p)) {
             all_reads++;
             lr.clear();
-            parse_cores_from_nibbles(Ops::seq(data_p), Ops::len(data_p),
-                                     lcp_level, &str, syncmer_functor, chs, lr,
-                                     pos_buf);
+            const int64_t rle_len = parse_cores_from_nibbles(
+                Ops::seq(data_p), Ops::len(data_p), lcp_level, &str,
+                syncmer_functor, chs, lr, pos_buf);
             // Skip reads with too few cores; the record is recycled regardless.
             if (lr.cores.size() >= static_cast<size_t>(lcmer_l + 2)) {
                 ++processed_read_count;
                 Process_Func(lr, dbgi, thread_id, lcmer_index, lcmer_l);
                 if (prime_reverse) {
-                    prime_reverse_complement(Ops::seq(data_p), Ops::len(data_p),
-                                             lcp_level, &str, syncmer_functor,
-                                             chs, pos_buf, rc_nibbles, lr, dbgi,
-                                             lcmer_l);
+                    prime_reverse_complement(
+                        Ops::seq(data_p), Ops::len(data_p), rle_len, lcp_level,
+                        &str, syncmer_functor, chs, pos_buf, lr, dbgi, lcmer_l);
                 }
             }
             if (!recycle_queue.try_enqueue(data_p)) {

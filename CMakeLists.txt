@@ -75,7 +75,7 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(HTS REQUIRED IMPORTED_TARGET htslib)
 
-set(SOURCE_FILES lasm.cpp asm2.cpp lcmer.cpp dump_cores.cpp)
+set(SOURCE_FILES lasm.cpp asm2.cpp dump_cores.cpp)
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
 target_include_directories(${PROJECT_NAME} PRIVATE ./ext)

@@ -418,75 +418,6 @@ struct KmerViewOnBytes {
     constexpr int_type get() const noexcept { return value; }
 };
 
-void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len,
-                                       charsi &c);
-
-inline int64_t rle_compact(const uint8_t *data, int64_t len, uint8_t *rle_data,
-                           uint32_t *rle_pos) {
-    if (len <= 0) return 0;
-    rle_data[0] = data[0];
-    rle_pos[0] = 0;
-    int64_t out = 1;
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-    int64_t i = 1;
-    for (; i + 16 <= len; i += 16) {
-        uint8x16_t curr = vld1q_u8(data + i);
-        uint8x16_t prev = vld1q_u8(data + i - 1);
-        uint8x16_t neq = vmvnq_u8(vceqq_u8(curr, prev));
-        uint8x8_t narrowed = vshrn_n_u16(vreinterpretq_u16_u8(neq), 4);
-        uint64_t mask64 = vget_lane_u64(vreinterpret_u64_u8(narrowed), 0);
-        if (mask64 == 0) continue;
-        while (mask64) {
-            int nibble_idx = __builtin_ctzll(mask64) >> 2;
-            rle_data[out] = data[i + nibble_idx];
-            rle_pos[out] = static_cast<uint32_t>(i + nibble_idx);
-            ++out;
-            mask64 &= ~(0x0FULL << (nibble_idx * 4));
-        }
-    }
-    for (; i < len; ++i) {
-        if (data[i] != data[i - 1]) {
-            rle_data[out] = data[i];
-            rle_pos[out] = static_cast<uint32_t>(i);
-            ++out;
-        }
-    }
-#elif defined(__SSSE3__)
-    int64_t i = 1;
-    for (; i + 16 <= len; i += 16) {
-        __m128i curr =
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + i));
-        __m128i prev =
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + i - 1));
-        int mask = ~_mm_movemask_epi8(_mm_cmpeq_epi8(curr, prev)) & 0xFFFF;
-        if (mask == 0) continue;
-        while (mask) {
-            int idx = __builtin_ctz(mask);
-            rle_data[out] = data[i + idx];
-            rle_pos[out] = static_cast<uint32_t>(i + idx);
-            ++out;
-            mask &= mask - 1;
-        }
-    }
-    for (; i < len; ++i) {
-        if (data[i] != data[i - 1]) {
-            rle_data[out] = data[i];
-            rle_pos[out] = static_cast<uint32_t>(i);
-            ++out;
-        }
-    }
-#else
-    for (int64_t i = 1; i < len; ++i) {
-        if (data[i] != data[i - 1]) {
-            rle_data[out] = data[i];
-            rle_pos[out] = static_cast<uint32_t>(i);
-            ++out;
-        }
-    }
-#endif
-    return out;
-}
-
 // Fused nt16 one-hot decode + RLE compaction in a single pass.
 // Input: packed nt16 nibbles (2 bases per byte, as bam_get_seq() or the FASTX
 // reader produce), length in bases.
@@ -885,15 +816,6 @@ inline uint64_t parse1_rle_syncmers(const uint8_t *rle_data,
     return core_index;
 }
 
-inline uint64_t parse1_2bit_syncmers(const uint8_t *data, int64_t len,
-                                     core_buf *str, const auto &syncmer_functor,
-                                     charsi &rle_buf, pos_scratch &pos_buf) {
-    rle_buf.require(len);
-    pos_buf.require(len);
-    int64_t rle_len = rle_compact(data, len, rle_buf.data, pos_buf.data);
-    return parse1_rle_syncmers(rle_buf.data, pos_buf.data, rle_len, len, str,
-                               syncmer_functor);
-}
 // Level-1 cores of bases [from, to) of the concatenated fragments, with
 // positions in whole-sequence coordinates: the RLE stream of the range is
 // windowed with the same code as the read path. A run is NOT restarted when
@@ -1097,56 +1019,88 @@ constexpr uint8_t nibble_complement(uint8_t n) {
     return comp[n];
 }
 
-// Reverse complement of a byte of two packed nibbles: the nibbles swapped and
-// each complemented.
-inline constexpr std::array<uint8_t, 256> kRevcompNibblePair = [] {
-    std::array<uint8_t, 256> table{};
-    for (int b = 0; b < 256; ++b) {
-        table[b] = static_cast<uint8_t>((nibble_complement(b & 0xF) << 4) |
-                                        nibble_complement(b >> 4));
-    }
-    return table;
-}();
-
-// Reverse complement of len packed nibbles into dst, a byte at a time. For an
-// odd len the source's padding nibble would come first, so every output byte
-// takes its two nibbles from neighbouring reversed bytes, and the last low
-// nibble is 0.
-inline void revcomp_nibbles(const uint8_t *src, uint32_t len,
-                            gtl::vector<uint8_t> &dst) {
-    const uint32_t bytes = (len + 1) / 2;
-    dst.resize(bytes);
-    if (len % 2 == 0) {
-        for (uint32_t j = 0; j < bytes; ++j) {
-            dst[j] = kRevcompNibblePair[src[bytes - 1 - j]];
-        }
-        return;
-    }
-    for (uint32_t j = 0; j + 1 < bytes; ++j) {
-        dst[j] =
-            static_cast<uint8_t>((kRevcompNibblePair[src[bytes - 1 - j]] << 4) |
-                                 (kRevcompNibblePair[src[bytes - 2 - j]] >> 4));
-    }
-    dst[bytes - 1] = static_cast<uint8_t>(kRevcompNibblePair[src[0]] << 4);
+// Nonzero iff nibble n is not A, C, G or T, the nibbles with exactly one bit
+// set. Plain bit operations, so a scan of a whole read vectorizes.
+constexpr uint8_t non_acgt_bits(uint8_t n) {
+    return static_cast<uint8_t>((n & (n - 1)) | (n == 0));
 }
 
-inline void parse_cores_from_nibbles(const uint8_t *data, size_t len,
-                                     int lcp_level, core_buf *str,
-                                     const auto &syncmer_functor, charsi &chs,
-                                     lcp_read &lr, pos_scratch &pos_buf,
-                                     bool reversed = false) {
-    chs.require(len + kOnehotRlePad);
-    pos_buf.require(len + kOnehotRlePad);
-    if (reversed) {
-        onehotto2bitDNA_bivec_chs_reverse(data, len, chs);
-        parse1_2bit_syncmers(chs.data, len, str, syncmer_functor, chs, pos_buf);
-    } else {
-        int64_t rle_len = onehot_to_rle(data, len, chs.data, pos_buf.data);
-        parse1_rle_syncmers(chs.data, pos_buf.data, rle_len, len, str,
-                            syncmer_functor);
+// Whether any of len packed nibbles is not A, C, G or T.
+inline bool has_non_acgt(const uint8_t *nibbles, int64_t len) {
+    uint8_t other = 0;
+    for (int64_t i = 0; i < len / 2; ++i) {
+        other |=
+            non_acgt_bits(nibbles[i] >> 4) | non_acgt_bits(nibbles[i] & 0x0F);
     }
+    if (len % 2 == 1) other |= non_acgt_bits(nibbles[len / 2] >> 4);
+    return other != 0;
+}
+
+// Turns the run-length stream onehot_to_rle wrote for `nibbles` (len bases,
+// rle_len runs) in place into the one it writes for their reverse complement,
+// and returns its run count. The runs come in reverse order, and the run that
+// ended at e starts at len - e. An A, C, G or T run's base b complements to
+// 3 - b. Every other nibble complements to N, which decodes as A, so such a
+// run's base is 0 and neighbouring runs of two such nibbles become one run.
+inline int64_t rle_reverse_complement(const uint8_t *nibbles, int64_t len,
+                                      uint8_t *rle_data, uint32_t *rle_pos,
+                                      int64_t rle_len) {
+    if (rle_len <= 0) return 0;
+    std::reverse(rle_data, rle_data + rle_len);
+    for (int64_t j = 0; j < rle_len; ++j) rle_data[j] ^= 3;
+    // Forward run i ends where run i + 1 starts: once rle_pos[1, rle_len) is
+    // reversed, reverse run j >= 1 starts at len - rle_pos[j].
+    std::reverse(rle_pos + 1, rle_pos + rle_len);
+    for (int64_t j = 1; j < rle_len; ++j) {
+        rle_pos[j] = static_cast<uint32_t>(len) - rle_pos[j];
+    }
+    if (!has_non_acgt(nibbles, len)) return rle_len;
+
+    // Some run is not A, C, G or T: its 3 - b is wrong, and it merges with a
+    // neighbouring such run.
+    int64_t out = 0;
+    bool prev_other = false;
+    for (int64_t j = 0; j < rle_len; ++j) {
+        // Reverse base rle_pos[j] complements forward base `at`, which is the
+        // high nibble of its byte when even.
+        const uint32_t at = static_cast<uint32_t>(len) - 1 - rle_pos[j];
+        const uint8_t nib = (nibbles[at >> 1] >> ((~at & 1u) << 2)) & 0x0F;
+        const bool other = non_acgt_bits(nib) != 0;
+        if (other && prev_other) continue;
+        rle_data[out] = rle_data[j];
+        if (other) rle_data[out] = kOnehotDecode[nibble_complement(nib)];
+        rle_pos[out] = rle_pos[j];
+        ++out;
+        prev_other = other;
+    }
+    return out;
+}
+
+// Cores of the run-length stream rle_data/rle_pos (rle_len runs of a len-base
+// sequence) at lcp_level, appended to lr.
+inline void parse_cores_from_rle(const uint8_t *rle_data,
+                                 const uint32_t *rle_pos, int64_t rle_len,
+                                 size_t len, int lcp_level, core_buf *str,
+                                 const auto &syncmer_functor, lcp_read &lr) {
+    parse1_rle_syncmers(rle_data, rle_pos, rle_len, static_cast<int64_t>(len),
+                        str, syncmer_functor);
     str->deepen(lcp_level);
     str->append_to(lr);
+}
+
+// Cores of len packed nibbles, appended to lr. The run-length stream stays in
+// chs/pos_buf; returns its run count.
+inline int64_t parse_cores_from_nibbles(const uint8_t *data, size_t len,
+                                        int lcp_level, core_buf *str,
+                                        const auto &syncmer_functor,
+                                        charsi &chs, lcp_read &lr,
+                                        pos_scratch &pos_buf) {
+    chs.require(len + kOnehotRlePad);
+    pos_buf.require(len + kOnehotRlePad);
+    const int64_t rle_len = onehot_to_rle(data, len, chs.data, pos_buf.data);
+    parse_cores_from_rle(chs.data, pos_buf.data, rle_len, len, lcp_level, str,
+                         syncmer_functor, lr);
     lr.data = data;
+    return rle_len;
 }
 #endif
