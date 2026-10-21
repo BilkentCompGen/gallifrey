@@ -198,6 +198,14 @@ class AsmProgram {
         app.add_flag("--print-bi-dbg", cfg.print_prelayout_graph,
                      "Print DBG before layout (with .bi.gfa suffix)")
             ->group(other_group);
+        app.add_flag("--retro-admission", cfg.retro_admission,
+                     with_default(
+                         "Remember each lcmer window's first sighting on a "
+                         "read's own strand until a later sighting on either "
+                         "strand admits the window, then add that sighting's "
+                         "count and edges as if it had been admitted at once",
+                         cfg.retro_admission))
+            ->group(other_group);
         app.callback([this, level_opt, multipass_opt]() {
             if (olc_lcmer_l_ignored != 0) {
                 std::fprintf(stderr,

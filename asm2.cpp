@@ -77,6 +77,7 @@ struct assembler {
     bool parallel_file_reading;
     bool drop_crumbs;
     bool prime_reverse;
+    bool retro_admission;
     bool strict_layout_labels;
     bool end_joins;
 
@@ -93,6 +94,7 @@ struct assembler {
           parallel_file_reading{cfg.parallel_file_reading},
           drop_crumbs{cfg.drop_crumbs},
           prime_reverse{cfg.prime_reverse},
+          retro_admission{cfg.retro_admission},
           strict_layout_labels{cfg.strict_layout_labels},
           end_joins{cfg.end_joins} {
         inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
@@ -219,6 +221,34 @@ struct assembler {
         }
         return llr;
     }
+
+    // The fragment of window j of lr (cores j..j+L-1), the bases its last
+    // core adds: [end(j+L-2), end(j+L-1)).
+    static SequenceContainerType window_fragment(const lcp_read &lr, size_t j,
+                                                 int lcmer_l, u64 key,
+                                                 word_arena &arena) {
+        return SequenceContainerType(lr.data, lr.pos[j + lcmer_l - 2].second,
+                                     lr.pos[j + lcmer_l - 1].second, key,
+                                     arena);
+    }
+    // window_fragment for a reverse-complement parse lr of the len-base read
+    // `nibbles`, whose positions are on the reverse complement: the bases
+    // are read from the forward nibbles, complemented.
+    static SequenceContainerType reverse_window_fragment(
+        const uint8_t *nibbles, size_t len, const lcp_read &lr, size_t j,
+        int lcmer_l, u64 key, word_arena &arena) {
+        const size_t a = lr.pos[j + lcmer_l - 2].second;
+        const size_t b = lr.pos[j + lcmer_l - 1].second;
+        SequenceContainerType out{b - a, 0, arena};
+        out.origin_node = key;
+        for (size_t k = a; k < b; ++k) {
+            const uint8_t nib = bam_seqi(nibbles, len - 1 - k);
+            const uint64_t code = seq_nt16_int[nibble_complement(nib)] & 3;
+            const size_t bit = (k - a) * 2;
+            out.data[bit >> 6] |= code << (bit & 63);
+        }
+        return out;
+    }
     template <class BFT>
     static void process_cores(const lcp_read &lr, dbg_index_base<BFT> &dbgi,
                               int thread_id, uint64_t &lcmer_index,
@@ -243,11 +273,63 @@ struct assembler {
         // every path, and spelling a path concatenates fragments exactly.
         for (size_t i = 1; i < ll.size() - 1; ++i) {
             insert_lcmer_helper(ll, i, dbgi, [&](u64 key) {
-                return SequenceContainerType(
-                    lr.data, lr.pos[i + lcmer_l - 2].second,
-                    lr.pos[i + lcmer_l - 1].second, key,
-                    dbgi.fragment_arena(thread_id));
+                return window_fragment(lr, i, lcmer_l, key,
+                                       dbgi.fragment_arena(thread_id));
             });
+        }
+    }
+
+    // --retro-admission: a node for `key` if it has none, with count 0 and
+    // the fragment `fragment(key)`. It lets a kept sighting's adjacency find
+    // an admitted window that has no node yet (resolve_retro_admissions).
+    template <class BFT, class Fragment>
+    static void ensure_node(dbg_index_base<BFT> &dbgi, u64 key,
+                            Fragment &&fragment) {
+        using index_type = dbg_index_base<BFT>;
+        dbgi.dbg.lazy_emplace_l(
+            key, [](index_type::dbg_map_t::value_type &) {},
+            [&](const index_type::dbg_map_t::constructor &ctr) {
+                typename index_type::bidbg_val v{0U};
+                v.seq.push_back(fragment(key));
+                ctr(key, std::move(v));
+            });
+    }
+
+    // --retro-admission: process_cores, keeping first sightings in
+    // dbgi.retro (sight_own). An admitted window with no admitted
+    // neighbour also gets a node (count 0).
+    template <class BFT>
+    static void process_retro_cores(const lcp_read &lr,
+                                    dbg_index_base<BFT> &dbgi, int thread_id,
+                                    uint64_t &lcmer_index, int lcmer_l) {
+        (void)lcmer_index;
+        using index_type = dbg_index_base<BFT>;
+        LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
+        // Window keys, overwritten last to first by the sighting result (0
+        // when kept). A window's successor is then already 0 when it was
+        // kept from this read, so the successor's record alone holds that
+        // adjacency.
+        gtl::vector<uint64_t> ll(1, 0);
+        ll.reserve(lr.cores.size() - lcmer_l + 3);
+        ll.push_back(index_type::lcmer_id(l));
+        for (size_t i = static_cast<size_t>(lcmer_l + 1);
+             i < lr.cores.size() - 1; ++i) {
+            l.update_lcmer(lr.cores[i], lr.cores[i - lcmer_l], lcmer_l);
+            ll.push_back(index_type::lcmer_id(l));
+        }
+        ll.push_back(0);
+        for (size_t i = ll.size() - 2; i >= 1; --i) {
+            ll[i] = dbgi.sight_own(ll[i], ll[i - 1], ll[i + 1]);
+        }
+        for (size_t i = 1; i < ll.size() - 1; ++i) {
+            const auto fragment = [&](u64 key) {
+                return window_fragment(lr, i, lcmer_l, key,
+                                       dbgi.fragment_arena(thread_id));
+            };
+            insert_lcmer_helper(ll, i, dbgi, fragment);
+            if (ll[i] != 0 && ll[i - 1] == 0 && ll[i + 1] == 0) {
+                ensure_node(dbgi, ll[i], fragment);
+            }
         }
     }
 
@@ -257,13 +339,14 @@ struct assembler {
     // windows are the ones process_cores would take. chs/pos_buf hold the
     // read's run-length stream of rle_len runs, as parse_cores_from_nibbles
     // left it; it is turned into the reverse complement's in place. `lr` is
-    // caller scratch.
+    // caller scratch; `thread_id` picks the fragment arena of nodes made under
+    // --retro-admission.
     template <class BFT>
     static void prime_reverse_complement(
         const uint8_t *nibbles, size_t len, int64_t rle_len, int lcp_level,
         core_buf *str, const SyncmerType &syncmer_functor, charsi &chs,
         pos_scratch &pos_buf, lcp_read &lr, dbg_index_base<BFT> &dbgi,
-        int lcmer_l) {
+        int lcmer_l, int thread_id) {
         const int64_t rc_len =
             rle_reverse_complement(nibbles, static_cast<int64_t>(len), chs.data,
                                    pos_buf.data, rle_len);
@@ -273,13 +356,25 @@ struct assembler {
         if (lr.cores.size() < static_cast<size_t>(lcmer_l + 2)) {
             return;
         }
-        uint64_t unused_index = 0;
         LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
-        dbgi.emplace(l, unused_index, 0);
+        // Window j (cores j..j+L-1). Under --retro-admission, a window this
+        // sighting admits with a kept own-strand sighting gets its node here,
+        // from this parse's bases.
+        const auto sight = [&](size_t j) {
+            const u64 key = dbg_index_base<BFT>::lcmer_id(l);
+            if (dbgi.sight_reverse(key)) {
+                ensure_node(dbgi, key, [&](u64 k) {
+                    return reverse_window_fragment(
+                        nibbles, len, lr, j, lcmer_l, k,
+                        dbgi.fragment_arena(thread_id));
+                });
+            }
+        };
+        sight(1);
         for (size_t i = static_cast<size_t>(lcmer_l + 1);
              i < lr.cores.size() - 1; ++i) {
             l.update_lcmer(lr.cores[i], lr.cores[i - lcmer_l], lcmer_l);
-            dbgi.emplace(l, unused_index, 0);
+            sight(i - static_cast<size_t>(lcmer_l) + 1);
         }
     }
 
@@ -488,9 +583,10 @@ struct assembler {
                 ++processed_read_count;
                 Process_Func(lr, dbgi, thread_id, lcmer_index, lcmer_l);
                 if (prime_reverse) {
-                    prime_reverse_complement(
-                        Ops::seq(data_p), Ops::len(data_p), rle_len, lcp_level,
-                        &str, syncmer_functor, chs, pos_buf, lr, dbgi, lcmer_l);
+                    prime_reverse_complement(Ops::seq(data_p), Ops::len(data_p),
+                                             rle_len, lcp_level, &str,
+                                             syncmer_functor, chs, pos_buf, lr,
+                                             dbgi, lcmer_l, thread_id);
                 }
             }
             if (!recycle_queue.try_enqueue(data_p)) {
@@ -700,10 +796,26 @@ struct assembler {
     std::expected<void, std::string> construct_dbg(dbg_index &dbgi) {
         u64 valid_sum = 0;
         u64 all_sum = 0;
-        if (!run_over_inputs(dbgi, process_cores<DefaultBF>, valid_sum,
-                             all_sum)) {
+        auto process = process_cores<DefaultBF>;
+        if (retro_admission) {
+            dbgi.retro = std::make_unique<dbg_index::retro_admissions>();
+            process = process_retro_cores<DefaultBF>;
+        }
+        if (!run_over_inputs(dbgi, process, valid_sum, all_sum)) {
             return std::unexpected(
                 "Error in reading data for DBG construction.");
+        }
+        if (dbgi.retro) {
+            const u64 kept = dbgi.retro->map.size();
+            const u64 admitted = dbgi.resolve_retro_admissions(threads.work);
+            dbgi.retro.reset();
+            const u64 erased = dbgi.erase_unlinked_placeholders(threads.work);
+            fprintf(stderr,
+                    "Retro admission: %" PRIu64
+                    " first sightings kept, %" PRIu64
+                    " admitted later, %" PRIu64 " never admitted; %" PRIu64
+                    " unlinked placeholder nodes erased\n",
+                    kept, admitted, kept - admitted, erased);
         }
         fprintf(stderr, "%" PRIu64 " processed\n%" PRIu64 " total reads\n",
                 valid_sum, all_sum);

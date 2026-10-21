@@ -196,6 +196,10 @@ struct asm_config {
     // into the Bloom filter only, so the other strand's reads are admitted at
     // their first sighting.
     bool prime_reverse = true;
+    // Remember each window's first own-strand sighting until a later sighting
+    // on either strand admits the window, then add that sighting's count and
+    // edges, so first sightings are not lost.
+    bool retro_admission = false;
     // Accept a core-label match as an SCD layout seed only if both cores have
     // the same homopolymer-compressed sequence, so cores that merely share a
     // label are not chained.
@@ -252,6 +256,7 @@ struct asm_config {
                 bloom.projected_count, bloom.false_positive_rate);
         fprintf(f, "Drop Crumbs: %s\n", drop_crumbs ? "true" : "false");
         fprintf(f, "Prime Reverse: %s\n", prime_reverse ? "true" : "false");
+        fprintf(f, "Retro Admission: %s\n", retro_admission ? "true" : "false");
         fprintf(f, "Strict Layout Labels: %s\n",
                 strict_layout_labels ? "true" : "false");
         fprintf(f, "End Joins: %s\n", end_joins ? "true" : "false");
