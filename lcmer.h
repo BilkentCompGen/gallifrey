@@ -562,8 +562,12 @@ static inline int compact16_emit(
     uint32_t pos_base  // position offset for this half (chunk_start or +16)
 ) {
     // Build combined byte per lane: (lane_idx << 4) | value for changed, 0 for
-    // unchanged.
-    uint8x16_t live = vandq_u8(data_vec, neq_vec);
+    // unchanged. A changed lane 0 of nibble 0 would pack to 0 as well; nibble
+    // 15 decodes the same, so the value packs as that instead.
+    const uint8x16_t zero_nibble = vceqq_u8(data_vec, vdupq_n_u8(0));
+    const uint8x16_t value =
+        vorrq_u8(data_vec, vandq_u8(zero_nibble, vdupq_n_u8(0x0F)));
+    uint8x16_t live = vandq_u8(value, neq_vec);
     uint8x16_t combined = vorrq_u8(live, vandq_u8(neq_vec, idx_template));
 
     // --- Round 1: 16 bytes → 8 uint16 (merge adjacent pairs) ---
