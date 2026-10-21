@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <string>
 
+#include "asm.h"
+
 namespace CLI {
 class App;
 }
@@ -16,9 +18,7 @@ class App;
 class DumpCoresProgram {
     std::string input;
     std::string output;
-    int syncmer_k = 11;
-    int submer_s = 4;
-    int submer_t = 6;
+    syncmer_params syncmer;
     int lcp_level = 4;
     int lcmer_l = 0;
     uint32_t seed = 0;

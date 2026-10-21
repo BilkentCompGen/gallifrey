@@ -13,6 +13,7 @@
 #include "fastx.h"
 #include "lcmer.h"
 #include "syncmer.h"
+#include "syncmer_option.h"
 
 static input_format dump_input_format(const std::string &path) {
     const input_format f = detect_input_format(path);
@@ -23,18 +24,9 @@ static input_format dump_input_format(const std::string &path) {
 }
 
 static int run_dump_cores(const std::string &input_path,
-                          const std::string &output_path, int syncmer_k,
-                          int submer_s, int submer_t, int lcp_level,
+                          const std::string &output_path,
+                          const syncmer_params &spara, int lcp_level,
                           int lcmer_l, uint32_t seed) {
-    syncmer_params spara;
-    spara.k = syncmer_k;
-    spara.smer.s = submer_s;
-    spara.smer.t = submer_t;
-    if (auto v = spara.validate(); !v) {
-        fprintf(stderr, "Error: %s\n", v.error().c_str());
-        return 1;
-    }
-
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
     SyncmerType syncmer_functor(spara, seed);
@@ -128,14 +120,7 @@ DumpCoresProgram::DumpCoresProgram(CLI::App &parent) {
         *parent.add_subcommand("dump-cores", "Read FASTA and dump LCP cores");
     app.add_option("input", input, "Input FASTA file")->required();
     app.add_option("-o,--output", output, "Output TSV file")->required();
-    app.add_option("--syncmer-k", syncmer_k, "K-mer length")
-        ->capture_default_str();
-    app.add_option("--submer-s", submer_s,
-                   "s-mer length s for syncmer selection")
-        ->capture_default_str();
-    app.add_option("--submer-t", submer_t,
-                   "Offset t of the smallest s-mer (open syncmer)")
-        ->capture_default_str();
+    add_syncmer_option(app, syncmer);
     app.add_option("-l,--level", lcp_level, "LCP level to compute")
         ->capture_default_str();
     app.add_option("-w,--window", lcmer_l,
@@ -148,8 +133,8 @@ DumpCoresProgram::DumpCoresProgram(CLI::App &parent) {
     app.callback([this]() {
         // CLI11 callbacks return void; surface a nonzero rc as a
         // CLI::RuntimeError so CLI11_PARSE prints it and exits with that code.
-        if (int rc = run_dump_cores(input, output, syncmer_k, submer_s,
-                                    submer_t, lcp_level, lcmer_l, seed);
+        if (int rc = run_dump_cores(input, output, syncmer, lcp_level, lcmer_l,
+                                    seed);
             rc != 0) {
             throw CLI::RuntimeError("dump-cores failed", rc);
         }

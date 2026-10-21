@@ -11,6 +11,7 @@
 #include "bamdoctor.h"
 #include "dump_cores.h"
 #include "ext/lcptools/lcptools_ho.h"
+#include "syncmer_option.h"
 using std::string;
 
 // Lists an option's names without the "{false}" CLI11 appends to negated flag
@@ -110,26 +111,7 @@ class AsmProgram {
             ->group("");
 
         const std::string kmer_group = advanced("k-mer selection");
-        app.add_option("--syncmer-k", cfg.syncmer.k,
-                       "Syncmer k-mer length, in homopolymer-compressed bases")
-            ->check(CLI::Range(2u, syncmer_params::max_k))
-            ->capture_default_str()
-            ->group(kmer_group);
-        app.add_option(
-               "--submer-s", cfg.syncmer.smer.s,
-               "s-mer length s for syncmer selection. Without --submer-t "
-               "this is a closed syncmer (smallest s-mer at the first or "
-               "last position). Default when neither --submer-s nor "
-               "--submer-t is given: open syncmer, s=4, t=6.")
-            ->check(CLI::Range(1ul, 15ul))
-            ->group(kmer_group);
-        app.add_option(
-               "--submer-t", cfg.syncmer.smer.t,
-               "Offset t of the smallest s-mer: selects an open syncmer "
-               "(smallest s-mer at position t).")
-            ->check(CLI::Range(0ul, 15ul))
-            ->needs("--submer-s")
-            ->group(kmer_group);
+        add_syncmer_option(app, cfg.syncmer)->group(kmer_group);
         app.add_option("--random-seed", cfg.seed,
                        "Seed of the syncmer s-mer hash (32-bit)")
             ->check(CLI::Range(uint64_t{0}, uint64_t{UINT32_MAX}))
@@ -248,12 +230,6 @@ class AsmProgram {
                              "significantly more memory and build "
                              "suboptimal assemblies.\n");
             }
-            // Validate the syncmer configuration up front; a CLI error makes
-            // CLI11 print the message and exit nonzero.
-            cfg.syncmer.apply_default_rule();
-            if (auto v = cfg.syncmer.validate(); !v) {
-                throw CLI::ValidationError(v.error());
-            }
             cfg.parallel_file_reading = (file_reading_mode == "parallel");
             // CLI11 callbacks return void; surface a nonzero rc as a
             // CLI::RuntimeError so the failure reaches the process exit status.
@@ -283,17 +259,7 @@ class SamReadTesting {
         app.add_option("-t,--threads", threads, "Number of threads")
             ->check(CLI::Range(1, MAXIMUM_WORK_THREADS))
             ->capture_default_str();
-        app.add_option("--syncmer-k", syncmer.k, "Syncmer k-mer length")
-            ->check(CLI::Range(2u, syncmer_params::max_k))
-            ->capture_default_str();
-        app.add_option("--submer-s", syncmer.smer.s,
-                       "s-mer length (default with no --submer-t: open "
-                       "syncmer, s=4, t=6)")
-            ->check(CLI::Range(1ul, 15ul));
-        app.add_option("--submer-t", syncmer.smer.t,
-                       "Offset t of the smallest s-mer (open syncmer)")
-            ->check(CLI::Range(0ul, 15ul))
-            ->needs("--submer-s");
+        add_syncmer_option(app, syncmer);
 
         std::map<std::string, SamReadTestingMode> SamReadTestingMode_map = {
             {"basic", SamReadTestingMode::BASIC},
@@ -311,10 +277,6 @@ class SamReadTesting {
             ->transform(CLI::CheckedTransformer(SamReadTestingMode_map,
                                                 CLI::ignore_case));
         app.callback([this]() {
-            syncmer.apply_default_rule();
-            if (auto v = syncmer.validate(); !v) {
-                throw CLI::ValidationError(v.error());
-            }
             // CLI11 callbacks return void; re-raise a nonzero rc as a CLI error
             // so it reaches the process exit status.
             if (int rc = run_sam_read_testing(input, threads, lcp_level, mode,

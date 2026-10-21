@@ -50,35 +50,72 @@ struct syncmer_params {
     // functor is constructed, so callers can surface a clean error.
     std::expected<void, std::string> validate() const {
         if (type() == typeenum::Invalid) {
-            return std::unexpected(
-                std::string("Provide --submer-s (optionally with --submer-t)"));
+            return std::unexpected(std::string("--syncmer: no s-mer length"));
         }
         if (k > max_k) {
-            return std::unexpected("--syncmer-k (" + std::to_string(k) +
+            return std::unexpected("--syncmer: k (" + std::to_string(k) +
                                    ") must be <= " + std::to_string(max_k));
         }
         if (*smer.s == 0 || *smer.s >= k) {
-            return std::unexpected("--submer-s (" + std::to_string(*smer.s) +
-                                   ") must be in [1, --syncmer-k " +
-                                   std::to_string(k) + ")");
+            return std::unexpected("--syncmer: s (" + std::to_string(*smer.s) +
+                                   ") must be in [1, k = " + std::to_string(k) +
+                                   ")");
         }
         if (smer.t.has_value() && *smer.t >= k - *smer.s + 1) {
-            return std::unexpected("--submer-t (" + std::to_string(*smer.t) +
-                                   ") must be < k - s + 1 (" +
-                                   std::to_string(k - *smer.s + 1) + ")");
+            return std::unexpected("--syncmer: t (" + std::to_string(*smer.t) +
+                                   ") must be <= k - s (" +
+                                   std::to_string(k - *smer.s) + ")");
         }
         return {};
     }
+
+    // Parses "k/s[/t]" (e.g. 11/4/6; without /t a closed syncmer) and
+    // validates the result.
+    static std::expected<syncmer_params, std::string> parse(
+        const std::string &text) {
+        const std::string malformed =
+            "--syncmer: expected k/s or k/s/t (e.g. 11/4/6), got \"" + text +
+            "\"";
+        unsigned long values[3] = {0, 0, 0};
+        int count = 0;
+        size_t at = 0;
+        while (count < 3) {
+            size_t len = 0;
+            while (at + len < text.size() && text[at + len] >= '0' &&
+                   text[at + len] <= '9') {
+                ++len;
+            }
+            if (len == 0 || len > 9) return std::unexpected(malformed);
+            values[count] = std::stoul(text.substr(at, len));
+            ++count;
+            at += len;
+            if (at == text.size()) break;
+            if (text[at] != '/') return std::unexpected(malformed);
+            ++at;
+        }
+        if (count < 2 || at != text.size()) return std::unexpected(malformed);
+        syncmer_params p;
+        p.k = static_cast<unsigned>(values[0]);
+        p.smer.s = values[1];
+        if (count == 3) p.smer.t = values[2];
+        if (auto v = p.validate(); !v) return std::unexpected(v.error());
+        return p;
+    }
+
+    // "k/s/t", or "k/s" for a closed syncmer; the form parse() accepts.
+    std::string text() const {
+        std::string out = std::to_string(k) + "/" + std::to_string(*smer.s);
+        if (smer.t.has_value()) out += "/" + std::to_string(*smer.t);
+        return out;
+    }
+
     void print_cfg(FILE *f) const {
-        fprintf(f, "k: %u\n", k);
         if (!smer.s.has_value()) {
-            fprintf(f, "submer-rule: \"none\"\n");
+            fprintf(f, "Syncmer: none\n");
         } else if (smer.t.has_value()) {
-            fprintf(f, "submer-rule: \"open-syncmer\"\n");
-            fprintf(f, "syncmer-s: %lu\nsyncmer-t: %lu\n", *smer.s, *smer.t);
+            fprintf(f, "Syncmer: %s (open)\n", text().c_str());
         } else {
-            fprintf(f, "submer-rule: \"closed-syncmer\"\n");
-            fprintf(f, "syncmer-s: %lu\n", *smer.s);
+            fprintf(f, "Syncmer: %s (closed)\n", text().c_str());
         }
     }
 };

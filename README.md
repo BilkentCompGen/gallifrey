@@ -68,7 +68,7 @@ names and quality values are ignored; only sequences are used. Different
 formats can be mixed in one invocation.
 
 ```bash
-lasm hifi <reads1> [reads2 ...] -o output.gfa -l <lcp_level> [--syncmer-k K --submer-s S --submer-t T]
+lasm hifi <reads1> [reads2 ...] -o output.gfa -l <lcp_level> [--syncmer K/S[/T]]
 ```
 
 ## Basic Usage
@@ -88,9 +88,7 @@ build/lasm hifi reads.bam \
   -t 16 \
   -@ 8 \
   -w 6 \
-  --syncmer-k 11 \
-  --submer-s 4 \
-  --submer-t 6 \
+  --syncmer 11/4/6 \
   --iterations 2
 ```
 
@@ -136,13 +134,10 @@ Syncmer selection (Edgar 2021). A k-mer is selected by the position of its
 smallest s-mer; selection is computed on the fly from s-mer hashes, with no
 per-k-mer table. K-mers and s-mers count run-length runs, not bases.
 
-- `--syncmer-k`: k-mer length, at most 16 (default 11)
-- `--submer-s`: s-mer length, 1 <= s < k. Without `--submer-t` this is a
-  closed syncmer (smallest s-mer at the first or last position)
-- `--submer-t`: offset of the smallest s-mer for an open syncmer,
-  0 <= t <= k - s (requires `--submer-s`)
-- With neither `--submer-s` nor `--submer-t`, an open syncmer with s=4, t=6
-  is used
+- `--syncmer K/S[/T]`: syncmer k-mer length `K` (at most 16), s-mer length
+  `S` (1 <= S < K) and, for an open syncmer, offset `T` of the smallest s-mer
+  (0 <= T <= K - S). Without `/T` it is a closed syncmer (smallest s-mer at
+  the first or last position). Default `11/4/6`
 - `--random-seed`: seed of the s-mer hash
 
 ### Advanced: Bloom filter
