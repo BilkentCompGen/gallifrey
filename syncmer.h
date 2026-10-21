@@ -481,8 +481,9 @@ struct GenericSubmerRule {
     // S.codes() (see live_scratch::q) for [0, n) and sets S.sel[e] = 1 iff the
     // k-mer ending at symbol e (symbols [e-k+1, e]) is selected, for e in
     // [k-1, n); other sel entries are left untouched. Window j of that k-mer
-    // is the s-mer ending at e-j (j = 0 is the lowest bits, as in is_submer),
-    // so µ is the smallest j among equal minimal hashes.
+    // is the s-mer ending at e-j (j = 0 is the lowest bits of the k-mer code),
+    // so µ is the smallest j among equal minimal hashes. Closed syncmer: µ at
+    // the first or last window; open syncmer: µ at t.
     // Precondition: S.require(n) or larger.
     void select_live(const uint8_t *rle, int64_t n, live_scratch &S) const {
         const int64_t K = k(), Sz = s();
@@ -523,24 +524,6 @@ struct GenericSubmerRule {
                 r[p] = hf(live_code(q, p, smask));
             select_windows<uint32_t>(open, w, tt, r, sel, K - 1, n);
         }
-    }
-    // Per-k-mer reference rule (tests check select_live against it).
-    // µ(κ,s) = smallest s-mer (first on ties); window i sits at bit 2*i.
-    // Closed syncmer: µ at the first or last s-mer; open syncmer: µ at t.
-    constexpr bool is_submer(int_type val) const {
-        int_type min_index = 0;
-        int_type min_val = std::numeric_limits<int_type>::max();
-        for (int_type i = 0; i < k() - s() + 1; ++i) {
-            const int_type hashed_s = hf((val >> (2 * i)) & s_mask);
-            if (hashed_s < min_val) {
-                min_index = i;
-                min_val = hashed_s;
-            }
-        }
-        if (type() == syncmer_params::typeenum::ClosedSyncmer) {
-            return min_index == 0 || min_index == k() - s();
-        }
-        return min_index == t();
     }
 };
 
