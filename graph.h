@@ -246,22 +246,20 @@ struct dbg_index_base {
     // (construct_dbg) probes it, and construct_dbg releases it when done.
     std::optional<BloomFilterType> bf;
     // --retro-admission: the first sighting of a window, kept when it is on
-    // a read's own strand. `prev` and `next` are the neighbouring window keys
-    // in that read (0 at its ends); `next` is 0 also when that window was
-    // kept from the same read, whose sighting then holds the adjacency. Only
-    // read insertion and resolve_retro_admissions use it; construct_dbg
-    // frees it.
-    struct first_sighting {
-        u64 prev;
-        u64 next;
-    };
+    // a read's own strand, with its neighbouring window keys in that read.
+    // `prev_of` holds every kept key with the preceding key (0 at the read's
+    // start). The following key is 0 at the read's end, and also when that
+    // window was kept from the same read, whose sighting then holds the
+    // adjacency. Kept windows mostly come in runs from one read, so it is 0
+    // for most sightings; `next_of` holds only the nonzero ones. Only read
+    // insertion and resolve_retro_admissions use them; construct_dbg frees
+    // them.
     struct retro_admissions {
-        gtl::parallel_flat_hash_map<
-            u64, first_sighting, std::hash<u64>,
-            gtl::priv::hash_default_eq<u64>,
-            std::allocator<std::pair<const u64, first_sighting>>, HT_SHARD_BC,
-            mutex_type>
-            map;
+        using table = gtl::parallel_flat_hash_map<
+            u64, u64, std::hash<u64>, gtl::priv::hash_default_eq<u64>,
+            std::allocator<std::pair<const u64, u64>>, HT_SHARD_BC, mutex_type>;
+        table prev_of;
+        table next_of;
         // A key's Bloom filter test and its record are made under the key's
         // stripe, so a read that finds the key in the filter also finds the
         // record, and two reads never both take the first sighting. 32
@@ -282,7 +280,8 @@ struct dbg_index_base {
         if (bf->contains(key)) return key;
         std::lock_guard lock(retro->stripe(key));
         if (bf->insert_if_absent(key)) {
-            retro->map.try_emplace(key, first_sighting{prev, next});
+            retro->prev_of.try_emplace(key, prev);
+            if (next != 0) retro->next_of.try_emplace(key, next);
             return 0;
         }
         return key;
@@ -302,14 +301,14 @@ struct dbg_index_base {
         }
         std::lock_guard lock(retro->stripe(key));
         const bool admitted = !bf->insert_if_absent(key);
-        return {admitted, admitted && retro->map.contains(key)};
+        return {admitted, admitted && retro->prev_of.contains(key)};
     }
     // After reading, adds each kept sighting of an admitted window as its
     // read would have added it had the window been admitted then
     // (insert_lcmer_helper); a window is admitted iff it has a node. Each
     // adjacency with an admitted neighbour gives the upstream window a count
     // and the downstream one a predecessor. Every adjacency is held by one
-    // sighting (see first_sighting) and nothing else changes the graph
+    // sighting (see retro_admissions) and nothing else changes the graph
     // meanwhile, so the result does not depend on thread timing. Returns the
     // number of admitted kept sightings.
     u64 resolve_retro_admissions(int threads) {
@@ -317,17 +316,22 @@ struct dbg_index_base {
             val.second.counts.core_count += 1;
         };
         std::atomic<u64> admitted{0};
-        parallel_for(retro->map.subcnt(), threads, [&](size_t submap) {
-            retro->map.with_submap(submap, [&](const auto &set) {
-                for (const auto &[key, first] : set) {
+        parallel_for(retro->prev_of.subcnt(), threads, [&](size_t submap) {
+            retro->prev_of.with_submap(submap, [&](const auto &set) {
+                for (const auto &[key, prev] : set) {
                     if (!dbg.contains(key)) continue;
                     admitted.fetch_add(1, std::memory_order_relaxed);
-                    if (dbg.modify_if(first.prev, add_count)) {
+                    if (dbg.modify_if(prev, add_count)) {
                         dbg.modify_if(key, [&](auto &val) {
-                            val.second.emplace_prev(first.prev);
+                            val.second.emplace_prev(prev);
                         });
                     }
-                    if (dbg.modify_if(first.next, [&](auto &val) {
+                    // Reading is over and nothing writes next_of any more,
+                    // so the lookup needs no lock.
+                    u64 next = 0;
+                    retro->next_of.if_contains_unsafe(
+                        key, [&](const auto &v) { next = v.second; });
+                    if (dbg.modify_if(next, [&](auto &val) {
                             val.second.emplace_prev(key);
                         })) {
                         dbg.modify_if(key, add_count);

@@ -757,7 +757,7 @@ struct assembler {
                 "Error in reading data for DBG construction.");
         }
         if (dbgi.retro) {
-            const u64 kept = dbgi.retro->map.size();
+            const u64 kept = dbgi.retro->prev_of.size();
             const u64 admitted = dbgi.resolve_retro_admissions(threads.work);
             dbgi.retro.reset();
             const u64 erased = dbgi.erase_unlinked_placeholders(threads.work);
