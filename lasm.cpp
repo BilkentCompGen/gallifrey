@@ -198,7 +198,8 @@ class AsmProgram {
         app.add_flag("--print-bi-dbg", cfg.print_prelayout_graph,
                      "Print DBG before layout (with .bi.gfa suffix)")
             ->group(other_group);
-        app.add_flag("--retro-admission", cfg.retro_admission,
+        app.add_flag("--retro-admission,!--no-retro-admission",
+                     cfg.retro_admission,
                      with_default(
                          "Remember each lcmer window's first sighting on a "
                          "read's own strand until a later sighting on either "
@@ -206,22 +207,26 @@ class AsmProgram {
                          "count and edges as if it had been admitted at once",
                          cfg.retro_admission))
             ->group(other_group);
-        app.add_flag("--link-reverse", cfg.link_reverse,
-                     with_default(
-                         "Let each read's reverse complement add the missing "
-                         "links between lcmer windows that are already in the "
-                         "graph, so the two strands' graphs fill each other's "
-                         "gaps",
-                         cfg.link_reverse))
-            ->group(other_group);
-        app.callback([this, level_opt, multipass_opt]() {
+        auto *link_reverse_opt =
+            app.add_flag("--link-reverse,!--no-link-reverse", cfg.link_reverse,
+                         with_default(
+                             "Let each read's reverse complement add the "
+                             "missing links between lcmer windows that are "
+                             "already in the graph, so the two strands' graphs "
+                             "fill each other's gaps",
+                             cfg.link_reverse))
+                ->group(other_group);
+        app.callback([this, level_opt, multipass_opt, link_reverse_opt]() {
             if (olc_lcmer_l_ignored != 0) {
                 std::fprintf(stderr,
                              "[config] --olc-lcmer-l is ignored; overlap "
                              "detection uses --window (%d)\n",
                              cfg.lcmer_l);
             }
-            if (cfg.link_reverse && !cfg.prime_reverse) {
+            // Only when asked for: it is on by default, and
+            // --no-prime-reverse alone should not print a note.
+            if (link_reverse_opt->count() > 0 && cfg.link_reverse &&
+                !cfg.prime_reverse) {
                 std::fprintf(stderr,
                              "[config] --link-reverse needs --prime-reverse; "
                              "no links are added\n");

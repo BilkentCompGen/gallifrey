@@ -199,11 +199,11 @@ struct asm_config {
     // Remember each window's first own-strand sighting until a later sighting
     // on either strand admits the window, then add that sighting's count and
     // edges, so first sightings are not lost.
-    bool retro_admission = false;
+    bool retro_admission = true;
     // With prime_reverse, two consecutive windows of a read's reverse
     // complement whose nodes both exist get their missing edge; no node or
     // count changes.
-    bool link_reverse = false;
+    bool link_reverse = true;
     // Accept a core-label match as an SCD layout seed only if both cores have
     // the same homopolymer-compressed sequence, so cores that merely share a
     // label are not chained.
