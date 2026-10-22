@@ -291,16 +291,21 @@ struct dbg_index_base {
         return key;
     }
     // A window of a read's reverse-complement parse: inserts it into the
-    // Bloom filter. Under --retro-admission, returns whether the window is
-    // now admitted with a kept own-strand sighting, so it needs a node this
-    // read's bases can give; otherwise false.
-    bool sight_reverse(u64 key) {
+    // Bloom filter. `admitted`: the filter had already seen the window.
+    // `needs_node` (--retro-admission only): the window is now admitted with
+    // a kept own-strand sighting, so it needs a node this read's bases can
+    // give.
+    struct reverse_sighting {
+        bool admitted;
+        bool needs_node;
+    };
+    reverse_sighting sight_reverse(u64 key) {
         if (!retro) {
-            bf->insert_if_absent(key);
-            return false;
+            return {!bf->insert_if_absent(key), false};
         }
         std::lock_guard lock(retro->stripe(key));
-        return !bf->insert_if_absent(key) && retro->map.contains(key);
+        const bool admitted = !bf->insert_if_absent(key);
+        return {admitted, admitted && retro->map.contains(key)};
     }
     // After reading, adds each kept sighting of an admitted window as its
     // read would have added it had the window been admitted then
@@ -336,10 +341,12 @@ struct dbg_index_base {
         return admitted.load();
     }
     // Erases the nodes made only to hold a place for a kept sighting's
-    // adjacency (count 0, no predecessor) that nothing linked to. Any node
-    // another lists as predecessor has a count, so none of these is
-    // referenced. Seeding comes after construction, so no node is seeded
-    // yet. Returns the number erased.
+    // adjacency (count 0, no predecessor). The own-strand path and
+    // resolve_retro_admissions give a count to every node they list as a
+    // predecessor, so none of these is referenced by them. --link-reverse may
+    // list one as a predecessor without a count; that edge goes with the
+    // node, as cleaning would cut such a tip anyway. Seeding comes after
+    // construction, so no node is seeded yet. Returns the number erased.
     u64 erase_unlinked_placeholders(int threads) {
         std::atomic<u64> erased{0};
         parallel_for(dbg.subcnt(), threads, [&](size_t submap) {

@@ -178,6 +178,9 @@ The defaults suit most runs.
   read's own strand until a later sighting on either strand admits the
   window, then add that sighting's count and edges as if it had been admitted
   at once. Costs memory for the windows still waiting (default off)
+- `--link-reverse`: let each read's reverse complement add the missing links
+  between lcmer windows that are already in the graph, so the two strands'
+  graphs fill each other's gaps (default off)
 
 ## Output Files
 

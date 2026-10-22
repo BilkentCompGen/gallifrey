@@ -71,6 +71,7 @@ struct assembler {
     bool drop_crumbs;
     bool prime_reverse;
     bool retro_admission;
+    bool link_reverse;
     bool strict_layout_labels;
     bool end_joins;
 
@@ -88,6 +89,7 @@ struct assembler {
           drop_crumbs{cfg.drop_crumbs},
           prime_reverse{cfg.prime_reverse},
           retro_admission{cfg.retro_admission},
+          link_reverse{cfg.link_reverse},
           strict_layout_labels{cfg.strict_layout_labels},
           end_joins{cfg.end_joins} {
         inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
@@ -333,13 +335,20 @@ struct assembler {
     // read's run-length stream of rle_len runs, as parse_cores_from_nibbles
     // left it; it is turned into the reverse complement's in place. `lr` is
     // caller scratch; `thread_id` picks the fragment arena of nodes made under
-    // --retro-admission.
+    // --retro-admission. Each window takes one Bloom sighting, and the steps
+    // below act on it in this order:
+    // 1. --retro-admission: a window this sighting admits with a kept
+    //    own-strand sighting gets its node here, from this parse's bases.
+    // 2. --link-reverse: when this window and the previous one are both
+    //    admitted and both have nodes, the edge between them is added if
+    //    missing. No node or count changes, so the other strand's depth is
+    //    not counted twice.
     template <class BFT>
     static void prime_reverse_complement(
         const uint8_t *nibbles, size_t len, int64_t rle_len, int lcp_level,
         core_buf *str, const SyncmerType &syncmer_functor, charsi &chs,
         pos_scratch &pos_buf, lcp_read &lr, dbg_index_base<BFT> &dbgi,
-        int lcmer_l, int thread_id) {
+        int lcmer_l, int thread_id, bool link_reverse) {
         const int64_t rc_len =
             rle_reverse_complement(nibbles, static_cast<int64_t>(len), chs.data,
                                    pos_buf.data, rle_len);
@@ -350,17 +359,28 @@ struct assembler {
             return;
         }
         LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
-        // Window j (cores j..j+L-1). Under --retro-admission, a window this
-        // sighting admits with a kept own-strand sighting gets its node here,
-        // from this parse's bases.
+        // The previous window's key if it was admitted, else 0.
+        u64 prev_admitted = 0;
+        // Window j (cores j..j+L-1).
         const auto sight = [&](size_t j) {
             const u64 key = dbg_index_base<BFT>::lcmer_id(l);
-            if (dbgi.sight_reverse(key)) {
+            const auto seen = dbgi.sight_reverse(key);
+            if (seen.needs_node) {
                 ensure_node(dbgi, key, [&](u64 k) {
                     return reverse_window_fragment(
                         nibbles, len, lr, j, lcmer_l, k,
                         dbgi.fragment_arena(thread_id));
                 });
+            }
+            if (link_reverse) {
+                if (seen.admitted && prev_admitted != 0 &&
+                    dbgi.dbg.contains(prev_admitted)) {
+                    dbgi.dbg.modify_if(key, [&](auto &val) {
+                        val.second.emplace_prev(prev_admitted);
+                    });
+                }
+                prev_admitted = 0;
+                if (seen.admitted) prev_admitted = key;
             }
         };
         sight(1);
@@ -548,7 +568,8 @@ struct assembler {
                              dbg_index &dbgi, std::atomic<bool> &done,
                              int &processed_read_count, int &all_reads,
                              auto Process_Func, SyncmerType syncmer_functor,
-                             int lcmer_l, bool prime_reverse) {
+                             int lcmer_l, bool prime_reverse,
+                             bool link_reverse) {
         uint64_t lcmer_index = 0;
         typename Ops::record *data_p = NULL;
         core_buf str;
@@ -566,10 +587,10 @@ struct assembler {
                 ++processed_read_count;
                 Process_Func(lr, dbgi, thread_id, lcmer_index, lcmer_l);
                 if (prime_reverse) {
-                    prime_reverse_complement(Ops::seq(data_p), Ops::len(data_p),
-                                             rle_len, lcp_level, &str,
-                                             syncmer_functor, chs, pos_buf, lr,
-                                             dbgi, lcmer_l, thread_id);
+                    prime_reverse_complement(
+                        Ops::seq(data_p), Ops::len(data_p), rle_len, lcp_level,
+                        &str, syncmer_functor, chs, pos_buf, lr, dbgi, lcmer_l,
+                        thread_id, link_reverse);
                 }
             }
             if (!recycle_queue.try_enqueue(data_p)) {
@@ -687,7 +708,8 @@ struct assembler {
                 process_data<Ops>(tid, lcp_level, data_queue, recycle_queue,
                                   dbgi, done, valid_read_counts[tid - 1],
                                   all_read_counts[tid - 1], Process_Func,
-                                  syncmer_functor, lcmer_l, prime_reverse);
+                                  syncmer_functor, lcmer_l, prime_reverse,
+                                  link_reverse);
             });
         }
 

@@ -200,6 +200,10 @@ struct asm_config {
     // on either strand admits the window, then add that sighting's count and
     // edges, so first sightings are not lost.
     bool retro_admission = false;
+    // With prime_reverse, two consecutive windows of a read's reverse
+    // complement whose nodes both exist get their missing edge; no node or
+    // count changes.
+    bool link_reverse = false;
     // Accept a core-label match as an SCD layout seed only if both cores have
     // the same homopolymer-compressed sequence, so cores that merely share a
     // label are not chained.
@@ -257,6 +261,7 @@ struct asm_config {
         fprintf(f, "Drop Crumbs: %s\n", drop_crumbs ? "true" : "false");
         fprintf(f, "Prime Reverse: %s\n", prime_reverse ? "true" : "false");
         fprintf(f, "Retro Admission: %s\n", retro_admission ? "true" : "false");
+        fprintf(f, "Link Reverse: %s\n", link_reverse ? "true" : "false");
         fprintf(f, "Strict Layout Labels: %s\n",
                 strict_layout_labels ? "true" : "false");
         fprintf(f, "End Joins: %s\n", end_joins ? "true" : "false");
