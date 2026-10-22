@@ -185,7 +185,7 @@ struct asm_config {
         int work = 8;
     } threads;
     uint32_t seed = kDefaultRandomSeed;
-    bool parallel_file_reading = true;
+    bool parallel_file_reading = false;
     syncmer_params syncmer;
     bool print_precleanup_graph = false;
     bool print_prelayout_graph = false;
