@@ -1,21 +1,17 @@
 #ifndef _LAYOUT_GRAPH_H
 #define _LAYOUT_GRAPH_H
 
-#include <sys/stat.h>
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
-#include <cstring>
 #include <deque>
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <map>
 #include <optional>
 #include <queue>
-// #include <stack>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -2279,11 +2275,6 @@ inline void emit_ultra_merged_graph(AssemblerT &as, const unitig_graph &graph,
         [&](const supernode_vec &supernodes, const edge_map &merged_edges) {
             write_gfa(supernodes, merged_edges, as.threads.work, out);
         });
-}
-
-template <class AssemblerT>
-inline void emit_ultra_merged_graph(AssemblerT &as, const unitig_graph &graph) {
-    emit_ultra_merged_graph(as, graph, stdout);
 }
 
 }  // namespace layout_graph_emit

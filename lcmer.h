@@ -1,21 +1,17 @@
 #pragma once
-#include <cstdint>
 #if defined(__SSSE3__)
 #include <tmmintrin.h>
 #endif
 
-#include "nibble2base.hpp"
 #ifndef LCMER_H
 #define LCMER_H
 #include <stdint.h>
 
 #include <algorithm>
-#include <array>
 #include <bit>
 #include <cstring>
 #include <gtl/vector.hpp>
 #include <iterator>
-#include <string>
 #include <type_traits>
 
 #include "kmer_lcp.h"
@@ -69,31 +65,6 @@ struct charsi_base {
 };
 using charsi = charsi_base<uint8_t, 2.0, 5>;
 using pos_scratch = charsi_base<uint32_t, 2.0, 5>;
-struct sv {
-    char *from;
-    char *to;
-    sv() : from(0), to(0) {}
-    sv(char *from, char *to) : from(from), to(to) {}
-
-    void expand_until(char c) {
-        while (*to != 0 && *to != c) {
-            to++;
-        }
-    }
-    void skip_next(char c) {
-        expand_until(c);
-        if (*to) ++to;
-        from = to;
-    }
-    template <int N, char DEL>
-    void get() {
-        for (int i = 0; i < N; ++i) {
-            skip_next(DEL);
-        }
-        expand_until(DEL);
-    }
-    // operator std::string() { return {from, to}; }
-};
 
 struct litecmer {
     struct words_t {
@@ -125,11 +96,6 @@ struct litecmer {
         return *this;
     }
 
-    constexpr uint32_t hi() const { return words.hi; }
-    constexpr uint32_t lo() const { return words.lo; }
-    constexpr uint64_t native_bitcast_value() const {
-        return std::bit_cast<uint64_t>(words);
-    }
     constexpr uint64_t value() const {
         return (static_cast<uint64_t>(words.hi) << 32) |
                static_cast<uint64_t>(words.lo);
@@ -143,12 +109,8 @@ struct litecmer {
         return out;
     }
 
-    static litecmer make_poly(std::forward_iterator auto it, int n) {
-        return litecmer(it, n);
-    }
-
     // Order-sensitive rolling update for first N-1 cores.
-    // Requires state initialized by make_poly().
+    // Requires state initialized by the iterator constructor.
     void update_lcmer_poly(uint32_t new_core, uint32_t out_core, int n) {
         if (n > 1) {
             const uint32_t kOutMul = poly_pow(kPolyBase, n - 2);
@@ -189,7 +151,6 @@ struct KmerViewOnInts {
     uint8_t prev;
 
     static constexpr INT_TYPE BIT_MASK = -1;
-    // static constexpr INT_TYPE BIT_MASK = ((INT_TYPE)1 << BIT_WIDTH) - 1;
 
     KmerViewOnInts(int_type k)
         : k{k},
@@ -205,172 +166,11 @@ struct KmerViewOnInts {
         return i;
     }
 
-    int fill_rle(const uint8_t *data_address, int_type cap) {
-        int_type i;
-        prev = 0xff;
-        int_type it = move_get_rle(data_address, 0, cap);
-        for (i = 0; i < k && it < cap; i++) {
-            it = move_get_rle(data_address, it, cap);
-        }
-        return it;
-    }
-
     int_type move_get(const uint8_t *data_address, int_type index) {
         value <<= BIT_WIDTH;
         value &= KMASK;
         value |= (data_address[index] & BIT_MASK);
         return index + 1;
-    }
-
-    int_type move_get_rle2(uint8_t prev, const uint8_t *data_address,
-                           int_type index, int_type cap) {
-        while (index < cap && prev == data_address[index]) {
-            index++;
-        }
-        value <<= BIT_WIDTH;
-        value &= KMASK;
-        value |= (data_address[index] & BIT_MASK);
-        return index + 1;
-    }
-
-    int_type move_get_rle(const uint8_t *data_address, int_type index,
-                          int_type cap) {
-        const uint8_t *p = data_address + index;
-        const uint8_t *const end = data_address + cap;
-
-        while (p < end && *p == prev) {
-            ++p;
-        }
-        if (p == end) {
-            return cap;
-        }
-        prev = *p;
-        value = ((value << BIT_WIDTH) & KMASK) | (*p & BIT_MASK);
-        return static_cast<int_type>((p - data_address) + 1);
-    }
-    constexpr int_type get() const noexcept { return value; }
-};
-
-template <class INT_TYPE = uint32_t>
-struct KmerViewOnCrumbs {
-    using int_type = INT_TYPE;
-    int_type k;
-    int_type kmask;
-    int_type value;
-    uint8_t prev;
-    static constexpr uint8_t mask = 3U;
-    KmerViewOnCrumbs(int_type k)
-        : k{k}, kmask{((int_type)1 << (2 * k)) - 1}, value{0}, prev{255} {}
-
-    int fill_rle(const uint8_t *data_address, int_type cap) {
-        int_type i;
-        int_type it = move_get_rle(data_address, 0, cap);
-        for (i = 0; i < k && it < cap; i++) {
-            it = move_get_rle(data_address, it, cap);
-        }
-        return it;
-    }
-
-    int_type move_get_rle(const uint8_t *data_address, int_type index,
-                          int_type cap) {
-        size_t byte_idx = index / 4;
-        size_t crum_idx = index % 4;
-        uint8_t at = (data_address[byte_idx] >> (crum_idx * 2)) & mask;
-        while (index < cap && at == prev) {
-            ++index;
-            byte_idx = index / 4;
-            crum_idx = index % 4;
-            at = (data_address[byte_idx] >> (crum_idx * 2)) & mask;
-        }
-        if (index == cap) {
-            return index;
-        }
-        value = ((value << 2) & kmask) | at;
-        prev = at;
-        return index + 1;
-    }
-    constexpr int_type get() const noexcept { return value; }
-};
-
-// Crumb view for 64-bit packed sequences (2 bits/base, 32 bases/word).
-template <class INT_TYPE = uint64_t>
-struct KmerViewOnCrumbs64 {
-    using int_type = INT_TYPE;
-    int_type k;
-    int_type kmask;
-    int_type value;
-    uint8_t prev;
-    static constexpr uint8_t mask = 3U;
-
-    KmerViewOnCrumbs64(int_type k)
-        : k{k}, kmask{((int_type)1 << (2 * k)) - 1}, value{0}, prev{255} {}
-
-    static inline uint8_t base_at(const uint64_t *data_words, size_t index) {
-        const size_t bit_index = index * 2;
-        return static_cast<uint8_t>(
-            (data_words[bit_index >> 6] >> (bit_index & 63)) & mask);
-    }
-
-    int fill_rle(const uint64_t *data_words, int_type cap,
-                 int_type skip_first_n) {
-        int_type i;
-        int_type it = move_get_rle(data_words, skip_first_n, cap);
-        // k-1 more insertions (k total incl. the initial one), so the first
-        // window checked by the caller is runs[0..k-1] — the same window
-        // parse1_rle_syncmers checks first.
-        for (i = 0; i < k - 1 && it < cap; i++) {
-            it = move_get_rle(data_words, it, cap);
-        }
-        return it;
-    }
-
-    int_type move_get_rle(const uint64_t *data_words, int_type index,
-                          int_type cap) {
-        uint8_t at = base_at(data_words, index);
-        while (index < cap && at == prev) {
-            ++index;
-            if (index == cap) {
-                break;
-            }
-            at = base_at(data_words, index);
-        }
-        if (index == cap) {
-            return index;
-        }
-        value = ((value << 2) & kmask) | at;
-        prev = at;
-        return index + 1;
-    }
-    constexpr int_type get() const noexcept { return value; }
-};
-
-template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
-struct KmerViewOnNibbles {
-    static constexpr int tab[] = {4, 0, 1, 4, 2, 4, 4, 4,
-                                  3, 4, 4, 4, 4, 4, 4, 4};
-
-    using int_type = INT_TYPE;
-    static constexpr int k = _K;
-    int_type value;
-    static constexpr int_type KMASK = ((int_type)1 << (BIT_WIDTH * k)) - 1;
-    KmerViewOnNibbles() : value{0} {}
-
-    int fill(const uint8_t *data_address) {
-        int i;
-        for (i = 0; i < k; i++) {
-            move_get(data_address, i);
-        }
-        return i;
-    }
-    int_type move_get(const uint8_t *data_address, int index) {
-        value <<= BIT_WIDTH;
-        if constexpr (KMASK != -1) value &= KMASK;
-        if constexpr (BIT_WIDTH == 2) {
-            value |= tab[bam_seqi(data_address, index)];
-        } else {
-            value |= bam_seqi(data_address, index);
-        }
-        return value;
     }
 
     constexpr int_type get() const noexcept { return value; }
@@ -419,8 +219,8 @@ struct KmerViewOnBytes {
 };
 
 // Fused nt16 one-hot decode + RLE compaction in a single pass.
-// Input: packed nt16 nibbles (2 bases per byte, as bam_get_seq() or the FASTX
-// reader produce), length in bases.
+// Input: packed nt16 nibbles (2 bases per byte, as the BAM and FASTX readers
+// produce), length in bases.
 // Output: rle_data/rle_pos filled with RLE-compacted 2-bit bases. Runs are
 // split on the one-hot nibble and decoded through kOnehotDecode (anything
 // but A/C/G/T, e.g. N, decodes as A) identically on every path.
@@ -841,8 +641,7 @@ inline uint64_t parse1_CrumbledSubSeqs_syncmers(fragment_span sseqs,
         const size_t lo = std::max(from, l_so_far) - l_so_far;
         const size_t hi = std::min(to, l_so_far + s.len) - l_so_far;
         for (size_t i = lo; i < hi; ++i) {
-            const uint8_t b = KmerViewOnCrumbs64<uint64_t>::base_at(
-                s.data, s.skip_first_n + i);
+            const uint8_t b = s.code(i);
             if (b != prev_base) {
                 rle_data[rle_len] = b;
                 rle_pos[rle_len] = static_cast<uint32_t>(l_so_far + i);

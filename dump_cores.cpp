@@ -6,10 +6,8 @@
 #include <CLI/CLI.hpp>
 #include <cstdio>
 #include <string>
-#include <vector>
 
 #include "asm.h"
-#include "ext/lcptools/lcptools_ho.h"
 #include "fastx.h"
 #include "lcmer.h"
 #include "syncmer.h"

@@ -1,7 +1,6 @@
 #ifndef _LASM_BAM_READER_H_
 #define _LASM_BAM_READER_H_
 
-#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <string>

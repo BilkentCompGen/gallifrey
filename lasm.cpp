@@ -3,8 +3,6 @@
 #include <string_view>
 #include <vector>
 
-#include "CLI/CLI.hpp"
-
 #define LCPTOOLS_IMPL
 #include "asm.h"
 #include "config.h"

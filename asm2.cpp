@@ -1,26 +1,22 @@
 #include <blockingconcurrentqueue.h>
-#include <fcntl.h>
 #include <stdio.h>
-#include <unistd.h>
+#include <sys/stat.h>
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
 
 #include <algorithm>
 #include <chrono>
-#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <gtl/btree.hpp>
 #include <gtl/phmap.hpp>
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <iostream>
 #include <memory>
-#include <random>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -33,7 +29,6 @@
 #include "graph.h"
 #include "layout_graph.h"
 #include "lcmer.h"
-#include "lcptools/lcptools_ho.h"
 #include "syncmer.h"
 
 using std::string;
@@ -143,9 +138,7 @@ struct assembler {
                 return dbgi.dbg.lazy_emplace_l(
                     ll[i],
                     [&](index_type::dbg_map_t::value_type &val) {
-                        val.second.emplace_prev(
-                            ll[i - 1]);  // TODO verify this CC logic holds
-                        // val.second.cc++;
+                        val.second.emplace_prev(ll[i - 1]);
                         mark(val.second);
                     },
                     [&](const index_type::dbg_map_t::constructor &ctr) {
@@ -164,25 +157,6 @@ struct assembler {
                     });
             }
         }
-    }
-    static gtl::vector<uint64_t> find_lcmers(const lcp_read &lr,
-                                             const dbg_index &dbgi,
-                                             int lcmer_l) {
-        LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
-
-        gtl::vector<uint64_t> ll(1, 0);
-        ll.reserve(lr.cores.size() - lcmer_l + 3);
-        dbg_index::lci_type lval = dbgi.get(l);
-        ll.push_back(lval.id);
-        for (size_t i = static_cast<size_t>(lcmer_l + 1);
-             i < lr.cores.size() - 1; ++i) {
-            uint32_t in_core = lr.cores[i];
-            l.update_lcmer(in_core, lr.cores[i - lcmer_l], lcmer_l);
-            lval = dbgi.get(l);
-            ll.push_back(lval.id);
-        }
-        ll.push_back(0);
-        return ll;
     }
     static auto find_lcmer_ranges(const lcp_read &lr, const unitig_graph &graph,
                                   int lcmer_l) {
@@ -395,13 +369,8 @@ struct assembler {
     // Base j of seq[from, to), or of its reverse complement.
     static uint8_t range_base(const SequenceContainerType &seq, size_t from,
                               size_t to, bool rc, size_t j) {
-        using view = KmerViewOnCrumbs64<uint64_t>;
-        const size_t skip = static_cast<size_t>(seq.skip_first_n);
-        if (rc) {
-            return static_cast<uint8_t>(
-                3 ^ view::base_at(seq.data, skip + to - 1 - j));
-        }
-        return view::base_at(seq.data, skip + from + j);
+        if (rc) return static_cast<uint8_t>(3 ^ seq.code(to - 1 - j));
+        return seq.code(from + j);
     }
 
     // Cores of seq[from, to) (or of its reverse complement) at lcp_level,
@@ -527,17 +496,6 @@ struct assembler {
         }
         for (auto &w : workers) w.join();
         return {chunks.size(), windows.load()};
-    }
-
-    static std::pair<int, int> get_thread_dist(int threads) {
-        if (threads == 0) {
-            return {0, 0};
-        }
-        if (threads < 16) {
-            int sam_threads = threads / 2;
-            return {sam_threads, threads - sam_threads};
-        }
-        return {8, threads - 8};
     }
 
     // Record traits. The worker loop only needs the packed nt16 sequence and
@@ -844,13 +802,6 @@ struct assembler {
         return {};
     }
 
-    size_t count_seqv_len(const gtl::vector<SequenceContainerType> &seqv) {
-        size_t sum = 0;
-        for (const SequenceContainerType &s : seqv) {
-            sum += s.len;
-        }
-        return sum;
-    }
     // Overlap coordinate space: inclusive core indices on a node's
     // (reverse-complemented) core sequence. `len` is the core-span length in
     // steps (cores - 1).
@@ -1228,8 +1179,6 @@ static int run_passes(const asm_config &cfg);
 int run_assembly(const asm_config &cfg) {
     if (!cfg.multipass.empty()) return run_passes(cfg);
     if (!prepare_run(cfg)) return 1;
-    // free(malloc(1024ULL * 1024 * 1024 * 20)); INTIMIDATE the OS for the
-    // ram
 
     INIT_TIMERS(HIFI_ASSEMBLY);
 

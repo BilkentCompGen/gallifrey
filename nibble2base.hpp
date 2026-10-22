@@ -2,16 +2,13 @@
 #define NIBBLE2BASE_HPP
 
 #include <algorithm>
-#include <cassert>
 #include <cstdint>
 #include <cstring>
-#include <gtl/vector.hpp>
 #include <iterator>
 #include <memory>
 #include <span>
 #include <vector>
 
-#include "kmer_bits.h"
 #include "nt16.h"
 
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
@@ -19,6 +16,9 @@
 #elif defined(__SSSE3__)
 #include <tmmintrin.h>
 #endif
+
+// Letter of each 2-bit base code (A=0, C=1, G=2, T=3).
+inline constexpr char kBaseLetters[4] = {'A', 'C', 'G', 'T'};
 
 // Bump allocator for 2-bit words: zeroed storage carved from large blocks,
 // all freed together by release() or the destructor. Not thread-safe; each
@@ -139,10 +139,6 @@ struct CrumbledSubSeq64 {
         });
     }
 
-    CrumbledSubSeq64(const uint8_t *nibbles, size_t from, size_t to,
-                     uint64_t origin_node) noexcept
-        : CrumbledSubSeq64(nibbles, from, to, origin_node, from_nibbles{}) {}
-
     CrumbledSubSeq64(const char *bases, size_t from, size_t to,
                      uint64_t origin_node, from_ascii) noexcept
         : len(to - from),
@@ -211,48 +207,6 @@ struct CrumbledSubSeq64 {
         }
     }
 
-    CrumbledSubSeq64(std::span<const CrumbledSubSeq64> subseqs,
-                     size_t start_idx, size_t from, size_t to)
-        : len{to - from},
-          skip_first_n{0},
-          data{new uint64_t[storage_size(to - from + 32)]()},
-          origin_node{0} {
-        size_t sub_len = (from < to) ? (to - from) : 0;
-        if (sub_len == 0 || subseqs.empty()) {
-            return;
-        }
-
-        size_t cumulative = 0;
-        size_t dest_pos = 0;
-
-        for (size_t i = start_idx; i < subseqs.size() && dest_pos < sub_len; ++i) {
-            const auto &frag = subseqs[i];
-            size_t frag_start = cumulative;
-            size_t frag_end = cumulative + frag.len;
-
-            // Compute the overlap of [frag_start, frag_end) with [from, to)
-            size_t overlap_start = std::max(frag_start, from);
-            size_t overlap_end = std::min(frag_end, to);
-
-            if (overlap_start < overlap_end) {
-                // Offset within this fragment
-                size_t local_from = overlap_start - frag_start;
-                size_t copy_len = overlap_end - overlap_start;
-
-                // Copy bases from frag to result
-                for (size_t b = 0; b < copy_len; ++b) {
-                    size_t src_bit = (frag.skip_first_n + local_from + b) * 2;
-                    uint64_t code =
-                        (frag.data[src_bit >> 6] >> (src_bit & 63)) & 0x3;
-                    size_t dst_bit = dest_pos * 2;
-                    data[dst_bit >> 6] |= code << (dst_bit & 63);
-                    ++dest_pos;
-                }
-                origin_node = frag.origin_node;
-            }
-            cumulative += frag.len;
-        }
-    };
     CrumbledSubSeq64(std::span<const CrumbledSubSeq64> subseqs, size_t from,
                      size_t to)
         : len{to - from},
@@ -455,76 +409,8 @@ struct CrumbledSubSeq64 {
         }
         return rc;
     }
-    [[nodiscard]] CrumbledSubSeq64 reverse_complement_old() const {
-        assert(skip_first_n >= 0);
-        CrumbledSubSeq64 rc{len, 31};
-        if (len < 32) {
-            // Fix the skip_first
-            uint64_t word = (data[0] >> skip_first_n * 2);
-            if (storage_size(len + skip_first_n) > 1) {
-                word |= (data[1] << (64 - skip_first_n * 2));
-            }
-
-            rc.data[0] = reverse_complement_kmer(word, len);
-            rc.skip_first_n = 0;
-            return rc;
-        }
-        size_t num_blocks = storage_size(len + skip_first_n);
-        for (size_t i = 0; i < num_blocks - 1; ++i) {
-            rc.data[num_blocks - i - 1] = reverse_complement_kmer(data[i], 32);
-        }
-        if ((len + skip_first_n) % 32 != 0)
-            rc.data[0] = reverse_complement_kmer(data[num_blocks - 1],
-                                                 (len + skip_first_n) % 32);
-        rc.skip_first_n = (num_blocks * 32 - len) - skip_first_n;
-        return rc;
-    }
 };
 static_assert(sizeof(CrumbledSubSeq64) == 24,
               "the borrowed flag shares the length word");
-struct seqveciterator {
-    size_t idx = 0;
-    size_t bidx = 0;
-    size_t bases_before = 0;
-    void move_only(const gtl::vector<CrumbledSubSeq64> &sseqs,
-                   uint64_t until) {
-        size_t new_idx = idx;
-        size_t new_bidx = bidx;
-        while (new_idx < sseqs.size() &&
-               bases_before + (sseqs[new_idx].len - new_bidx) < until) {
-            bases_before += sseqs[new_idx].len - new_bidx;
-            new_bidx = 0;
-            new_idx++;
-        }
-        new_bidx += until - bases_before;
-        idx = new_idx;
-        bidx = new_bidx;
-        bases_before = until;
-    }
-    CrumbledSubSeq64 get_and_move(
-        const gtl::vector<CrumbledSubSeq64> &sseqs, uint64_t until) {
-        // Save bases_before before the loop mutates it, so we can
-        // compute the full extraction range for the constructor.
-        const size_t saved_bases_before = bases_before;
-        size_t new_idx = idx;
-        size_t new_bidx = bidx;
-        while (new_idx < sseqs.size() &&
-               bases_before + (sseqs[new_idx].len - new_bidx) < until) {
-            bases_before += sseqs[new_idx].len - new_bidx;
-            new_bidx = 0;
-            new_idx++;
-        }
-        new_bidx += until - bases_before;
-        // 'from' and 'to' are positions relative to the concatenation
-        // starting at start_idx (idx).  We start at bidx within the
-        // first fragment and need (until - saved_bases_before) bases.
-        CrumbledSubSeq64 seq{sseqs, idx, bidx,
-                                  bidx + (until - saved_bases_before)};
-        idx = new_idx;
-        bidx = new_bidx;
-        bases_before = until;
-        return seq;
-    }
-};
 
 #endif

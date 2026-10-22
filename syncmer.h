@@ -5,7 +5,6 @@
 #include <cassert>
 #include <concepts>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <limits>
 
@@ -77,7 +76,6 @@ struct live_scratch {
         }
     }
     uint8_t *codes() { return q.data() + kPad; }
-    const uint8_t *codes() const { return q.data() + kPad; }
 };
 
 // r[p] = rank[q[p] & m] for p in [p0, n), with a 256-entry byte table (the

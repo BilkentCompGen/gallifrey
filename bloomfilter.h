@@ -259,11 +259,6 @@ struct BlockedAtomicBloomFilter {
         return result;
     }
 
-    void Reset() {
-        for (uint64_t i = 0; i < num_words; i++)
-            bv[i].store(0, std::memory_order_relaxed);
-    }
-
     // Fraction of filter bits set.
     double fill_fraction() const {
         uint64_t set = 0;
@@ -307,57 +302,15 @@ concept BF_Insert_Query_Concept = requires(BF bf) {
     { bf.Query(uint64_t{}) } -> std::same_as<bool>;
     { bf.Insert(uint64_t{}) } -> std::same_as<void>;
     { bf.InsertIfAbsent(uint64_t{}) } -> std::same_as<bool>;
-    // { BF(double{}, uint64_t{}) } -> BF;
-};
-
-struct MockBF {
-    double false_positive_rate;
-    double projected_element_count;
-    unsigned int random_seed;
-
-    MockBF(double false_positive_rate,
-           unsigned long long projected_element_count,
-           unsigned long long random_seed)
-        : false_positive_rate(false_positive_rate),
-          projected_element_count(projected_element_count),
-          random_seed(random_seed) {}
-    bool contains(const auto &) const { return true; }
-    bool insert(const auto &) { return false; }
-    bool insert_if_absent(const auto &) { return false; }
-};
-
-template <class BloomImplementation>
-struct bloom_interface {
-    double false_positive_rate;
-    double projected_element_count;
-    unsigned int random_seed;
-
-    BloomImplementation implementation;
-    bloom_interface(double false_positive_rate, double projected_element_count,
-                    unsigned int random_seed)
-        : false_positive_rate(false_positive_rate),
-          projected_element_count(projected_element_count),
-          random_seed(random_seed),
-          implementation(false_positive_rate, projected_element_count,
-                         random_seed) {}
-    bool contains(const auto &element) const {
-        return implementation.contains(element);
-    }
-    bool insert(const auto &element) { return implementation.insert(element); }
-    bool insert_if_absent(const auto &element) {
-        if (contains(element)) return false;
-        insert(element);
-        return true;
-    }
 };
 
 // The filter is seed-independent: the probe positions come from the 64-bit
 // lcmer key alone (via fmix64), so for a given key set
 // --random-seed does not change which keys collide in the filter. The seed
-// argument only keeps the constructor uniform with bloom_interface<MockBF>;
-// threading it into the probes would change the assembly.
+// argument is accepted and unused; threading it into the probes would change
+// the assembly.
 template <BF_Insert_Query_Concept BF>
-struct bloom_interface<BF> {
+struct bloom_interface {
     BF implementation;
 
     bloom_interface(double false_positive_rate, size_t projected_element_count,
