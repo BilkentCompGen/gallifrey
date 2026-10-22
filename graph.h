@@ -131,10 +131,11 @@ using u64 = uint64_t;
 using i64 = int64_t;
 using u32 = uint32_t;
 using DefaultBF = bloom_interface<bloom_ext::BlockedAtomicBloomFilter<>>;
-// A bubble removed by GraphCleaning::pop_bubbles, kept so the removed allele
-// can be written as an alternate sequence after layout. The fragments of the
-// source's last and the sink's first lcmer keep their origin ids through
-// every later merge, so they locate the bubble in the final unitigs.
+// A bubble removed by GraphCleaning::pop_bubbles, for a planned diploid
+// output of the removed allele as an alternate sequence (collected only under
+// dbg_index_base::kKeepPoppedAlleles). The fragments of the source's last and
+// the sink's first lcmer keep their origin ids through every later merge, so
+// they locate the bubble in the final unitigs.
 struct popped_bubble {
     u64 source_origin;
     u64 sink_origin;
@@ -234,6 +235,8 @@ struct dbg_index_base {
 
     dbg_map_t dbg;
     gtl::btree_set<u64> active_set;
+    // Holds popped alleles for planned diploid alternate-allele output.
+    static constexpr bool kKeepPoppedAlleles = false;
     gtl::vector<popped_bubble> popped_bubbles;
     // Depth above which a node holds more than one locus (set by cleaning;
     // 0 when no depth model was fitted).
@@ -1189,8 +1192,8 @@ struct GraphCleaning {
     // the record as a read error (below half a copy). Removed nodes may hold
     // at most bubble_length_bound times the kept path's cores. Bubbles are
     // decided smallest first, so nested ones resolve from the inside out.
-    // Each pop is appended to `popped` before its nodes go. max_bubble_len
-    // (inner cores) 0 disables popping.
+    // Each pop is appended to `popped` (under kKeepPoppedAlleles) before its
+    // nodes go. max_bubble_len (inner cores) 0 disables popping.
     static size_t pop_bubbles(dbg_map_t &dbg, double one_copy,
                               double locus_limit, double bubble_length_bound,
                               size_t max_bubble_len, auto &active_set,
@@ -1265,9 +1268,11 @@ struct GraphCleaning {
             const bool error = removed_depth < 0.5 * one_copy;
 
             // The removed allele is the heaviest path over removed nodes.
-            popped.push_back(make_popped_bubble(
-                dbg, sid, tid, heaviest_bubble_path(dbg, sid, tid, inner, kept),
-                error, removed_depth, kept_depth));
+            if constexpr (dbg_index::kKeepPoppedAlleles)
+                popped.push_back(make_popped_bubble(
+                    dbg, sid, tid,
+                    heaviest_bubble_path(dbg, sid, tid, inner, kept), error,
+                    removed_depth, kept_depth));
 
             // Delete removed nodes; along the kept path, drop every other
             // edge inside the bubble. Inner nodes have no edges outside it.
@@ -1400,8 +1405,6 @@ struct GraphCleaning {
                 for (const auto &tip : tips) {
                     double tip_depth = 0.0;
                     bool seeded = false;
-                    gtl::vector<SequenceContainerType> frags;
-                    size_t len = 0;
                     for (u64 nid : tip) {
                         const auto &node = dbg.find(nid)->second;
                         tip_depth = std::max(tip_depth, node.avg_core_count());
@@ -1409,26 +1412,31 @@ struct GraphCleaning {
                     }
                     if (tip_depth >= locus_limit) continue;  // repeat copy
                     if (seeded) continue;  // an earlier pass's segment
-                    // Tip sequence in forward order.
-                    for (size_t k = 0; k < tip.size(); ++k) {
-                        const u64 nid =
-                            forward ? tip[k] : tip[tip.size() - 1 - k];
-                        for (const auto &frag : dbg.find(nid)->second.seq) {
-                            frags.push_back(
-                                SequenceContainerType::copy_of(frag));
-                            len += frag.len;
+                    if constexpr (dbg_index::kKeepPoppedAlleles) {
+                        // Tip sequence in forward order.
+                        gtl::vector<SequenceContainerType> frags;
+                        size_t len = 0;
+                        for (size_t k = 0; k < tip.size(); ++k) {
+                            const u64 nid =
+                                forward ? tip[k] : tip[tip.size() - 1 - k];
+                            for (const auto &frag : dbg.find(nid)->second.seq) {
+                                frags.push_back(
+                                    SequenceContainerType::copy_of(frag));
+                                len += frag.len;
+                            }
                         }
+                        const auto &xseq = dbg.find(xid)->second.seq;
+                        const u64 anchor = xseq.empty() ? 0
+                                           : forward ? xseq.back().origin_node
+                                                     : xseq.front().origin_node;
+                        popped.push_back(popped_bubble{
+                            forward ? anchor : 0, forward ? 0 : anchor,
+                            tip_depth < 0.5 * one_copy, (float)tip_depth,
+                            (float)xit->second.avg_core_count(),
+                            frags.empty()
+                                ? SequenceContainerType()
+                                : SequenceContainerType(frags, 0, len)});
                     }
-                    const auto &xseq = dbg.find(xid)->second.seq;
-                    const u64 anchor = xseq.empty() ? 0
-                                       : forward    ? xseq.back().origin_node
-                                                    : xseq.front().origin_node;
-                    popped.push_back(popped_bubble{
-                        forward ? anchor : 0, forward ? 0 : anchor,
-                        tip_depth < 0.5 * one_copy, (float)tip_depth,
-                        (float)xit->second.avg_core_count(),
-                        frags.empty() ? SequenceContainerType()
-                                      : SequenceContainerType(frags, 0, len)});
                     // Detach the tip from the fork, then delete it.
                     const u64 first = tip.front();
                     if (forward) {
