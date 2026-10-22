@@ -120,7 +120,7 @@ Assembly:
   the `--print-raw-dbg`/`--print-bi-dbg` dumps). Small windows bridge
   construction holes and large ones resolve repeats, so order the passes from
   small to large windows
-- `--ploidy`: copies of a locus, `1` (default) or `2`; a bubble whose nodes all stay within the depth of one locus (its measured depth plus three times its spread) holds alleles or read errors and is popped, a deeper one is a repeat and is kept. With `2`, short dead-end branches at one-locus forks (allele tips) are cut as well
+- `--ploidy`: ploidy of the sample, `1` for a haploid (or fully homozygous) genome (default) or `2` for a diploid one
 - `--silent`: reduce progress logging (with `--multipass`, every pass logs its
   settings, the segments it uses and keeps, and its wall/CPU time)
 

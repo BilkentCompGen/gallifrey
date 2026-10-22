@@ -100,9 +100,8 @@ class AsmProgram {
                 ->excludes(level_opt)
                 ->excludes(window_opt);
         app.add_option("--ploidy", cfg.graph_cleaning.ploidy,
-                       "Copies of a locus (1 or 2): bubbles whose nodes read "
-                       "at most this many copies are popped, deeper ones are "
-                       "repeats and kept; 2 also cuts allele tips at forks")
+                       "Ploidy of the sample: 1 for a haploid (or fully "
+                       "homozygous) genome, 2 for a diploid one")
             ->check(CLI::Range(1, 2))
             ->capture_default_str();
         app.add_flag("--silent", cfg.silent, "Do not print progress to stderr");
