@@ -478,52 +478,6 @@ inline scd_seed_stats build_scd_graph(
     return stats;
 }
 
-// Compiled only under -DLASM_LAYOUT_RESOLVE_OVERLAP. Drops any SCD component
-// overlapping a heavier one by >50% of the shorter interval, keeping the
-// heavier. Off by default; disconnected components are instead emitted as
-// separate contigs (see collect_path_sequences).
-inline void resolve_overlapping_components(gtl::vector<comp_path> &comp_paths) {
-    if (comp_paths.size() < 2) return;
-
-    // Greedy weighted-interval selection: consider components heaviest-first,
-    // accept one unless it duplicates (>50% of the shorter interval overlaps)
-    // a component already accepted.
-    gtl::vector<uint32_t> order(comp_paths.size());
-    for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-        if (comp_paths[a].total_weight != comp_paths[b].total_weight)
-            return comp_paths[a].total_weight > comp_paths[b].total_weight;
-        return a < b;  // stable tie-break
-    });
-
-    gtl::vector<uint32_t> kept_idx;
-    for (uint32_t idx : order) {
-        const auto &cand = comp_paths[idx];
-        const i64 cand_len = std::max<i64>(1, cand.layout_to - cand.layout_from);
-        bool dup = false;
-        for (uint32_t ki : kept_idx) {
-            const auto &k = comp_paths[ki];
-            const i64 lo = std::max(cand.layout_from, k.layout_from);
-            const i64 hi = std::min(cand.layout_to, k.layout_to);
-            const i64 ov = hi > lo ? hi - lo : 0;
-            const i64 k_len = std::max<i64>(1, k.layout_to - k.layout_from);
-            if (ov * 2 > std::min(cand_len, k_len)) { dup = true; break; }
-        }
-        if (!dup) kept_idx.push_back(idx);
-    }
-
-    if (kept_idx.size() == comp_paths.size()) return;  // nothing dropped
-
-    // Re-emit the survivors in layout order (moving to avoid copying paths).
-    std::sort(kept_idx.begin(), kept_idx.end(), [&](uint32_t a, uint32_t b) {
-        return comp_paths[a].layout_from < comp_paths[b].layout_from;
-    });
-    gtl::vector<comp_path> kept;
-    kept.reserve(kept_idx.size());
-    for (uint32_t idx : kept_idx) kept.push_back(std::move(comp_paths[idx]));
-    comp_paths = std::move(kept);
-}
-
 // ── Phase 2: Find heaviest path per connected component ─────────────
 // Single longest-weight DP with an implicit virtual source (wired to every
 // in-degree-0 node) and virtual sink (wired from every out-degree-0 node):
@@ -655,10 +609,6 @@ inline gtl::vector<comp_path> find_heaviest_paths(
               [](const auto &a, const auto &b) {
                   return a.layout_from < b.layout_from;
               });
-#ifdef LASM_LAYOUT_RESOLVE_OVERLAP
-    // Off by default; see the note on resolve_overlapping_components.
-    resolve_overlapping_components(comp_paths);
-#endif
 
     return comp_paths;
 }
@@ -1122,48 +1072,24 @@ struct PostLayoutCleaning {
 
 // ── Orientation resolution ──────────────────────────────────────────
 // Each layout assigns every DBG node an orientation (+/-). Normally a node
-// belongs to exactly one layout, so nothing needs resolving. `*out_conflicts`
+// belongs to exactly one layout, so nothing needs resolving; the first layout
+// (in `layouts` order) to claim a node sets its orientation. `*out_conflicts`
 // counts any node claimed by two layouts with opposite orientation (a
 // violation of the single-owner invariant).
-enum class orientation_policy {
-    first_wins,     // first layout (in `layouts` order) to claim the node wins
-    majority_vote,  // orientation backed by the most layouts wins (tie → '+')
-};
-
 inline gtl::flat_hash_map<u64, bool> resolve_layout_orientations(
     const layout_graph_algo::layout_result_t &layouts,
-    orientation_policy policy = orientation_policy::first_wins,
     size_t *out_conflicts = nullptr) {
-    gtl::flat_hash_map<u64, std::pair<uint32_t, uint32_t>> votes;  // {plus,minus}
-    gtl::flat_hash_map<u64, bool> first_ori;                       // first-seen
+    gtl::flat_hash_map<u64, bool> first_ori;
+    gtl::flat_hash_set<u64> conflicting;
     for (const auto &layout : layouts) {
         for (const auto &[id, t] : layout) {
             const bool ori = std::get<2>(t);
-            auto &v = votes[id];
-            if (v.first == 0 && v.second == 0) first_ori.emplace(id, ori);
-            if (ori) ++v.first; else ++v.second;
+            const auto [it, fresh] = first_ori.emplace(id, ori);
+            if (!fresh && it->second != ori) conflicting.insert(id);
         }
     }
-
-    size_t conflicts = 0;
-    gtl::flat_hash_map<u64, bool> result;
-    result.reserve(votes.size());
-    for (const auto &[id, v] : votes) {
-        if (v.first > 0 && v.second > 0) ++conflicts;
-        bool ori;
-        switch (policy) {
-            case orientation_policy::majority_vote:
-                ori = (v.first >= v.second);  // tie → '+'
-                break;
-            case orientation_policy::first_wins:
-            default:
-                ori = first_ori[id];
-                break;
-        }
-        result[id] = ori;
-    }
-    if (out_conflicts) *out_conflicts = conflicts;
-    return result;
+    if (out_conflicts) *out_conflicts = conflicting.size();
+    return first_ori;
 }
 
 // ── Phase: build one layout job per component + per-node boundary masks ──
@@ -2188,12 +2114,12 @@ inline void build_merged_graph(AssemblerT &as, const unitig_graph &graph,
     // Resolve per-node orientation up front (see resolve_layout_orientations).
     // A nonzero conflict count means the single-owner invariant was violated.
     size_t ori_conflicts = 0;
-    auto node_layout_ori = resolve_layout_orientations(
-        layouts, orientation_policy::first_wins, &ori_conflicts);
+    auto node_layout_ori = resolve_layout_orientations(layouts, &ori_conflicts);
     if (ori_conflicts) [[unlikely]]
         std::fprintf(stderr,
                      "[layout-emit] WARNING: %zu node(s) claimed by multiple "
-                     "layouts with conflicting orientation (policy=first_wins)\n",
+                     "layouts with conflicting orientation (first layout "
+                     "kept)\n",
                      ori_conflicts);
 
     // ── Phase 1: one job per layout component + per-node boundary masks ──
