@@ -191,14 +191,16 @@ struct BlockedAtomicBloomFilter {
     static constexpr int kPositionsPerMix = 64 / pos_bits;
     // 2^64 / golden ratio: successive salts are far apart.
     static constexpr uint64_t kWeyl = 0x9e3779b97f4a7c15ULL;
+    // A GCC/Clang extension; __extension__ keeps -Wpedantic quiet about it.
+    __extension__ typedef unsigned __int128 u128;
     struct Probes {
         uint64_t base;
         std::array<block_type, words_per_block> mask;
     };
     Probes ProbesOf(uint64_t key) const {
         const uint64_t x = fmix64(key);
-        const auto block = static_cast<uint64_t>(
-            (static_cast<unsigned __int128>(x) * num_blocks) >> 64);
+        const auto block =
+            static_cast<uint64_t>((static_cast<u128>(x) * num_blocks) >> 64);
         Probes p{block * words_per_block, {}};
         uint64_t bits = x;
         uint64_t salt = x;
