@@ -5,9 +5,11 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <type_traits>
 #include <utility>
 
 // A vector holding up to N elements inside the object; the (N + 1)th moves
@@ -92,7 +94,11 @@ class inline_vec {
     void grow(size_t cap) {
         assert(cap <= std::numeric_limits<uint32_t>::max());
         T *block = std::allocator<T>{}.allocate(cap);
-        std::uninitialized_move(begin(), end(), block);
+        if (spilled()) {
+            std::uninitialized_move(begin(), end(), block);
+        } else {
+            move_inline_to(block);
+        }
         std::destroy(begin(), end());
         if (spilled()) std::allocator<T>{}.deallocate(heap_, cap_);
         heap_ = block;
@@ -115,8 +121,18 @@ class inline_vec {
             other.size_ = 0;
             return;
         }
-        std::uninitialized_move(other.begin(), other.end(), inline_);
+        other.move_inline_to(inline_);
         other.clear();
+    }
+    // Move-constructs the inline elements at dst, which holds at least N. A
+    // trivially copyable T is copied as the whole buffer: GCC cannot prove
+    // size_ <= N and flags the size_-element copy with -Warray-bounds.
+    void move_inline_to(T *dst) noexcept {
+        if constexpr (std::is_trivially_copyable_v<T>) {
+            std::memcpy(dst, inline_, sizeof(inline_));
+        } else {
+            std::uninitialized_move(inline_, inline_ + size_, dst);
+        }
     }
 
     uint32_t size_ = 0;
