@@ -205,26 +205,22 @@ class AsmProgram {
                          "count and edges as if it had been admitted at once",
                          cfg.retro_admission))
             ->group(other_group);
-        auto *link_reverse_opt =
-            app.add_flag("--link-reverse,!--no-link-reverse", cfg.link_reverse,
-                         with_default(
-                             "Let each read's reverse complement add the "
-                             "missing links between lcmer windows that are "
-                             "already in the graph, so the two strands' graphs "
-                             "fill each other's gaps",
-                             cfg.link_reverse))
-                ->group(other_group);
-        app.callback([this, level_opt, multipass_opt, link_reverse_opt]() {
+        app.add_flag("--link-reverse", cfg.link_reverse,
+                     with_default(
+                         "Let each read's reverse complement add the missing "
+                         "links between lcmer windows that are already in the "
+                         "graph, so the two strands' graphs fill each other's "
+                         "gaps",
+                         cfg.link_reverse))
+            ->group(other_group);
+        app.callback([this, level_opt, multipass_opt]() {
             if (olc_lcmer_l_ignored != 0) {
                 std::fprintf(stderr,
                              "[config] --olc-lcmer-l is ignored; overlap "
                              "detection uses --window (%d)\n",
                              cfg.lcmer_l);
             }
-            // Only when asked for: it is on by default, and
-            // --no-prime-reverse alone should not print a note.
-            if (link_reverse_opt->count() > 0 && cfg.link_reverse &&
-                !cfg.prime_reverse) {
+            if (cfg.link_reverse && !cfg.prime_reverse) {
                 std::fprintf(stderr,
                              "[config] --link-reverse needs --prime-reverse; "
                              "no links are added\n");

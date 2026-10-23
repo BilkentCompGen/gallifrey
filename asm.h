@@ -203,7 +203,7 @@ struct asm_config {
     // With prime_reverse, two consecutive windows of a read's reverse
     // complement whose nodes both exist get their missing edge; no node or
     // count changes.
-    bool link_reverse = true;
+    bool link_reverse = false;
     // Accept a core-label match as an SCD layout seed only if both cores have
     // the same homopolymer-compressed sequence, so cores that merely share a
     // label are not chained.
