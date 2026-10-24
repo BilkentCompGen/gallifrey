@@ -92,6 +92,14 @@ FetchContent_Declare(
     GIT_TAG v2.5.0
 )
 FetchContent_MakeAvailable(cli11_proj)
+# CLI11's implementation is compiled once, in its own source file, instead of
+# inline in every source file that includes CLI11. It is part of lasm rather
+# than CLI11's precompiled library, which the Makefile generator would build
+# before starting on lasm's sources.
+set(CLI11_IMPL ${cli11_proj_SOURCE_DIR}/src/Precompile.cpp)
+target_sources(${PROJECT_NAME} PRIVATE ${CLI11_IMPL})
+set_source_files_properties(lasm.cpp dump_cores.cpp ${CLI11_IMPL}
+                            PROPERTIES COMPILE_DEFINITIONS CLI11_COMPILE)
 
 FetchContent_Declare(
     gtl
