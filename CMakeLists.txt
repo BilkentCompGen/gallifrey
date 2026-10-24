@@ -143,10 +143,11 @@ endif()
 set(ZLIB_COMPAT ON)
 set(BUILD_SHARED_LIBS OFF)
 set(BUILD_TESTING OFF)
+set(SKIP_INSTALL_ALL ON)
 FetchContent_Declare(
     zlib_ng
     GIT_REPOSITORY https://github.com/zlib-ng/zlib-ng.git
-    GIT_TAG 2.3.3
+    GIT_TAG 12731092979c6d07f42da27da673a9f6c7b13586 # 2.3.3
 )
 FetchContent_MakeAvailable(zlib_ng)
 
