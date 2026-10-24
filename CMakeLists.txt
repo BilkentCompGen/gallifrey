@@ -72,10 +72,9 @@ endif()
 #     # Remove optimization that can interfere with debugging
 #     string(REPLACE "-Wno-interference-size" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 # endif()
-# libdeflate inflates BGZF blocks; zlib streams plain gzip.
+# libdeflate inflates BGZF blocks; zlib-ng (fetched below) streams plain gzip.
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(DEFLATE REQUIRED IMPORTED_TARGET libdeflate)
-pkg_check_modules(ZLIB REQUIRED IMPORTED_TARGET zlib)
 
 set(SOURCE_FILES lasm.cpp asm2.cpp dump_cores.cpp)
 
@@ -138,9 +137,22 @@ if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
     target_compile_definitions(ksw2_extd2 PRIVATE __SSE2__ KSW_SSE2_ONLY)
 endif()
 
+# zlib-ng in zlib-compatible mode: the zlib API behind <zlib.h>, with a faster
+# inflate for plain gzip input. Built as a static library; it picks its SIMD
+# code paths at run time, so the binary stays portable.
+set(ZLIB_COMPAT ON)
+set(BUILD_SHARED_LIBS OFF)
+set(BUILD_TESTING OFF)
+FetchContent_Declare(
+    zlib_ng
+    GIT_REPOSITORY https://github.com/zlib-ng/zlib-ng.git
+    GIT_TAG 2.3.3
+)
+FetchContent_MakeAvailable(zlib_ng)
+
 # Link libraries
 target_link_libraries(${PROJECT_NAME} PRIVATE
-                      PkgConfig::DEFLATE PkgConfig::ZLIB gtl CLI11::CLI11 ksw2_extd2
+                      zlib-ng::zlibstatic PkgConfig::DEFLATE gtl CLI11::CLI11 ksw2_extd2
                       concurrentqueue pthread
                       $<$<PLATFORM_ID:Linux>:rt>)
 

@@ -7,7 +7,6 @@ Requirements:
 - CMake >= 3.20
 - C++23 compiler
 - `libdeflate`
-- `zlib`
 - POSIX threads
 
 Build (defaults to `Release`):
