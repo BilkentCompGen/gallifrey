@@ -74,8 +74,10 @@ formats can be mixed in one invocation.
 An input can also be a pipe: `-` reads standard input, and a named pipe or
 `/dev/stdin` works like a file, for example
 `samtools view -b reads.cram | lasm hifi - -o assembly.gfa -l 5`.
-`--multipass` reads its inputs once per pass, so it needs regular files. Each
-input can be given only once.
+Several pipes can be given, but each must already have its writer running
+when lasm starts: lasm opens every input before it reads any, so pipes filled
+one after the other would wait forever. `--multipass` reads its inputs once
+per pass, so it needs regular files. Each input can be given only once.
 
 ```bash
 lasm hifi <reads1> [reads2 ...] -o output.gfa -l <lcp_level> [--syncmer K/S[/T]]

@@ -43,16 +43,17 @@ using std::string;
 #define OLC_SKIP_LAST(l) ((l) / 2)
 #endif
 
-// Records `st`, the status of inputs[seen.size()], in `seen`. An input given
-// twice is refused whatever it is: given as `-` and as /dev/stdin, both
-// descriptors share one file position.
-static bool record_unique_input(const auto &inputs,
+// Records `st`, the status of `input`, in `seen`, which holds the status of
+// each earlier entry of `inputs` in order. An input given twice is refused
+// whatever it is: given as `-` and as /dev/stdin, both descriptors share one
+// file position.
+static bool record_unique_input(const std::string &input, const auto &inputs,
                                 std::vector<struct stat> &seen,
                                 const struct stat &st) {
     for (size_t i = 0; i < seen.size(); ++i) {
         if (same_file(seen[i], st)) {
             fprintf(stderr, "Error: input %s is given twice (also as %s)\n",
-                    inputs[seen.size()].c_str(), inputs[i].c_str());
+                    input.c_str(), inputs[i].c_str());
             return false;
         }
     }
@@ -754,7 +755,7 @@ struct assembler {
                         strerror(errno));
                 return false;
             }
-            if (!record_unique_input(inputs, seen, st)) return false;
+            if (!record_unique_input(input, inputs, seen, st)) return false;
             const auto format = detect_input_format(*stream);
             if (!format) {
                 fprintf(stderr, "Error: input %s: %s\n", input.c_str(),
@@ -1179,7 +1180,7 @@ static bool check_inputs(const asm_config &cfg) {
                     input.c_str());
             return false;
         }
-        if (!record_unique_input(cfg.inputs, seen, st)) return false;
+        if (!record_unique_input(input, cfg.inputs, seen, st)) return false;
     }
     return true;
 }
