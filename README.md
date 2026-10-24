@@ -71,6 +71,12 @@ The format is detected from the file content, so any file name works. Read
 names and quality values are ignored; only sequences are used. Different
 formats can be mixed in one invocation.
 
+An input can also be a pipe: `-` reads standard input, and a named pipe or
+`/dev/stdin` works like a file, for example
+`samtools view -b reads.cram | lasm hifi - -o assembly.gfa -l 5`.
+`--multipass` reads its inputs once per pass, so it needs regular files. Each
+input can be given only once.
+
 ```bash
 lasm hifi <reads1> [reads2 ...] -o output.gfa -l <lcp_level> [--syncmer K/S[/T]]
 ```
@@ -103,7 +109,8 @@ including the advanced ones below.
 
 Required:
 
-- `input`: one or more BAM or FASTA/FASTQ(.gz) read files
+- `input`: one or more BAM or FASTA/FASTQ(.gz) read files; `-` reads
+  standard input
 - `-o, --output`: output GFA path
 - `-l, --level`: LCP/core depth (or `--multipass`)
 
@@ -123,7 +130,8 @@ Assembly:
   with the previous pass's contigs; only the last pass writes the output (and
   the `--print-raw-dbg`/`--print-bi-dbg` dumps). Small windows bridge
   construction holes and large ones resolve repeats, so order the passes from
-  small to large windows
+  small to large windows. Every pass reads the inputs again, so they must be
+  files, not pipes or standard input
 - `--ploidy`: ploidy of the sample, `1` for a haploid (or fully homozygous) genome (default) or `2` for a diploid one
 - `--silent`: reduce progress logging (with `--multipass`, every pass logs its
   settings, the segments it uses and keeps, and its wall/CPU time)

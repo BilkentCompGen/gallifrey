@@ -73,7 +73,7 @@ class bam_reader {
     // block_size is an int32 in the spec; htslib refuses larger records.
     static constexpr uint32_t kBamMaxBlockSize = INT32_MAX - kBamCoreSize;
 
-    input_stream in_;
+    input_stream &in_;
     byte_cursor cur_{in_};
     std::string error_;
 
@@ -83,7 +83,15 @@ class bam_reader {
         return false;
     }
 
-    bool skip_header() {
+   public:
+    // Reads the BAM file `in` (opened by the caller and not owned) from its
+    // start.
+    explicit bam_reader(input_stream &in) : in_(in) {}
+    bam_reader(const bam_reader &) = delete;
+    bam_reader &operator=(const bam_reader &) = delete;
+
+    // Reads past the header; call once before next().
+    bool read_header() {
         size_t got = 0;
         const uint8_t *magic = cur_.take(4, got);
         if (!magic || memcmp(magic, "BAM\1", 4) != 0) {
@@ -104,16 +112,6 @@ class bam_reader {
             }
         }
         return true;
-    }
-
-   public:
-    bam_reader() = default;
-    bam_reader(const bam_reader &) = delete;
-    bam_reader &operator=(const bam_reader &) = delete;
-
-    bool open(const std::string &path, int io_threads) {
-        if (!in_.open(path, io_threads)) return fail("cannot open");
-        return skip_header();
     }
 
     // Fills `rec` with the next record's sequence. False at the end of the

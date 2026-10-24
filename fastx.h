@@ -64,7 +64,7 @@ class fastx_reader {
     // once `len` quality bytes have been consumed.
     enum class state { start, header, seq, plus, qual };
 
-    input_stream src_;
+    input_stream &src_;
     const uint8_t *buf_ = nullptr;  // current block of src_
     size_t pos_ = 0;
     size_t end_ = 0;
@@ -243,18 +243,12 @@ class fastx_reader {
     }
 
    public:
-    // `chunk_size` is the block size of uncompressed input, a testing knob:
-    // record boundaries are handled incrementally, so any positive size
+    // Reads FASTA/FASTQ from `src` (opened by the caller and not owned).
+    // Record boundaries are handled incrementally, so any block size of `src`
     // parses identically.
-    fastx_reader() = default;
-    explicit fastx_reader(size_t chunk_size) : src_(chunk_size) {}
+    explicit fastx_reader(input_stream &src) : src_(src) {}
     fastx_reader(const fastx_reader &) = delete;
     fastx_reader &operator=(const fastx_reader &) = delete;
-
-    // `io_threads` inflate threads for BGZF input.
-    bool open(const std::string &path, int io_threads) {
-        return src_.open(path, io_threads);
-    }
 
     bool failed() const { return failed_; }
 

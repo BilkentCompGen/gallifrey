@@ -580,12 +580,17 @@ struct assembler {
         }
     }
 
-    [[nodiscard]] static bool read_bam(const string &path,
+    // An input opened, and its format detected, before any input is read.
+    struct open_input {
+        string path;
+        std::unique_ptr<input_stream> stream;
+    };
+
+    [[nodiscard]] static bool read_bam(const string &path, input_stream &in,
                                        data_queue_of<seq_record> &data_queue,
-                                       record_queue &recycle_queue,
-                                       int threads) {
-        bam_reader reader;
-        if (!reader.open(path, threads)) {
+                                       record_queue &recycle_queue) {
+        bam_reader reader(in);
+        if (!reader.read_header()) {
             std::cerr << "Error: Could not read " << path << ": "
                       << reader.error() << std::endl;
             return false;
@@ -604,15 +609,10 @@ struct assembler {
 
     // FASTA/FASTQ: bases are packed into the record's nibble buffer during
     // the block scan.
-    [[nodiscard]] static bool read_fastx(const string &path,
+    [[nodiscard]] static bool read_fastx(const string &path, input_stream &in,
                                          data_queue_of<seq_record> &data_queue,
-                                         record_queue &recycle_queue,
-                                         int threads) {
-        fastx_reader reader;
-        if (!reader.open(path, threads)) {
-            std::cerr << "Error: Could not open " << path << std::endl;
-            return false;
-        }
+                                         record_queue &recycle_queue) {
+        fastx_reader reader(in);
         enqueue_records<seq_record_ops>(
             data_queue, recycle_queue,
             [&](seq_record *rec) { return reader.next(*rec); });
@@ -640,7 +640,7 @@ struct assembler {
     // One worker pool over one group of same-format inputs. Returns false if
     // any reader failed. Read counts are accumulated into the caller's sums.
     template <class Ops, class Reader>
-    bool run_stage(const gtl::vector<string> &stage_inputs, Reader reader,
+    bool run_stage(gtl::vector<open_input> &stage_inputs, Reader reader,
                    dbg_index &dbgi, auto Process_Func, u64 &valid_sum,
                    u64 &all_sum) {
         // Records in flight per worker before the readers block. Each holds a
@@ -672,29 +672,31 @@ struct assembler {
         }
 
         std::atomic<bool> read_failed{false};
+        // Reads one input to its end and closes it.
+        auto read_input = [&](open_input &input) {
+            const bool ok =
+                reader(input.path, *input.stream, data_queue, recycle_queue);
+            input.stream.reset();
+            if (!ok) {
+                fprintf(stderr, "Failed to read from input %s\n",
+                        input.path.c_str());
+                read_failed.store(true);
+            }
+            return ok;
+        };
         if (parallel_file_reading) {
             gtl::vector<std::thread> readers;
             readers.reserve(stage_inputs.size());
-            for (const auto &input : stage_inputs) {
-                readers.emplace_back([&, input]() {
-                    if (!reader(input, data_queue, recycle_queue, threads.io)) {
-                        fprintf(stderr, "Failed to read from input %s\n",
-                                input.c_str());
-                        read_failed.store(true);
-                    }
-                });
+            for (auto &input : stage_inputs) {
+                readers.emplace_back(
+                    [&read_input, &input]() { read_input(input); });
             }
             for (auto &r : readers) {
                 r.join();
             }
         } else {
-            for (const auto &input : stage_inputs) {
-                if (!reader(input, data_queue, recycle_queue, threads.io)) {
-                    fprintf(stderr, "Failed to read from input %s\n",
-                            input.c_str());
-                    read_failed.store(true);
-                    break;
-                }
+            for (auto &input : stage_inputs) {
+                if (!read_input(input)) break;
             }
         }
 
@@ -713,22 +715,29 @@ struct assembler {
     }
 
     // Runs `Process_Func` over every input, routing each file to the BAM
-    // reader or the FASTX reader according to its detected format.
+    // reader or the FASTX reader according to its detected format. Every
+    // input is opened once, and its format detected, before any is read.
     bool run_over_inputs(dbg_index &dbgi, auto Process_Func, u64 &valid_sum,
                          u64 &all_sum) {
-        gtl::vector<string> bam_inputs;
-        gtl::vector<string> fastx_inputs;
+        gtl::vector<open_input> bam_inputs;
+        gtl::vector<open_input> fastx_inputs;
         for (const auto &input : inputs) {
-            const auto format = detect_input_format(input);
+            auto stream = std::make_unique<input_stream>();
+            if (!stream->open(input, threads.io)) {
+                fprintf(stderr, "Error: input %s: %s\n", input.c_str(),
+                        stream->error().c_str());
+                return false;
+            }
+            const auto format = detect_input_format(*stream);
             if (!format) {
                 fprintf(stderr, "Error: input %s: %s\n", input.c_str(),
                         format.error().c_str());
                 return false;
             }
             if (*format == input_format::fastx) {
-                fastx_inputs.push_back(input);
+                fastx_inputs.push_back({input, std::move(stream)});
             } else {
-                bam_inputs.push_back(input);
+                bam_inputs.push_back({input, std::move(stream)});
             }
         }
         bool ok = true;
@@ -1122,9 +1131,44 @@ static bool validate_path(const std::string &path) {
     return true;
 }
 
+// Each pass opens every input once and reads it once. A pipe, a FIFO or
+// standard input can only be read once, so --multipass, which reads every
+// input again in each pass, needs regular files. An input given twice is
+// refused whatever it is: given as `-` and as /dev/stdin, both descriptors
+// share one file position.
+static bool check_inputs(const asm_config &cfg) {
+    std::vector<struct stat> seen;
+    for (const auto &input : cfg.inputs) {
+        struct stat st;
+        if (!stat_input(input, st)) {
+            fprintf(stderr, "Error: input %s: cannot open: %s\n", input.c_str(),
+                    strerror(errno));
+            return false;
+        }
+        if (!cfg.multipass.empty() && !S_ISREG(st.st_mode)) {
+            fprintf(stderr,
+                    "Error: input %s is not a regular file; --multipass reads "
+                    "every input once per pass, so it cannot read a pipe or "
+                    "standard input\n",
+                    input.c_str());
+            return false;
+        }
+        for (size_t i = 0; i < seen.size(); ++i) {
+            if (seen[i].st_dev == st.st_dev && seen[i].st_ino == st.st_ino) {
+                fprintf(stderr, "Error: input %s is given twice (also as %s)\n",
+                        input.c_str(), cfg.inputs[i].c_str());
+                return false;
+            }
+        }
+        seen.push_back(st);
+    }
+    return true;
+}
+
 // Checks shared by both drivers, before any work; prints the configuration.
 static bool prepare_run(const asm_config &cfg) {
     if (!validate_path(cfg.output)) return false;
+    if (!check_inputs(cfg)) return false;
 
     // Validate the syncmer configuration once, up front, before any syncmer
     // functor is constructed (the functor ctor assumes a valid rule).

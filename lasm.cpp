@@ -59,7 +59,7 @@ class AsmProgram {
         app.add_option("input", cfg.inputs,
                        "Input read files: BAM or FASTA/FASTQ "
                        "(plain or gzipped). Format is detected from content; "
-                       "formats may be mixed.")
+                       "formats may be mixed. - reads standard input.")
             ->required();
         app.add_option("-o,--output", cfg.output, "Output gfa file")
             ->required();

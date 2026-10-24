@@ -35,18 +35,19 @@ static int run_dump_cores(const std::string &input_path,
             out,
             "read_name\tread_len\tcore_idx\tcore_label\tstart\tend\tspan\n");
 
-    const auto fmt = detect_input_format(input_path);
+    input_stream in;
+    if (!in.open(input_path, 0)) {
+        fprintf(stderr, "Cannot open input: %s\n", input_path.c_str());
+        fclose(out);
+        return 1;
+    }
+    const auto fmt = detect_input_format(in);
     if (!fmt || *fmt != input_format::fastx) {
         fprintf(stderr, "Not a FASTA/FASTQ input: %s\n", input_path.c_str());
         fclose(out);
         return 1;
     }
-    fastx_reader reader;
-    if (!reader.open(input_path, 0)) {
-        fprintf(stderr, "Cannot open input: %s\n", input_path.c_str());
-        fclose(out);
-        return 1;
-    }
+    fastx_reader reader(in);
 
     seq_record rec;
     core_buf str;
