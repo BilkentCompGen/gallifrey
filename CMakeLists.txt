@@ -165,6 +165,14 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
                       concurrentqueue pthread
                       $<$<PLATFORM_ID:Linux>:rt>)
 
+# Link-time optimisation in Release builds with GCC: code generation moves to
+# the link, where GCC splits it into partitions compiled in parallel, instead
+# of running serially per source file (asm2.cpp alone dominated the build).
+# Clang's ThinLTO only parallelises across source files, so it is left off.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_property(TARGET ${PROJECT_NAME} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+endif()
+
 # Convenience target: run the assembler on a local sample (data not in repo).
 add_custom_target(rtest COMMAND lasm hifi test/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8)
 add_dependencies(rtest ${PROJECT_NAME})
