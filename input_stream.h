@@ -446,11 +446,16 @@ class gzip_stream {
 // `-` is standard input.
 inline bool is_stdin_path(const std::string &path) { return path == "-"; }
 
-// stat(2) of an input as input_stream::open opens it. Returns false with
-// errno set on failure.
+// stat(2) of an input without opening it. Returns false with errno set on
+// failure. On macOS, /dev/stdin and /dev/fd/N show the descriptor's file
+// only once open (input_stream::file_status).
 inline bool stat_input(const std::string &path, struct stat &st) {
     if (is_stdin_path(path)) return fstat(STDIN_FILENO, &st) == 0;
     return stat(path.c_str(), &st) == 0;
+}
+
+inline bool same_file(const struct stat &a, const struct stat &b) {
+    return a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 }
 
 // One input file as decompressed bytes, block by block. The file is read
@@ -581,6 +586,9 @@ class input_stream {
 
     // Why the stream stopped early; empty after a clean end.
     const std::string &error() const { return error_; }
+
+    // fstat(2) of the open file. Returns false with errno set on failure.
+    bool file_status(struct stat &st) const { return fstat(fd_, &st) == 0; }
 
     void close() {
         bgzf_.close();

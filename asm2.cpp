@@ -43,6 +43,23 @@ using std::string;
 #define OLC_SKIP_LAST(l) ((l) / 2)
 #endif
 
+// Records `st`, the status of inputs[seen.size()], in `seen`. An input given
+// twice is refused whatever it is: given as `-` and as /dev/stdin, both
+// descriptors share one file position.
+static bool record_unique_input(const auto &inputs,
+                                std::vector<struct stat> &seen,
+                                const struct stat &st) {
+    for (size_t i = 0; i < seen.size(); ++i) {
+        if (same_file(seen[i], st)) {
+            fprintf(stderr, "Error: input %s is given twice (also as %s)\n",
+                    inputs[seen.size()].c_str(), inputs[i].c_str());
+            return false;
+        }
+    }
+    seen.push_back(st);
+    return true;
+}
+
 struct assembler {
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
@@ -721,6 +738,9 @@ struct assembler {
                          u64 &all_sum) {
         gtl::vector<open_input> bam_inputs;
         gtl::vector<open_input> fastx_inputs;
+        // check_inputs refused one file given twice, except where only the
+        // open descriptor shows the file (macOS /dev/stdin, /dev/fd/N).
+        std::vector<struct stat> seen;
         for (const auto &input : inputs) {
             auto stream = std::make_unique<input_stream>();
             if (!stream->open(input, threads.io)) {
@@ -728,6 +748,13 @@ struct assembler {
                         stream->error().c_str());
                 return false;
             }
+            struct stat st;
+            if (!stream->file_status(st)) {
+                fprintf(stderr, "Error: input %s: %s\n", input.c_str(),
+                        strerror(errno));
+                return false;
+            }
+            if (!record_unique_input(inputs, seen, st)) return false;
             const auto format = detect_input_format(*stream);
             if (!format) {
                 fprintf(stderr, "Error: input %s: %s\n", input.c_str(),
@@ -1133,9 +1160,8 @@ static bool validate_path(const std::string &path) {
 
 // Each pass opens every input once and reads it once. A pipe, a FIFO or
 // standard input can only be read once, so --multipass, which reads every
-// input again in each pass, needs regular files. An input given twice is
-// refused whatever it is: given as `-` and as /dev/stdin, both descriptors
-// share one file position.
+// input again in each pass, needs regular files. Nothing is opened here, so a
+// FIFO cannot block the check.
 static bool check_inputs(const asm_config &cfg) {
     std::vector<struct stat> seen;
     for (const auto &input : cfg.inputs) {
@@ -1153,14 +1179,7 @@ static bool check_inputs(const asm_config &cfg) {
                     input.c_str());
             return false;
         }
-        for (size_t i = 0; i < seen.size(); ++i) {
-            if (seen[i].st_dev == st.st_dev && seen[i].st_ino == st.st_ino) {
-                fprintf(stderr, "Error: input %s is given twice (also as %s)\n",
-                        input.c_str(), cfg.inputs[i].c_str());
-                return false;
-            }
-        }
-        seen.push_back(st);
+        if (!record_unique_input(cfg.inputs, seen, st)) return false;
     }
     return true;
 }
