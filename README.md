@@ -29,7 +29,7 @@ build directory so you can keep them side by side.
 
 | Type | Flags (summary) | 
 |------|-----------------|
-| `Release` (default) | `-O3 -g -ftree-vectorize -DNDEBUG`; link-time optimisation with GCC |
+| `Release` (default) | `-O3 -g1 -ftree-vectorize -DNDEBUG` (line-level debug info); link-time optimisation with GCC |
 | `RelWithDebInfo` | `-O2 -g -pg -DNDEBUG` | 
 | `Debug` | `-O0 -g -DDEBUG` + UBSan (`-fsanitize=undefined,null,bounds -fsanitize-trap=all`) | 
 | `MinSizeRel` | `-Os -DNDEBUG` |

@@ -34,8 +34,9 @@ option(LASM_NATIVE "Optimize for the build host CPU (-march=native); produces no
 # appended so it reaches the compile line and wins over the defaults.
 # Debug flags
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG -Wall -Wextra -Wpedantic -fsanitize=undefined,null,bounds -fsanitize-trap=all ${CMAKE_CXX_FLAGS_DEBUG}")
-# Release flags
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -ftree-vectorize -DNDEBUG -Wall -Wextra -Wpedantic ${CMAKE_CXX_FLAGS_RELEASE}")
+# Release flags. -g1 keeps line tables (backtraces, profiles) and drops the
+# variable locations, which cost about a quarter of the compile time.
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g1 -ftree-vectorize -DNDEBUG -Wall -Wextra -Wpedantic ${CMAKE_CXX_FLAGS_RELEASE}")
 # RelWithDebInfo flags — includes gprof instrumentation (-pg, -no-pie)
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -pg -DNDEBUG -Wall -Wextra -ftree-vectorize ${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
 set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "-pg -no-pie ${CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO}")
