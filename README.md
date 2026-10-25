@@ -78,6 +78,15 @@ when lasm starts: lasm opens every input before it reads any, so pipes filled
 one after the other would wait forever. `--multipass` reads its inputs once
 per pass, so it needs regular files. Each input can be given only once.
 
+A single large gzipped FASTA/FASTQ file is decompressed on one thread, which
+can limit the whole run. Decompressing it in parallel with
+[rapidgzip](https://github.com/mxmlnkn/rapidgzip) and piping the result in is
+faster, for example
+`rapidgzip -d -c -P 4 reads.fq.gz | lasm hifi - -o assembly.gfa -l 5`.
+rapidgzip does not report a truncated gzip file, so check the file first
+(`gzip -t reads.fq.gz`) if it may be incomplete. Several gzipped files are
+already decompressed in parallel with `--file-reading-mode parallel`.
+
 ```bash
 lasm hifi <reads1> [reads2 ...] -o output.gfa -l <lcp_level> [--syncmer K/S[/T]]
 ```
