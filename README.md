@@ -176,8 +176,8 @@ The defaults suit most runs.
 ### Graph cleaning
 
 - `--iterations`: number of graph-cleaning passes (default 6)
-- `--max-tip-length`: maximum tip length in cores (default 16)
-- `--max-bubble-length`: largest bubble to pop, in inner cores (default 1024); `0` disables bubble popping
+- `--max-tip-length`: maximum tip length to cut, counted in lcmer windows (default 16)
+- `--max-bubble-length`: largest bubble to pop, counted in the lcmer windows of its inner nodes (default 1024); `0` disables bubble popping
 - `--min-bubble-length-difference`: maximum length ratio of a bubble's removed nodes to its kept path (default 2)
 
 ### Layout

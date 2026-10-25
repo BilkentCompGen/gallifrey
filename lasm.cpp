@@ -144,7 +144,7 @@ class AsmProgram {
             ->capture_default_str()
             ->group(cleaning_group);
         app.add_option("--max-tip-length", cfg.graph_cleaning.max_tip_length,
-                       "Maximum tip length to cut in terms of cores")
+                       "Maximum tip length to cut, counted in lcmer windows")
             ->check(CLI::Range(0, 1000000))
             ->capture_default_str()
             ->group(cleaning_group);
@@ -156,21 +156,23 @@ class AsmProgram {
             ->group(cleaning_group);
         app.add_option("--max-bubble-length",
                        cfg.graph_cleaning.max_bubble_length,
-                       "Maximum inner length (in cores) of a bubble to pop; 0 "
-                       "disables bubble popping.")
+                       "Maximum inner length of a bubble to pop, counted in "
+                       "the lcmer windows of its inner nodes; 0 disables "
+                       "bubble popping.")
             ->check(CLI::Range(0, 1000000))
             ->capture_default_str()
             ->group(cleaning_group);
 
         const std::string layout_group = advanced("Layout");
-        app.add_flag("--drop-crumbs,!--keep-crumbs", cfg.drop_crumbs,
-                     with_default(
-                         "Drop crumb nodes (fewer than window+1 cores, so "
-                         "invisible to overlap detection) that have a single "
-                         "predecessor and continue into a longer node, instead "
-                         "of emitting them as C segments. Halves the contig "
-                         "count at a small genome-fraction cost.",
-                         cfg.drop_crumbs))
+        app.add_flag(
+               "--drop-crumbs,!--keep-crumbs", cfg.drop_crumbs,
+               with_default(
+                   "Drop crumb nodes (fewer than window+1 lcmer windows, "
+                   "so invisible to overlap detection) that have a single "
+                   "predecessor and continue into a longer node, instead "
+                   "of emitting them as C segments. Halves the contig "
+                   "count at a small genome-fraction cost.",
+                   cfg.drop_crumbs))
             ->group(layout_group);
         app.add_flag(
                "--strict-layout-labels,!--no-strict-layout-labels",
