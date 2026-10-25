@@ -139,7 +139,8 @@ class AsmProgram {
 
         const std::string cleaning_group = advanced("Graph cleaning");
         app.add_option("--iterations", cfg.graph_cleaning.iterations,
-                       "Number of iterations of graph cleaning")
+                       "Maximum number of graph-cleaning rounds; cleaning "
+                       "stops at convergence")
             ->check(CLI::Range(0, 100))
             ->capture_default_str()
             ->group(cleaning_group);

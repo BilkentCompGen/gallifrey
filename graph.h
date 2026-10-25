@@ -899,8 +899,9 @@ struct GraphCleaning {
         redirect_prev_edges(dbg, redirect_deleted, active_set);
     }
 
-    static void cut_tips(dbg_map_t &dbg, int min_core_depth,
-                         size_t max_tip_length, auto &active_set) {
+    // Returns the number of nodes removed.
+    static size_t cut_tips(dbg_map_t &dbg, int min_core_depth,
+                           size_t max_tip_length, auto &active_set) {
         const auto prune_prev = [&dbg](auto current) {
             auto &pvec = current->second.prev;
             pvec.erase(std::remove_if(pvec.begin(), pvec.end(),
@@ -912,6 +913,7 @@ struct GraphCleaning {
                        pvec.end());
             std::sort(pvec.begin(), pvec.end());
         };
+        size_t n_cut = 0;
 
         for (u64 node : active_set) {
             auto current = dbg.find(node);
@@ -929,6 +931,7 @@ struct GraphCleaning {
                 if (current->second.forward_edge_count == 0 &&
                     current->second.prev.size() == 0) {
                     dbg.erase(current);
+                    ++n_cut;
                 } else if (current->second.forward_edge_count == 0 &&
                            current->second.prev.size() == 1) {
                     auto prev_it = dbg.find(current->second.prev[0]);
@@ -936,6 +939,7 @@ struct GraphCleaning {
                         prev_it->second.forward_edge_count--;
                     }
                     dbg.erase(current);
+                    ++n_cut;
                 }
             } else {
                 gtl::vector<u64> prev_ids(current->second.prev.begin(),
@@ -949,6 +953,7 @@ struct GraphCleaning {
                             prev_it->second.prev.size() == 0 &&
                             prev_it->second.forward_edge_count == 1) {
                             dbg.erase(prev_it);
+                            ++n_cut;
                         }
                     }
                 }
@@ -972,6 +977,7 @@ struct GraphCleaning {
                             prev_it->second.prev.size() == 0 &&
                             prev_it->second.forward_edge_count == 1) {
                             dbg.erase(prev_it);
+                            ++n_cut;
                         }
                     }
                 }
@@ -983,6 +989,7 @@ struct GraphCleaning {
                 prune_prev(current);
             }
         }
+        return n_cut;
     }
 
     // Live forward adjacency: successor lists derived from prev edges,
@@ -1550,9 +1557,15 @@ struct GraphCleaning {
             // were mostly satellite/repeat copies and added misassemblies.
             constexpr size_t kMaxForkTipCores = 64;
             const bool fork_tips = cfg.ploidy >= 2;
+            // A round that removes and merges nothing leaves the graph as it
+            // found it, apart from sorting prev lists and pruning erased
+            // nodes from active_set, so the next round would change nothing.
+            int rounds = 1;  // the initial simplification
             for (int i = 1; i < cfg.iterations; ++i) {
+                ++rounds;
                 fix_edges(dbgi.dbg, active_set);
-                cut_tips(dbgi.dbg, tip_depth, cfg.max_tip_length, active_set);
+                const size_t cut = cut_tips(dbgi.dbg, tip_depth,
+                                            cfg.max_tip_length, active_set);
                 const size_t popped = pop_bubbles(
                     dbgi.dbg, one_copy, locus_limit,
                     cfg.min_bubble_length_difference, cfg.max_bubble_length,
@@ -1570,11 +1583,16 @@ struct GraphCleaning {
                 redirect_deleted.clear();
                 // Iterations run simplify serially (single partition): the
                 // parallel sweep has a cross-chain forward_edge_count race.
-                simplify_simple_paths(dbgi.dbg, redirect_deleted, active_set, 1);
+                simplify_simple_paths(dbgi.dbg, redirect_deleted, active_set,
+                                      1);
                 IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                    "Iteration %d done.", i);
+                if (cut + popped + tips + redirect_deleted.size() == 0) break;
             }
             fix_edges(dbgi.dbg, active_set);
+            if (!acfg.silent)
+                std::fprintf(stderr, "[graph-clean] %d cleaning rounds\n",
+                             rounds);
         } else {
             build_active_set(dbgi.dbg, active_set, false);
         }
