@@ -21,7 +21,7 @@ class DumpCoresProgram {
     syncmer_params syncmer;
     int lcp_level = 4;
     int lcmer_l = 0;
-    uint32_t seed = 0;
+    uint32_t seed = kDefaultRandomSeed;
 
 public:
     explicit DumpCoresProgram(CLI::App &parent);

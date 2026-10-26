@@ -116,7 +116,8 @@ DumpCoresProgram::DumpCoresProgram(CLI::App &parent) {
                    "Dump lcmer keys of windows of this many cores (DBG node "
                    "keys) instead of cores; 0 dumps cores")
         ->capture_default_str();
-    app.add_option("--seed", seed, "Seed of the syncmer s-mer hash (32-bit)")
+    app.add_option("--random-seed", seed,
+                   "Seed of the syncmer s-mer hash (32-bit)")
         ->check(CLI::Range(uint64_t{0}, uint64_t{UINT32_MAX}))
         ->capture_default_str();
     app.callback([this]() {
