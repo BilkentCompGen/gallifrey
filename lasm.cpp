@@ -67,12 +67,15 @@ class AsmProgram {
                        "Number of worker threads")
             ->check(CLI::Range(1, MAXIMUM_WORK_THREADS))
             ->capture_default_str();
-        app.add_option(
-               "-@,--io-threads", cfg.threads.io,
-               "Number of decompression threads per BGZF input (BAM, bgzipped "
-               "FASTA/FASTQ)")
-            ->check(CLI::Range(0, 64))
-            ->capture_default_str();
+        auto *io_opt =
+            app.add_option("-@,--io-threads", cfg.threads.io,
+                           "Number of decompression threads per BGZF input "
+                           "(BAM, bgzipped FASTA/FASTQ); default: half of "
+                           "--threads, at least " +
+                               std::to_string(kMinDefaultIoThreads) +
+                               " and at most " +
+                               std::to_string(kMaxDefaultIoThreads))
+                ->check(CLI::Range(0, 64));
         app.add_option("--file-reading-mode", file_reading_mode,
                        "Input reader mode: parallel or sequential")
             ->check(CLI::IsMember({"parallel", "sequential"}))
@@ -219,7 +222,10 @@ class AsmProgram {
                          "gaps",
                          cfg.link_reverse))
             ->group(other_group);
-        app.callback([this, level_opt, multipass_opt, retro_opt]() {
+        app.callback([this, level_opt, multipass_opt, retro_opt, io_opt]() {
+            if (io_opt->count() == 0) {
+                cfg.threads.io = default_io_threads(cfg.threads.work);
+            }
             if (olc_lcmer_l_ignored != 0) {
                 std::fprintf(stderr,
                              "[config] --olc-lcmer-l is ignored; overlap "

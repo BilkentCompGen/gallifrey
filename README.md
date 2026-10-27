@@ -127,7 +127,7 @@ Required:
 Parallelism and input:
 
 - `-t, --threads`: worker thread count
-- `-@, --io-threads`: decompression thread count per BGZF input file (BAM and bgzipped FASTA/FASTQ; plain gzip is decompressed on one thread, uncompressed input needs none)
+- `-@, --io-threads`: decompression thread count per BGZF input file (BAM and bgzipped FASTA/FASTQ; plain gzip is decompressed on one thread, uncompressed input needs none); default: half of `--threads`, at least 4 and at most 24. Reading is usually the slowest part of construction, so with many worker threads more decompression threads speed up the run
 - `--file-reading-mode`: `sequential` or `parallel`
 
 Assembly:

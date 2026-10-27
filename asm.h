@@ -171,6 +171,17 @@ inline std::expected<std::vector<pass_params>, std::string> parse_multipass(
     }
     return out;
 }
+// Bounds of the default -@: fewer leaves reading short of inflate threads or
+// chunk readers; more adds none once the workers are kept busy (chunk reading
+// of 64 workers needs about 24 readers).
+inline constexpr int kMinDefaultIoThreads = 4, kMaxDefaultIoThreads = 24;
+// Default -@ for `work_threads` workers: half as many inflate threads or
+// chunk readers, within the bounds above, so reading keeps up as the worker
+// count grows.
+inline int default_io_threads(int work_threads) {
+    return std::clamp(work_threads / 2, kMinDefaultIoThreads,
+                      kMaxDefaultIoThreads);
+}
 struct asm_config {
     std::vector<std::string> inputs;
     std::string output;
@@ -181,8 +192,10 @@ struct asm_config {
     // --multipass passes; empty = one pass at (lcp_level, lcmer_l).
     std::vector<pass_params> multipass;
     struct {
-        int io = 4;
         int work = 8;
+        // The default rule at the default -t; the CLI applies the rule to
+        // the given -t when -@ is absent.
+        int io = default_io_threads(8);
     } threads;
     uint32_t seed = kDefaultRandomSeed;
     bool parallel_file_reading = false;
