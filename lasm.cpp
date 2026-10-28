@@ -205,7 +205,7 @@ class AsmProgram {
                          "Give an lcmer window whose first sightings were on "
                          "reads' own strand its node, count and links from "
                          "the first read of the other strand that sees it, "
-                         "so first sightings are not lost (works with "
+                         "so first sightings are not lost (needs "
                          "--prime-reverse)",
                          cfg.retro_admission))
             ->group(other_group);
@@ -228,6 +228,12 @@ class AsmProgram {
                 std::fprintf(stderr,
                              "[config] --link-reverse needs --prime-reverse; "
                              "no links are added\n");
+            }
+            if (cfg.retro_admission && !cfg.prime_reverse) {
+                std::fprintf(stderr,
+                             "[config] --retro-admission needs "
+                             "--prime-reverse; it has no effect\n");
+                cfg.retro_admission = false;
             }
             if (multipass_opt->count() > 0) {
                 auto passes = parse_multipass(multipass_text);

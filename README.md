@@ -195,7 +195,7 @@ The defaults suit most runs.
 - `--retro-admission` / `--no-retro-admission`: give an lcmer window whose
   first sightings were on reads' own strand its node, count and links from the
   first read of the other strand that sees it, so first sightings are not
-  lost. Works with `--prime-reverse` (default on)
+  lost. Needs `--prime-reverse` (default on)
 - `--link-reverse`: let each read's reverse complement add the missing links
   between lcmer windows that are already in the graph, so the two strands'
   graphs fill each other's gaps (default off)

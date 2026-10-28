@@ -802,7 +802,9 @@ struct assembler {
     std::expected<void, std::string> construct_dbg(dbg_index &dbgi) {
         u64 valid_sum = 0;
         u64 all_sum = 0;
-        dbgi.retro_admission = retro_admission;
+        // The tagged keys come only from priming, so without it retro
+        // admission has nothing to go on.
+        dbgi.retro_admission = retro_admission && prime_reverse;
         if (!run_over_inputs(dbgi, process_cores<DefaultBF>, valid_sum,
                              all_sum)) {
             return std::unexpected(
