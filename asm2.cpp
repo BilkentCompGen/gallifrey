@@ -266,10 +266,10 @@ struct assembler {
         }
     }
 
-    // --retro-admission: a node for `key` if it has none, with count 0 and
-    // the fragment `fragment(key)`, made at the reverse-complement sighting
-    // that admits a window whose earlier sightings were all on reads' own
-    // strand.
+    // --retro-admission: a node for `key` if it has none, with count 0, the
+    // fragment `fragment(key)` and marked as owing links. Made at the
+    // reverse-complement sighting that admits a window whose earlier
+    // sightings were all on reads' own strand.
     template <class BFT, class Fragment>
     static void ensure_node(dbg_index_base<BFT> &dbgi, u64 key,
                             Fragment &&fragment) {
@@ -278,9 +278,61 @@ struct assembler {
             key, [](index_type::dbg_map_t::value_type &) {},
             [&](const index_type::dbg_map_t::constructor &ctr) {
                 typename index_type::bidbg_val v{0U};
+                v.owes_links = true;
                 v.seq.push_back(fragment(key));
                 ctr(key, std::move(v));
             });
+    }
+
+    // --retro-admission: the previous window of a reverse-complement parse.
+    // `node` is its key if it has a node, else 0; `owes` whether that node
+    // owes links; `fresh` whether its sighting in this parse was the one
+    // that admitted it after own-strand sightings only.
+    struct retro_cursor {
+        u64 node = 0;
+        bool owes = false;
+        bool fresh = false;
+    };
+    // --retro-admission, step 3 of prime_reverse_complement for window `key`
+    // after `prev`; returns the cursor for the next window. When either
+    // window is fresh, this parse stands in for the lost own-strand
+    // sighting: the edge is added and the upstream window gets its count,
+    // even if another read made the edge. Otherwise, when either window owes
+    // links and the edge is missing, the link is offered to
+    // resolve_owed_links.
+    template <class BFT>
+    static retro_cursor retro_sight(
+        dbg_index_base<BFT> &dbgi, u64 key,
+        const typename dbg_index_base<BFT>::reverse_sighting &seen,
+        const retro_cursor &prev) {
+        retro_cursor here;
+        if (!seen.admitted) return here;
+        here.fresh = seen.needs_node;
+        bool linked = false;
+        bool offer = false;
+        dbgi.dbg.modify_if(key, [&](auto &val) {
+            // A node that existed before its first reverse-complement
+            // sighting owes links too.
+            if (seen.needs_node) val.second.owes_links = true;
+            here.node = key;
+            here.owes = val.second.owes_links;
+            if (prev.node == 0 || !(here.owes || prev.owes)) return;
+            if (here.fresh || prev.fresh) {
+                val.second.emplace_prev(prev.node);
+                linked = true;
+                return;
+            }
+            const auto &preds = val.second.prev;
+            offer =
+                std::find(preds.begin(), preds.end(), prev.node) == preds.end();
+        });
+        if (linked) {
+            dbgi.dbg.modify_if(prev.node, [](auto &val) {
+                val.second.counts.core_count += 1;
+            });
+        }
+        if (offer) dbgi.owed.offer(prev.node, key);
+        return here;
     }
 
     // --prime-reverse: parses the read's reverse complement and inserts those
@@ -300,14 +352,15 @@ struct assembler {
     //    admitted and both have nodes, the edge between them is added if
     //    missing. No node or count changes, so the other strand's depth is
     //    not counted twice.
-    // 3. --retro-admission: when this window and the previous one both have
-    //    nodes and either got its node at this sighting, this parse stands in
-    //    for the lost own-strand sighting: the edge between them is added if
-    //    missing and the upstream window gets the count the own strand's read
-    //    would have given it (insert_lcmer_helper). A later read that links a
-    //    node owing links to a neighbour it lacks offers that link to
-    //    resolve_owed_links, which adds it after reading only where it joins
-    //    a dead end to a source.
+    // 3. --retro-admission (retro_sight): when this window and the previous
+    //    one both have nodes and either got its node at its sighting in this
+    //    parse, this parse stands in for the lost own-strand sighting: the
+    //    edge between them is added if missing and the upstream window gets
+    //    the count the own strand's read would have given it
+    //    (insert_lcmer_helper). A later read that links a node owing links
+    //    to a neighbour it lacks offers that link to resolve_owed_links,
+    //    which adds it after reading only where it joins a dead end to a
+    //    source.
     template <class BFT>
     static void prime_reverse_complement(
         const uint8_t *nibbles, size_t len, int64_t rle_len, int lcp_level,
@@ -326,12 +379,7 @@ struct assembler {
         LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
         // The previous window's key if it was admitted, else 0.
         u64 prev_admitted = 0;
-        // --retro-admission: the previous window's key if it has a node, else
-        // 0, whether that node owes links, and whether it got its node at
-        // this sighting.
-        u64 prev_node = 0;
-        bool prev_owes = false;
-        bool prev_new = false;
+        retro_cursor retro_prev;
         // Window j (cores j..j+L-1).
         const auto sight = [&](size_t j) {
             const u64 key = dbg_index_base<BFT>::lcmer_id(l);
@@ -354,43 +402,7 @@ struct assembler {
                 if (seen.admitted) prev_admitted = key;
             }
             if (dbgi.retro_admission) {
-                bool has_node = false;
-                bool owes = false;
-                bool linked = false;
-                bool offer = false;
-                if (seen.admitted) {
-                    dbgi.dbg.modify_if(key, [&](auto &val) {
-                        if (seen.needs_node) val.second.owes_links = true;
-                        has_node = true;
-                        owes = val.second.owes_links;
-                        if (prev_node == 0 || !(owes || prev_owes)) {
-                            return;
-                        }
-                        // The adjacency of the lost own-strand sighting is
-                        // counted here once, even if another read made the
-                        // edge.
-                        if (seen.needs_node || prev_new) {
-                            val.second.emplace_prev(prev_node);
-                            linked = true;
-                            return;
-                        }
-                        const auto &prev = val.second.prev;
-                        offer = std::find(prev.begin(), prev.end(),
-                                          prev_node) == prev.end();
-                    });
-                }
-                if (linked) {
-                    dbgi.dbg.modify_if(prev_node, [](auto &val) {
-                        val.second.counts.core_count += 1;
-                    });
-                }
-                if (offer) {
-                    dbgi.owed.offer(prev_node, key);
-                }
-                prev_node = 0;
-                if (has_node) prev_node = key;
-                prev_owes = owes;
-                prev_new = has_node && seen.needs_node;
+                retro_prev = retro_sight(dbgi, key, seen, retro_prev);
             }
         };
         sight(1);
