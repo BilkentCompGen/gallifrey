@@ -265,12 +265,15 @@ struct dbg_index_base {
     owed_links owed;
     // Adds the offered links that join a dead end to a source: `from` has
     // no successor and `to` no predecessor in the graph the reads built,
-    // and neither end is offered another link. That is the break a window
-    // whose first own-strand sightings added nothing leaves when no later
-    // read sees it with its neighbour first; a link next to an existing
-    // branch is left out. Decided on the graph before any addition, so the
-    // result does not depend on thread timing. The upstream window gets the
-    // count the lost sighting would have given. Returns {offered, added}.
+    // `from` is offered no other successor and `to` no other predecessor,
+    // and the link is neither a self-link nor offered both ways. That is the
+    // break a window whose first own-strand sightings added nothing leaves
+    // when no later read sees it with its neighbour first; a link next to an
+    // existing branch is left out. Decided on the graph before any addition,
+    // so the result does not depend on thread timing. The upstream window
+    // gets the count the lost sighting would have given. Every offered node
+    // has had a node since its offer: nothing is erased before this. Returns
+    // {offered, added}.
     std::pair<u64, u64> resolve_owed_links(int threads) {
         gtl::vector<std::pair<u64, u64>> links;
         links.swap(owed.offered);
@@ -305,14 +308,20 @@ struct dbg_index_base {
         });
         gtl::vector<std::pair<u64, u64>> accepted;
         for (const auto &[from, to] : links) {
+            if (from == to) continue;
             if (as_from[from] != 1 || as_to[to] != 1) continue;
+            // Offered both ways: a two-node cycle, not a break.
+            if (std::binary_search(links.begin(), links.end(),
+                                   std::pair<u64, u64>{to, from})) {
+                continue;
+            }
             if (has_successor[slot[from]].load(std::memory_order_relaxed)) {
                 continue;
             }
             bool source = false;
             dbg.if_contains(
                 to, [&](const auto &val) { source = val.second.prev.empty(); });
-            if (source && dbg.contains(from)) accepted.push_back({from, to});
+            if (source) accepted.push_back({from, to});
         }
         for (const auto &[from, to] : accepted) {
             dbg.modify_if(to,
