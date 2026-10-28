@@ -336,6 +336,13 @@ struct dbg_index_base {
     // `needs_node` (--retro-admission only): the window is now admitted and
     // every earlier sighting was on a read's own strand, where it added
     // nothing, so it needs a node this read's bases can give.
+    // The two keys are tested one after the other, not atomically (emplace
+    // tests them in the other order). Two workers sighting one window on
+    // both strands at the same moment can both admit it (one count too
+    // many) or both reject it; then the tag is set, no later reverse
+    // sighting needs the node, and the window waits for a second own-strand
+    // sighting, as without retro admission. Locking would be needed to
+    // close that window; it is rare and left open.
     struct reverse_sighting {
         bool admitted;
         bool needs_node;

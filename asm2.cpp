@@ -61,6 +61,15 @@ static bool record_unique_input(const std::string &input, const auto &inputs,
     return true;
 }
 
+// With --retro-admission and --prime-reverse the Bloom filter holds a
+// window's own-strand and reverse-complement sightings under two entries.
+// A window of the genome is seen on both strands and so takes two, but most
+// distinct windows of high-accuracy long reads are read errors seen once,
+// so the entries grow by about this factor over the distinct windows
+// (measured on HiFi data; other error rates give other factors). The filter
+// is sized for that many entries per --projected-element-count window.
+constexpr double kStrandTagScale = 1.15;
+
 struct assembler {
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
@@ -837,6 +846,11 @@ struct assembler {
         // Exact for the blocked layout, unlike the unblocked fill^(k - 1).
         const double est_fpr = bf.fpr_for_fill(fill);
         const double keys = bf.distinct_keys_for_fill(fill);
+        // The advice is in --projected-element-count windows, which the
+        // filter turns into kStrandTagScale entries each under retro
+        // admission.
+        double advised = keys;
+        if (dbgi.retro_admission) advised = keys / kStrandTagScale;
         fprintf(stderr,
                 "Bloom filter: %.4f of bits set, estimated false-positive "
                 "rate %.2e (about %.4g distinct keys)\n",
@@ -854,9 +868,9 @@ struct assembler {
                     "Warning: Bloom filter estimated false-positive rate "
                     "%.2e exceeds 10x the configured %.2e; it holds about "
                     "%.3g distinct keys, so raise --projected-element-count "
-                    "(now %" PRIu64 ") to at least that\n",
+                    "(now %" PRIu64 ") to at least %.3g\n",
                     est_fpr, bloom.false_positive_rate, keys,
-                    bloom.projected_count);
+                    bloom.projected_count, advised);
         }
         // Nothing probes the filter after the reads are in: segment seeding
         // bypasses it and cleaning and layout never read it.
@@ -1265,11 +1279,7 @@ static bool write_output_gfa(const asm_config &cfg, assembler &as,
 
 static int run_passes(const asm_config &cfg);
 
-// Distinct entries the Bloom filter is sized for. With --retro-admission and
-// --prime-reverse it holds a window seen on both strands under two entries,
-// about this much more than --projected-element-count windows, so the
-// filter keeps its configured false-positive rate.
-constexpr double kStrandTagScale = 1.15;
+// Distinct entries the Bloom filter is sized for (see kStrandTagScale).
 static uint64_t filter_entries(const asm_config &cfg) {
     if (!cfg.retro_admission || !cfg.prime_reverse) {
         return cfg.bloom.projected_count;
