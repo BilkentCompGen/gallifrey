@@ -199,16 +199,18 @@ class AsmProgram {
         app.add_flag("--print-bi-dbg", cfg.print_prelayout_graph,
                      "Print DBG before layout (with .bi.gfa suffix)")
             ->group(other_group);
-        app.add_flag("--retro-admission,!--no-retro-admission",
-                     cfg.retro_admission,
-                     with_default(
-                         "Give an lcmer window whose first sightings were on "
-                         "reads' own strand its node, count and links from "
-                         "the first read of the other strand that sees it, "
-                         "so first sightings are not lost (needs "
-                         "--prime-reverse)",
-                         cfg.retro_admission))
-            ->group(other_group);
+        auto *retro_opt =
+            app.add_flag(
+                   "--retro-admission,!--no-retro-admission",
+                   cfg.retro_admission,
+                   with_default(
+                       "Give an lcmer window whose first sightings were on "
+                       "reads' own strand its node, count and links from "
+                       "the first read of the other strand that sees it, "
+                       "so first sightings are not lost (needs "
+                       "--prime-reverse)",
+                       cfg.retro_admission))
+                ->group(other_group);
         app.add_flag("--link-reverse", cfg.link_reverse,
                      with_default(
                          "Let each read's reverse complement add the missing "
@@ -217,7 +219,7 @@ class AsmProgram {
                          "gaps",
                          cfg.link_reverse))
             ->group(other_group);
-        app.callback([this, level_opt, multipass_opt]() {
+        app.callback([this, level_opt, multipass_opt, retro_opt]() {
             if (olc_lcmer_l_ignored != 0) {
                 std::fprintf(stderr,
                              "[config] --olc-lcmer-l is ignored; overlap "
@@ -229,10 +231,13 @@ class AsmProgram {
                              "[config] --link-reverse needs --prime-reverse; "
                              "no links are added\n");
             }
+            // On by default, so it is turned off quietly unless asked for.
             if (cfg.retro_admission && !cfg.prime_reverse) {
-                std::fprintf(stderr,
-                             "[config] --retro-admission needs "
-                             "--prime-reverse; it has no effect\n");
+                if (retro_opt->count() > 0) {
+                    std::fprintf(stderr,
+                                 "[config] --retro-admission needs "
+                                 "--prime-reverse; it has no effect\n");
+                }
                 cfg.retro_admission = false;
             }
             if (multipass_opt->count() > 0) {
