@@ -117,16 +117,6 @@ class bounded_queue {
     std::atomic<size_t> dequeued_{0};
 };
 
-template <std::integral int_type>
-consteval int_type nextpowerof2(int_type v) {
-    v--;
-    for (size_t i = 1; i < sizeof(int_type) * 8; i <<= 1) {
-        v |= v >> i;
-    }
-    v++;
-    return v;
-}
-
 using u64 = uint64_t;
 using i64 = int64_t;
 using u32 = uint32_t;
