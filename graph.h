@@ -1218,15 +1218,22 @@ struct GraphCleaning {
     // stay below locus_limit lies at one locus: its arms are alleles or read
     // errors, and it is popped, keeping its heaviest path. A bubble with any
     // node beyond it is a repeat whose arms are different copies; popping it
-    // would collapse them, so it is kept. The removed side's depth only marks
-    // the record as a read error (below half a copy). Removed nodes may hold
-    // at most bubble_length_bound times the kept path's cores. Bubbles are
-    // decided smallest first, so nested ones resolve from the inside out.
-    // Each pop is appended to `popped` (under kKeepPoppedAlleles) before its
-    // nodes go. max_bubble_len (inner cores) 0 disables popping.
+    // would collapse them, so it is kept. With ploidy 2 or more, the ends
+    // are tested by the mean of source and sink depth instead of the higher
+    // one. A repeat present at two or more loci has both ends at or above
+    // locus_limit, so their mean stays at or above it and the bubble is kept.
+    // Of the bubbles the higher end would keep, the mean pops only those with
+    // one end above locus_limit and the other below it by more than the first
+    // exceeds it. The removed side's depth only marks the record as a read
+    // error (below half a copy). Removed nodes may hold at most
+    // bubble_length_bound times the kept path's cores. Bubbles are decided
+    // smallest first, so nested ones resolve from the inside out. Each pop is
+    // appended to `popped` (under kKeepPoppedAlleles) before its nodes go.
+    // max_bubble_len (inner cores) 0 disables popping.
     static size_t pop_bubbles(dbg_map_t &dbg, double one_copy,
                               double locus_limit, double bubble_length_bound,
-                              size_t max_bubble_len, auto &active_set,
+                              size_t max_bubble_len, int ploidy,
+                              auto &active_set,
                               gtl::vector<popped_bubble> &popped) {
         if (max_bubble_len == 0 || one_copy <= 0.0) return 0;
         constexpr size_t kMaxBubbleNodes = 256;
@@ -1289,9 +1296,10 @@ struct GraphCleaning {
                 bubble_length_bound * (double)std::max<size_t>(kept_len, 1)) {
                 continue;  // removed side much longer than the kept path
             }
-            const double end_depth =
-                std::max(sit->second.avg_core_count(),
-                         dbg.find(tid)->second.avg_core_count());
+            const double source_depth = sit->second.avg_core_count();
+            const double sink_depth = dbg.find(tid)->second.avg_core_count();
+            double end_depth = std::max(source_depth, sink_depth);
+            if (ploidy >= 2) end_depth = 0.5 * (source_depth + sink_depth);
             if (end_depth >= locus_limit || inner_high >= locus_limit) {
                 continue;  // a repeat: the arms are different copies
             }
@@ -1588,7 +1596,7 @@ struct GraphCleaning {
                 const size_t popped = pop_bubbles(
                     dbgi.dbg, one_copy, locus_limit,
                     cfg.min_bubble_length_difference, cfg.max_bubble_length,
-                    active_set, dbgi.popped_bubbles);
+                    cfg.ploidy, active_set, dbgi.popped_bubbles);
                 const size_t tips =
                     fork_tips ? cut_fork_tips(dbgi.dbg, one_copy, locus_limit,
                                               kMaxForkTipCores, active_set,
