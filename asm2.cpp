@@ -385,7 +385,7 @@ struct assembler {
                     });
                 }
                 if (offer) {
-                    dbgi.owed.offered[thread_id].push_back({prev_node, key});
+                    dbgi.owed.offer(prev_node, key);
                 }
                 prev_node = 0;
                 if (has_node) prev_node = key;

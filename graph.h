@@ -250,12 +250,17 @@ struct dbg_index_base {
         return key ^ 0x9e3779b97f4a7c15ULL;
     }
     // --retro-admission: links a later reverse-complement read offers next
-    // to a node that owes links (bidbg_val::owes_links), one list per worker.
-    // They are decided after reading (resolve_owed_links), so they hold pairs
-    // of nodes, never rejected windows.
+    // to a node that owes links (bidbg_val::owes_links). They are decided
+    // after reading (resolve_owed_links), so they hold pairs of nodes, never
+    // rejected windows. Offers are rare next to window sightings, so one
+    // lock serves all workers.
     struct owed_links {
-        std::array<gtl::vector<std::pair<u64, u64>>, MAXIMUM_WORK_THREADS + 1>
-            offered;
+        std::mutex lock;
+        gtl::vector<std::pair<u64, u64>> offered;
+        void offer(u64 from, u64 to) {
+            std::lock_guard guard(lock);
+            offered.push_back({from, to});
+        }
     };
     owed_links owed;
     // Adds the offered links that join a dead end to a source: `from` has
@@ -268,10 +273,7 @@ struct dbg_index_base {
     // count the lost sighting would have given. Returns {offered, added}.
     std::pair<u64, u64> resolve_owed_links(int threads) {
         gtl::vector<std::pair<u64, u64>> links;
-        for (auto &v : owed.offered) {
-            links.insert(links.end(), v.begin(), v.end());
-            gtl::vector<std::pair<u64, u64>>().swap(v);
-        }
+        links.swap(owed.offered);
         std::sort(links.begin(), links.end());
         links.erase(std::unique(links.begin(), links.end()), links.end());
         // How often each node is an end of an offered link, by side.
