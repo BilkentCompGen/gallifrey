@@ -192,11 +192,10 @@ The defaults suit most runs.
 
 - `--print-raw-dbg`: write the pre-cleaning graph with `.raw.gfa` suffix
 - `--print-bi-dbg`: write the graph before layout with `.bi.gfa` suffix
-- `--retro-admission` / `--no-retro-admission`: remember each lcmer window's
-  first sighting on a read's own strand until a later sighting on either
-  strand admits the window, then add that sighting's count and edges as if it
-  had been admitted at once. Costs memory for the windows still waiting
-  (default on)
+- `--retro-admission` / `--no-retro-admission`: give an lcmer window whose
+  first sightings were on reads' own strand its node, count and links from the
+  first read of the other strand that sees it, so first sightings are not
+  lost. Works with `--prime-reverse` (default on)
 - `--link-reverse`: let each read's reverse complement add the missing links
   between lcmer windows that are already in the graph, so the two strands'
   graphs fill each other's gaps (default off)

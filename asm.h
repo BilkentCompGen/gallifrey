@@ -196,9 +196,12 @@ struct asm_config {
     // into the Bloom filter only, so the other strand's reads are admitted at
     // their first sighting.
     bool prime_reverse = true;
-    // Remember each window's first own-strand sighting until a later sighting
-    // on either strand admits the window, then add that sighting's count and
-    // edges, so first sightings are not lost.
+    // With prime_reverse, the Bloom filter tells a window's own-strand
+    // sightings from its reverse-complement ones. A window whose first
+    // sightings were on a read's own strand, and so added nothing, gets its
+    // node, count and edges from the first reverse-complement read that sees
+    // it; later such reads offer the links it still lacks. Nothing is kept
+    // per rejected window.
     bool retro_admission = true;
     // With prime_reverse, two consecutive windows of a read's reverse
     // complement whose nodes both exist get their missing edge; no node or

@@ -267,8 +267,9 @@ struct assembler {
     }
 
     // --retro-admission: a node for `key` if it has none, with count 0 and
-    // the fragment `fragment(key)`. It lets a kept sighting's adjacency find
-    // an admitted window that has no node yet (resolve_retro_admissions).
+    // the fragment `fragment(key)`, made at the reverse-complement sighting
+    // that admits a window whose earlier sightings were all on reads' own
+    // strand.
     template <class BFT, class Fragment>
     static void ensure_node(dbg_index_base<BFT> &dbgi, u64 key,
                             Fragment &&fragment) {
@@ -282,44 +283,6 @@ struct assembler {
             });
     }
 
-    // --retro-admission: process_cores, keeping first sightings in
-    // dbgi.retro (sight_own). An admitted window with no admitted
-    // neighbour also gets a node (count 0).
-    template <class BFT>
-    static void process_retro_cores(const lcp_read &lr,
-                                    dbg_index_base<BFT> &dbgi, int thread_id,
-                                    uint64_t &lcmer_index, int lcmer_l) {
-        (void)lcmer_index;
-        using index_type = dbg_index_base<BFT>;
-        LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
-        // Window keys, overwritten last to first by the sighting result (0
-        // when kept). A window's successor is then already 0 when it was
-        // kept from this read, so the successor's record alone holds that
-        // adjacency.
-        gtl::vector<uint64_t> ll(1, 0);
-        ll.reserve(lr.cores.size() - lcmer_l + 3);
-        ll.push_back(index_type::lcmer_id(l));
-        for (size_t i = static_cast<size_t>(lcmer_l + 1);
-             i < lr.cores.size() - 1; ++i) {
-            l.update_lcmer(lr.cores[i], lr.cores[i - lcmer_l], lcmer_l);
-            ll.push_back(index_type::lcmer_id(l));
-        }
-        ll.push_back(0);
-        for (size_t i = ll.size() - 2; i >= 1; --i) {
-            ll[i] = dbgi.sight_own(ll[i], ll[i - 1], ll[i + 1]);
-        }
-        for (size_t i = 1; i < ll.size() - 1; ++i) {
-            const auto fragment = [&](u64 key) {
-                return window_fragment(lr, i, lcmer_l, key,
-                                       dbgi.fragment_arena(thread_id));
-            };
-            insert_lcmer_helper(ll, i, dbgi, fragment);
-            if (ll[i] != 0 && ll[i - 1] == 0 && ll[i + 1] == 0) {
-                ensure_node(dbgi, ll[i], fragment);
-            }
-        }
-    }
-
     // --prime-reverse: parses the read's reverse complement and inserts those
     // lcmer keys into the Bloom filter only (no node, count or edge), so the
     // first sighting of the sequence on the other strand is admitted. The
@@ -329,12 +292,22 @@ struct assembler {
     // caller scratch; `thread_id` picks the fragment arena of nodes made under
     // --retro-admission. Each window takes one Bloom sighting, and the steps
     // below act on it in this order:
-    // 1. --retro-admission: a window this sighting admits with a kept
-    //    own-strand sighting gets its node here, from this parse's bases.
+    // 1. --retro-admission: a window this sighting admits after sightings on
+    //    reads' own strand only, which added nothing (sight_reverse's
+    //    needs_node), gets its node here, from this parse's bases, and is
+    //    marked as owing links.
     // 2. --link-reverse: when this window and the previous one are both
     //    admitted and both have nodes, the edge between them is added if
     //    missing. No node or count changes, so the other strand's depth is
     //    not counted twice.
+    // 3. --retro-admission: when this window and the previous one both have
+    //    nodes and either got its node at this sighting, this parse stands in
+    //    for the lost own-strand sighting: the edge between them is added if
+    //    missing and the upstream window gets the count the own strand's read
+    //    would have given it (insert_lcmer_helper). A later read that links a
+    //    node owing links to a neighbour it lacks offers that link to
+    //    resolve_owed_links, which adds it after reading only where it joins
+    //    a dead end to a source.
     template <class BFT>
     static void prime_reverse_complement(
         const uint8_t *nibbles, size_t len, int64_t rle_len, int lcp_level,
@@ -353,6 +326,12 @@ struct assembler {
         LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
         // The previous window's key if it was admitted, else 0.
         u64 prev_admitted = 0;
+        // --retro-admission: the previous window's key if it has a node, else
+        // 0, whether that node owes links, and whether it got its node at
+        // this sighting.
+        u64 prev_node = 0;
+        bool prev_owes = false;
+        bool prev_new = false;
         // Window j (cores j..j+L-1).
         const auto sight = [&](size_t j) {
             const u64 key = dbg_index_base<BFT>::lcmer_id(l);
@@ -373,6 +352,45 @@ struct assembler {
                 }
                 prev_admitted = 0;
                 if (seen.admitted) prev_admitted = key;
+            }
+            if (dbgi.retro_admission) {
+                bool has_node = false;
+                bool owes = false;
+                bool linked = false;
+                bool offer = false;
+                if (seen.admitted) {
+                    dbgi.dbg.modify_if(key, [&](auto &val) {
+                        if (seen.needs_node) val.second.owes_links = true;
+                        has_node = true;
+                        owes = val.second.owes_links;
+                        if (prev_node == 0 || !(owes || prev_owes)) {
+                            return;
+                        }
+                        // The adjacency of the lost own-strand sighting is
+                        // counted here once, even if another read made the
+                        // edge.
+                        if (seen.needs_node || prev_new) {
+                            val.second.emplace_prev(prev_node);
+                            linked = true;
+                            return;
+                        }
+                        const auto &prev = val.second.prev;
+                        offer = std::find(prev.begin(), prev.end(),
+                                          prev_node) == prev.end();
+                    });
+                }
+                if (linked) {
+                    dbgi.dbg.modify_if(prev_node, [](auto &val) {
+                        val.second.counts.core_count += 1;
+                    });
+                }
+                if (offer) {
+                    dbgi.owed.offered[thread_id].push_back({prev_node, key});
+                }
+                prev_node = 0;
+                if (has_node) prev_node = key;
+                prev_owes = owes;
+                prev_new = has_node && seen.needs_node;
             }
         };
         sight(1);
@@ -784,26 +802,19 @@ struct assembler {
     std::expected<void, std::string> construct_dbg(dbg_index &dbgi) {
         u64 valid_sum = 0;
         u64 all_sum = 0;
-        auto process = process_cores<DefaultBF>;
-        if (retro_admission) {
-            dbgi.retro = std::make_unique<dbg_index::retro_admissions>();
-            process = process_retro_cores<DefaultBF>;
-        }
-        if (!run_over_inputs(dbgi, process, valid_sum, all_sum)) {
+        dbgi.retro_admission = retro_admission;
+        if (!run_over_inputs(dbgi, process_cores<DefaultBF>, valid_sum,
+                             all_sum)) {
             return std::unexpected(
                 "Error in reading data for DBG construction.");
         }
-        if (dbgi.retro) {
-            const u64 kept = dbgi.retro->prev_of.size();
-            const u64 admitted = dbgi.resolve_retro_admissions(threads.work);
-            dbgi.retro.reset();
+        if (dbgi.retro_admission) {
+            const auto [offered, added] = dbgi.resolve_owed_links(threads.work);
             const u64 erased = dbgi.erase_unlinked_placeholders(threads.work);
             fprintf(stderr,
-                    "Retro admission: %" PRIu64
-                    " first sightings kept, %" PRIu64
-                    " admitted later, %" PRIu64 " never admitted; %" PRIu64
-                    " unlinked placeholder nodes erased\n",
-                    kept, admitted, kept - admitted, erased);
+                    "Retro admission: %" PRIu64 " owed links offered, %" PRIu64
+                    " added; %" PRIu64 " unlinked placeholder nodes erased\n",
+                    offered, added, erased);
         }
         fprintf(stderr, "%" PRIu64 " processed\n%" PRIu64 " total reads\n",
                 valid_sum, all_sum);
@@ -1240,6 +1251,19 @@ static bool write_output_gfa(const asm_config &cfg, assembler &as,
 
 static int run_passes(const asm_config &cfg);
 
+// Distinct entries the Bloom filter is sized for. With --retro-admission and
+// --prime-reverse it holds a window seen on both strands under two entries,
+// about this much more than --projected-element-count windows, so the
+// filter keeps its configured false-positive rate.
+constexpr double kStrandTagScale = 1.15;
+static uint64_t filter_entries(const asm_config &cfg) {
+    if (!cfg.retro_admission || !cfg.prime_reverse) {
+        return cfg.bloom.projected_count;
+    }
+    return static_cast<uint64_t>(
+        std::llround(kStrandTagScale * cfg.bloom.projected_count));
+}
+
 int run_assembly(const asm_config &cfg) {
     if (!cfg.multipass.empty()) return run_passes(cfg);
     if (!prepare_run(cfg)) return 1;
@@ -1247,8 +1271,8 @@ int run_assembly(const asm_config &cfg) {
     INIT_TIMERS(HIFI_ASSEMBLY);
 
     assembler as(cfg);
-    auto graph = std::make_unique<dbg_index>(
-        cfg.bloom.false_positive_rate, cfg.bloom.projected_count, cfg.seed);
+    auto graph = std::make_unique<dbg_index>(cfg.bloom.false_positive_rate,
+                                             filter_entries(cfg), cfg.seed);
     dbg_index &dbg = *graph;
     if (auto r = as.construct_dbg(dbg); !r) {
         fprintf(stderr, "%s Terminating.\n", r.error().c_str());
@@ -1335,8 +1359,8 @@ static int run_passes(const asm_config &cfg) {
                     p + 1, n, as.lcp_level, as.lcmer_l, segments.size(),
                     total_bases(segments));
         // A fresh index (map and Bloom filter) per pass.
-        auto graph = std::make_unique<dbg_index>(
-            cfg.bloom.false_positive_rate, cfg.bloom.projected_count, cfg.seed);
+        auto graph = std::make_unique<dbg_index>(cfg.bloom.false_positive_rate,
+                                                 filter_entries(cfg), cfg.seed);
         dbg_index &dbg = *graph;
         if (auto r = as.construct_dbg(dbg); !r) {
             fprintf(stderr, "%s Terminating.\n", r.error().c_str());

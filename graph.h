@@ -162,11 +162,13 @@ struct dbg_index_base {
         bidbg_val(unsigned core_count)
             : redirected_flag(false),
               seeded(false),
+              owes_links(false),
               forward_edge_count(0),
               counts{core_count} {}
         bidbg_val(unsigned core_count, u64 prev)
             : redirected_flag(false),
               seeded(false),
+              owes_links(false),
               forward_edge_count(0),
               counts{core_count} {
             this->prev.push_back(prev);
@@ -178,6 +180,10 @@ struct dbg_index_base {
         // depth-only cleaning rules. Sits in the padding before
         // forward_edge_count.
         bool seeded;
+        // --retro-admission: made at a reverse-complement sighting for a
+        // window whose first own-strand sightings added nothing, so its links
+        // are owed by reverse-complement reads. Also in that padding.
+        bool owes_links;
         // forward_edge_count stays outside the redirect_to union: a
         // neighbouring chain may read it while this node is being redirected.
         // fec is written only on representatives; core_count stays unioned
@@ -245,109 +251,110 @@ struct dbg_index_base {
     // First-sighting filter for read lcmers. Only read insertion
     // (construct_dbg) probes it, and construct_dbg releases it when done.
     std::optional<BloomFilterType> bf;
-    // --retro-admission: the first sighting of a window, kept when it is on
-    // a read's own strand, with its neighbouring window keys in that read.
-    // `prev_of` holds every kept key with the preceding key (0 at the read's
-    // start). The following key is 0 at the read's end, and also when that
-    // window was kept from the same read, whose sighting then holds the
-    // adjacency. Kept windows mostly come in runs from one read, so it is 0
-    // for most sightings; `next_of` holds only the nonzero ones. Only read
-    // insertion and resolve_retro_admissions use them; construct_dbg frees
-    // them.
-    struct retro_admissions {
-        using table = gtl::parallel_flat_hash_map<
-            u64, u64, std::hash<u64>, gtl::priv::hash_default_eq<u64>,
-            std::allocator<std::pair<const u64, u64>>, HT_SHARD_BC, mutex_type>;
-        table prev_of;
-        table next_of;
-        // A key's Bloom filter test and its record are made under the key's
-        // stripe, so a read that finds the key in the filter also finds the
-        // record, and two reads never both take the first sighting. 32
-        // stripes per possible worker keep two workers on one stripe rare.
-        static constexpr size_t stripes_per_worker = 32;
-        static constexpr size_t stripe_count =
-            nextpowerof2((u64)MAXIMUM_WORK_THREADS) * stripes_per_worker;
-        std::array<mutex_type, stripe_count> stripes;
-        mutex_type &stripe(u64 key) { return stripes[key % stripe_count]; }
+    // --retro-admission: the Bloom filter holds a window's own-strand
+    // sightings under its key and its reverse-complement sightings under
+    // reverse_tag(key), so it tells which strands have seen the window. A
+    // window is admitted when either has. Off, both go under the key.
+    bool retro_admission = false;
+    static constexpr u64 reverse_tag(u64 key) {
+        return key ^ 0x9e3779b97f4a7c15ULL;
+    }
+    // --retro-admission: links a later reverse-complement read offers next
+    // to a node that owes links (bidbg_val::owes_links), one list per worker.
+    // They are decided after reading (resolve_owed_links), so they hold pairs
+    // of nodes, never rejected windows.
+    struct owed_links {
+        std::array<gtl::vector<std::pair<u64, u64>>, MAXIMUM_WORK_THREADS + 1>
+            offered;
     };
-    std::unique_ptr<retro_admissions> retro;
-    // --retro-admission, a window of a read's own strand: the key if the
-    // Bloom filter has seen it, else 0 and the sighting is kept.
-    u64 sight_own(u64 key, u64 prev, u64 next) {
-        // A repeat sighting needs no record and no stripe: bits are only
-        // ever set, so a filter that holds the key now also holds it under
-        // the stripe.
-        if (bf->contains(key)) return key;
-        std::lock_guard lock(retro->stripe(key));
-        if (bf->insert_if_absent(key)) {
-            retro->prev_of.try_emplace(key, prev);
-            if (next != 0) retro->next_of.try_emplace(key, next);
-            return 0;
+    owed_links owed;
+    // Adds the offered links that join a dead end to a source: `from` has
+    // no successor and `to` no predecessor in the graph the reads built,
+    // and neither end is offered another link. That is the break a window
+    // whose first own-strand sightings added nothing leaves when no later
+    // read sees it with its neighbour first; a link next to an existing
+    // branch is left out. Decided on the graph before any addition, so the
+    // result does not depend on thread timing. The upstream window gets the
+    // count the lost sighting would have given. Returns {offered, added}.
+    std::pair<u64, u64> resolve_owed_links(int threads) {
+        gtl::vector<std::pair<u64, u64>> links;
+        for (auto &v : owed.offered) {
+            links.insert(links.end(), v.begin(), v.end());
+            gtl::vector<std::pair<u64, u64>>().swap(v);
         }
-        return key;
+        std::sort(links.begin(), links.end());
+        links.erase(std::unique(links.begin(), links.end()), links.end());
+        // How often each node is an end of an offered link, by side.
+        gtl::flat_hash_map<u64, unsigned> as_from;
+        gtl::flat_hash_map<u64, unsigned> as_to;
+        for (const auto &[from, to] : links) {
+            ++as_from[from];
+            ++as_to[to];
+        }
+        // Whether each `from` already has a successor: one pass over every
+        // node's predecessors. Nothing is inserted meanwhile, so the
+        // lookups take no lock.
+        gtl::flat_hash_map<u64, size_t> slot;
+        for (const auto &[from, n] : as_from) {
+            slot.emplace(from, slot.size());
+        }
+        std::vector<std::atomic<bool>> has_successor(slot.size());
+        parallel_for(dbg.subcnt(), threads, [&](size_t submap) {
+            dbg.with_submap(submap, [&](const auto &set) {
+                for (const auto &node : set) {
+                    for (u64 p : node.second.prev) {
+                        const auto it = slot.find(p);
+                        if (it == slot.end()) continue;
+                        has_successor[it->second].store(
+                            true, std::memory_order_relaxed);
+                    }
+                }
+            });
+        });
+        gtl::vector<std::pair<u64, u64>> accepted;
+        for (const auto &[from, to] : links) {
+            if (as_from[from] != 1 || as_to[to] != 1) continue;
+            if (has_successor[slot[from]].load(std::memory_order_relaxed)) {
+                continue;
+            }
+            bool source = false;
+            dbg.if_contains(
+                to, [&](const auto &val) { source = val.second.prev.empty(); });
+            if (source && dbg.contains(from)) accepted.push_back({from, to});
+        }
+        for (const auto &[from, to] : accepted) {
+            dbg.modify_if(to,
+                          [&](auto &val) { val.second.emplace_prev(from); });
+            dbg.modify_if(from,
+                          [](auto &val) { val.second.counts.core_count += 1; });
+        }
+        return {links.size(), accepted.size()};
     }
     // A window of a read's reverse-complement parse: inserts it into the
     // Bloom filter. `admitted`: the filter had already seen the window.
-    // `needs_node` (--retro-admission only): the window is now admitted with
-    // a kept own-strand sighting, so it needs a node this read's bases can
-    // give.
+    // `needs_node` (--retro-admission only): the window is now admitted and
+    // every earlier sighting was on a read's own strand, where it added
+    // nothing, so it needs a node this read's bases can give.
     struct reverse_sighting {
         bool admitted;
         bool needs_node;
     };
     reverse_sighting sight_reverse(u64 key) {
-        if (!retro) {
+        if (!retro_admission) {
             return {!bf->insert_if_absent(key), false};
         }
-        std::lock_guard lock(retro->stripe(key));
-        const bool admitted = !bf->insert_if_absent(key);
-        return {admitted, admitted && retro->prev_of.contains(key)};
+        const bool reverse_before = !bf->insert_if_absent(reverse_tag(key));
+        const bool own_before = bf->contains(key);
+        return {reverse_before || own_before, own_before && !reverse_before};
     }
-    // After reading, adds each kept sighting of an admitted window as its
-    // read would have added it had the window been admitted then
-    // (insert_lcmer_helper); a window is admitted iff it has a node. Each
-    // adjacency with an admitted neighbour gives the upstream window a count
-    // and the downstream one a predecessor. Every adjacency is held by one
-    // sighting (see retro_admissions) and nothing else changes the graph
-    // meanwhile, so the result does not depend on thread timing. Returns the
-    // number of admitted kept sightings.
-    u64 resolve_retro_admissions(int threads) {
-        const auto add_count = [](auto &val) {
-            val.second.counts.core_count += 1;
-        };
-        std::atomic<u64> admitted{0};
-        parallel_for(retro->prev_of.subcnt(), threads, [&](size_t submap) {
-            retro->prev_of.with_submap(submap, [&](const auto &set) {
-                for (const auto &[key, prev] : set) {
-                    if (!dbg.contains(key)) continue;
-                    admitted.fetch_add(1, std::memory_order_relaxed);
-                    if (dbg.modify_if(prev, add_count)) {
-                        dbg.modify_if(key, [&](auto &val) {
-                            val.second.emplace_prev(prev);
-                        });
-                    }
-                    // Reading is over and nothing writes next_of any more,
-                    // so the lookup needs no lock.
-                    u64 next = 0;
-                    retro->next_of.if_contains_unsafe(
-                        key, [&](const auto &v) { next = v.second; });
-                    if (dbg.modify_if(next, [&](auto &val) {
-                            val.second.emplace_prev(key);
-                        })) {
-                        dbg.modify_if(key, add_count);
-                    }
-                }
-            });
-        });
-        return admitted.load();
-    }
-    // Erases the nodes made only to hold a place for a kept sighting's
-    // adjacency (count 0, no predecessor). The own-strand path and
-    // resolve_retro_admissions give a count to every node they list as a
-    // predecessor, so none of these is referenced by them. --link-reverse may
-    // list one as a predecessor without a count; that edge goes with the
-    // node, as cleaning would cut such a tip anyway. Seeding comes after
-    // construction, so no node is seeded yet. Returns the number erased.
+    // Erases the nodes made at a reverse-complement sighting that nothing
+    // linked to (count 0, no predecessor). The own-strand path, the
+    // reverse-complement links of --retro-admission and resolve_owed_links
+    // give a count to every node they list as a predecessor, so none of
+    // these is referenced by them. --link-reverse may list one as a
+    // predecessor without a count; that edge goes with the node, as cleaning
+    // would cut such a tip anyway. Seeding comes after construction, so no
+    // node is seeded yet. Returns the number erased.
     u64 erase_unlinked_placeholders(int threads) {
         std::atomic<u64> erased{0};
         parallel_for(dbg.subcnt(), threads, [&](size_t submap) {
@@ -441,7 +448,11 @@ struct dbg_index_base {
         (void)tid;
         const auto new_hash = std::hash<LCmer>{}(l);
         if (bf->insert_if_absent(new_hash)) {
-            return 0;
+            // First own-strand sighting; under --retro-admission a
+            // reverse-complement sighting before it admits the window.
+            if (!retro_admission || !bf->contains(reverse_tag(new_hash))) {
+                return 0;
+            }
         }
         return lcmer_id(l);
     }

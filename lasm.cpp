@@ -202,10 +202,11 @@ class AsmProgram {
         app.add_flag("--retro-admission,!--no-retro-admission",
                      cfg.retro_admission,
                      with_default(
-                         "Remember each lcmer window's first sighting on a "
-                         "read's own strand until a later sighting on either "
-                         "strand admits the window, then add that sighting's "
-                         "count and edges as if it had been admitted at once",
+                         "Give an lcmer window whose first sightings were on "
+                         "reads' own strand its node, count and links from "
+                         "the first read of the other strand that sees it, "
+                         "so first sightings are not lost (works with "
+                         "--prime-reverse)",
                          cfg.retro_admission))
             ->group(other_group);
         app.add_flag("--link-reverse", cfg.link_reverse,
