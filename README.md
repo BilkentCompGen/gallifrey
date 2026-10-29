@@ -127,8 +127,8 @@ Required:
 Parallelism and input:
 
 - `-t, --threads`: worker thread count
-- `-@, --io-threads`: decompression thread count per BGZF input file (BAM and bgzipped FASTA/FASTQ; plain gzip is decompressed on one thread, uncompressed input needs none); default: half of `--threads`, at least 4 and at most 24. Reading is usually the slowest part of construction, so with many worker threads more decompression threads speed up the run
-- `--file-reading-mode`: `sequential` or `parallel`
+- `-@, --io-threads`: decompression thread count per BGZF input file (BAM and bgzipped FASTA/FASTQ; plain gzip is decompressed on one thread, uncompressed input needs none), and the number of readers with `--file-reading-mode chunks`; default: half of `--threads`, at least 4 and at most 24. Reading is usually the slowest part of construction, so with many worker threads more decompression threads speed up the run
+- `--file-reading-mode`: `sequential` (default; one file after another), `parallel` (all files at once, one reader each) or `chunks` (unaligned BAM and FASTA/FASTQ files, uncompressed or bgzipped, are cut into chunks that `-@` readers take in turn, so even a single file is read by many threads; other files, such as plain gzip or pipes, are read whole, with a note). With more than one worker or reader thread the read order, and so the output, varies between runs and modes. `-t 1 -@ 1` fixes the order in `sequential` and `chunks` modes (in chunks mode the default `-@` is at least 4); `parallel` mode runs one reader per input whatever `-@` is, so with two or more files its order still varies
 
 Assembly:
 

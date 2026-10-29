@@ -57,6 +57,9 @@ inline void seq_record_destroy(seq_record *r) {
     delete r;
 }
 
+// `Source` hands out the bytes in blocks: bool next(const uint8_t *&, size_t &)
+// and const std::string &error() (empty after a clean end), as input_stream.
+template <class Source>
 class fastx_reader {
     // kseq record grammar, driven incrementally so a record may straddle any
     // number of blocks: header line -> sequence lines -> ('+' line -> quality
@@ -64,7 +67,7 @@ class fastx_reader {
     // once `len` quality bytes have been consumed.
     enum class state { start, header, seq, plus, qual };
 
-    input_stream &src_;
+    Source &src_;
     const uint8_t *buf_ = nullptr;  // current block of src_
     size_t pos_ = 0;
     size_t end_ = 0;
@@ -75,6 +78,13 @@ class fastx_reader {
     uint32_t qual_got_ = 0;
     std::string name_;
     bool name_done_ = false;
+    // Shape of the record being read: its sequence lines, whether it has a
+    // '+' line, whether its quality spans a line break, and whether the input
+    // ended before its quality was complete.
+    uint32_t seq_lines_ = 0;
+    bool fastq_ = false;
+    bool qual_wrapped_ = false;
+    bool truncated_ = false;
 
     // Takes the next block. Returns false at EOF or on error.
     bool refill() {
@@ -246,7 +256,7 @@ class fastx_reader {
     // Reads FASTA/FASTQ from `src` (opened by the caller and not owned).
     // Record boundaries are handled incrementally, so any block size of `src`
     // parses identically.
-    explicit fastx_reader(input_stream &src) : src_(src) {}
+    explicit fastx_reader(Source &src) : src_(src) {}
     fastx_reader(const fastx_reader &) = delete;
     fastx_reader &operator=(const fastx_reader &) = delete;
 
@@ -260,6 +270,17 @@ class fastx_reader {
     // line truncated at the first whitespace.
     const std::string &name() const { return name_; }
 
+    // Shape of the record returned by the last successful next(): FASTQ
+    // (it has a '+' line), and FASTQ in exactly four lines whose quality
+    // was read to its full length.
+    bool fastq_record() const { return fastq_; }
+    bool four_line_fastq_record() const {
+        return fastq_ && seq_lines_ == 1 && !qual_wrapped_ && !truncated_;
+    }
+    // Whether that record is FASTQ whose input ended before its quality was
+    // complete.
+    bool truncated_record() const { return truncated_; }
+
     // Fills `rec` with the next record's packed sequence. Returns false at EOF.
     bool next(seq_record &rec) {
         rec.len = 0;
@@ -267,6 +288,8 @@ class fastx_reader {
             if (pos_ == end_ && !refill()) {
                 // End of stream: emit whatever the last record accumulated,
                 // unless the stream broke off in it.
+                truncated_ = st_ == state::plus ||
+                             (st_ == state::qual && qual_got_ < rec.len);
                 st_ = state::start;
                 if (failed_ || rec.len == 0) return false;
                 if (rec.len & 1) rec.nibbles[rec.len >> 1] &= 0xF0;
@@ -287,6 +310,10 @@ class fastx_reader {
                     ++pos_;
                     name_.clear();
                     name_done_ = false;
+                    seq_lines_ = 0;
+                    fastq_ = false;
+                    qual_wrapped_ = false;
+                    truncated_ = false;
                     st_ = state::header;
                     break;
                 }
@@ -337,8 +364,10 @@ class fastx_reader {
                         }
                         if (c == '+') {
                             st_ = state::plus;
+                            fastq_ = true;
                             break;
                         }
+                        ++seq_lines_;
                     }
                     const uint8_t *nl = static_cast<const uint8_t *>(
                         memchr(base + pos_, '\n', end_ - pos_));
@@ -375,6 +404,7 @@ class fastx_reader {
                         if (n > 0 && nl[-1] == '\r') --n;
                         qual_got_ += static_cast<uint32_t>(n);
                         pos_ = static_cast<size_t>(nl - base) + 1;
+                        if (qual_got_ < rec.len) qual_wrapped_ = true;
                     }
                     if (qual_got_ == rec.len) {
                         st_ = state::start;

@@ -590,6 +590,16 @@ class input_stream {
     // fstat(2) of the open file. Returns false with errno set on failure.
     bool file_status(struct stat &st) const { return fstat(fd_, &st) == 0; }
 
+    // Whether the file is gzip or BGZF compressed.
+    bool compressed() const { return compression_ != compression::none; }
+
+    // Whether the file is BGZF compressed.
+    bool bgzf_compressed() const { return compression_ == compression::bgzf; }
+
+    // The open file, for reads at given offsets (pread) that leave this
+    // stream's position alone.
+    int descriptor() const { return fd_; }
+
     void close() {
         bgzf_.close();
         gzip_.close();

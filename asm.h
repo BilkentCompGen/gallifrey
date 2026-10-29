@@ -182,6 +182,15 @@ inline int default_io_threads(int work_threads) {
     return std::clamp(work_threads / 2, kMinDefaultIoThreads,
                       kMaxDefaultIoThreads);
 }
+// How inputs are read: one file after another (sequential), all files at
+// once with a reader each (parallel), or each file cut into chunks that -@
+// readers take one after another (chunks).
+enum class file_reading_mode { sequential, parallel, chunks };
+inline const char *file_reading_mode_name(file_reading_mode m) {
+    if (m == file_reading_mode::parallel) return "parallel";
+    if (m == file_reading_mode::chunks) return "chunks";
+    return "sequential";
+}
 struct asm_config {
     std::vector<std::string> inputs;
     std::string output;
@@ -195,10 +204,10 @@ struct asm_config {
         int work = 8;
         // The default rule at the default -t; the CLI applies the rule to
         // the given -t when -@ is absent.
-        int io = default_io_threads(8);
+        int io = default_io_threads(work);
     } threads;
     uint32_t seed = kDefaultRandomSeed;
-    bool parallel_file_reading = false;
+    file_reading_mode reading = file_reading_mode::sequential;
     syncmer_params syncmer;
     bool print_precleanup_graph = false;
     bool print_prelayout_graph = false;
@@ -266,8 +275,7 @@ struct asm_config {
         }
         fprintf(f, "Threads:\n\tIO: %d\n\tWork: %d\n", threads.io, threads.work);
         fprintf(f, "Seed: %" PRIu32 "\n", seed);
-        fprintf(f, "File Reading Mode: %s\n",
-                parallel_file_reading ? "parallel" : "sequential");
+        fprintf(f, "File Reading Mode: %s\n", file_reading_mode_name(reading));
         syncmer.print_cfg(f);
         fprintf(f,
                 "Bloom Filter Parameters:\n\tProjected Count: %" PRIu64

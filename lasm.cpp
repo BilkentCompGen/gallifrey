@@ -40,7 +40,7 @@ static std::string with_default(const std::string &desc, bool on) {
 
 class AsmProgram {
     asm_config cfg;
-    std::string file_reading_mode{"sequential"};
+    std::string file_reading_mode_text{"sequential"};
     int olc_lcmer_l_ignored = 0;  // --olc-lcmer-l: accepted, no effect
     std::string multipass_text;
 
@@ -70,15 +70,21 @@ class AsmProgram {
         auto *io_opt =
             app.add_option("-@,--io-threads", cfg.threads.io,
                            "Number of decompression threads per BGZF input "
-                           "(BAM, bgzipped FASTA/FASTQ); default: half of "
+                           "(BAM, bgzipped FASTA/FASTQ), or of readers with "
+                           "--file-reading-mode chunks; default: half of "
                            "--threads, at least " +
                                std::to_string(kMinDefaultIoThreads) +
                                " and at most " +
                                std::to_string(kMaxDefaultIoThreads))
                 ->check(CLI::Range(0, 64));
-        app.add_option("--file-reading-mode", file_reading_mode,
-                       "Input reader mode: parallel or sequential")
-            ->check(CLI::IsMember({"parallel", "sequential"}))
+        app.add_option("--file-reading-mode", file_reading_mode_text,
+                       "Input reader mode: sequential (one file after "
+                       "another), parallel (all files at once, one reader "
+                       "each) or chunks (unaligned BAM and FASTA/FASTQ "
+                       "files, uncompressed or bgzipped, are cut into chunks "
+                       "that -@ readers take in turn; other files are read "
+                       "whole)")
+            ->check(CLI::IsMember({"sequential", "parallel", "chunks"}))
             ->capture_default_str();
         auto *level_opt =
             app.add_option("-l,--level", cfg.lcp_level, "LCP level to compute")
@@ -268,7 +274,12 @@ class AsmProgram {
                              "significantly more memory and build "
                              "suboptimal assemblies.\n");
             }
-            cfg.parallel_file_reading = (file_reading_mode == "parallel");
+            cfg.reading = file_reading_mode::sequential;
+            if (file_reading_mode_text == "parallel") {
+                cfg.reading = file_reading_mode::parallel;
+            } else if (file_reading_mode_text == "chunks") {
+                cfg.reading = file_reading_mode::chunks;
+            }
             // CLI11 callbacks return void; surface a nonzero rc as a
             // CLI::RuntimeError so the failure reaches the process exit status.
             if (int rc = run_assembly(cfg); rc != 0) {

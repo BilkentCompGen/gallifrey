@@ -26,6 +26,7 @@
 #include "config.h"
 #include "graph.h"
 #include "io/bam_reader.h"
+#include "io/chunked_input.h"
 #include "io/fastx.h"
 #include "layout_graph.h"
 #include "lcmer.h"
@@ -89,7 +90,9 @@ struct assembler {
     decltype(asm_config::syncmer) syncmer_params;
     SyncmerType syncmer_functor;
     int lcmer_l;
-    bool parallel_file_reading;
+    file_reading_mode reading;
+    // The chunks-mode fallback notes were printed (by the first pass).
+    bool chunk_notes_printed = false;
     bool drop_crumbs;
     bool prime_reverse;
     bool retro_admission;
@@ -107,7 +110,7 @@ struct assembler {
           syncmer_params{cfg.syncmer},
           syncmer_functor{syncmer_params, seed},
           lcmer_l{cfg.lcmer_l},
-          parallel_file_reading{cfg.parallel_file_reading},
+          reading{cfg.reading},
           drop_crumbs{cfg.drop_crumbs},
           prime_reverse{cfg.prime_reverse},
           retro_admission{cfg.retro_admission},
@@ -637,10 +640,14 @@ struct assembler {
         }
     }
 
-    // An input opened, and its format detected, before any input is read.
+    // What one producer reads: an input opened, and its format detected,
+    // before any input is read (`stream`), or chunk `chunk` of a cut input
+    // (`cut`).
     struct open_input {
         string path;
         std::unique_ptr<input_stream> stream;
+        const chunked_input *cut = nullptr;
+        size_t chunk = 0;
     };
 
     [[nodiscard]] static bool read_bam(const string &path, input_stream &in,
@@ -686,6 +693,23 @@ struct assembler {
         return true;
     }
 
+    // One chunk of a cut input, with the record checks that make a false cut
+    // fail the run.
+    [[nodiscard]] static bool read_chunk(const open_input &input,
+                                         data_queue_of<seq_record> &data_queue,
+                                         record_queue &recycle_queue) {
+        chunk_reader reader(*input.cut, input.chunk);
+        enqueue_records<seq_record_ops>(
+            data_queue, recycle_queue,
+            [&](seq_record *rec) { return reader.next(*rec); });
+        if (const std::string error = reader.error(); !error.empty()) {
+            fprintf(stderr, "Error: input %s: %s\n", input.path.c_str(),
+                    error.c_str());
+            return false;
+        }
+        return true;
+    }
+
     template <class Ops>
     static void drain_and_destroy(auto &q) {
         typename Ops::record *rec = nullptr;
@@ -694,8 +718,12 @@ struct assembler {
         }
     }
 
-    // One worker pool over one group of same-format inputs. Returns false if
-    // any reader failed. Read counts are accumulated into the caller's sums.
+    // One worker pool over one group of same-format inputs (whole files or
+    // chunks), read by producer threads that each take the next input:
+    // sequential reading has one, parallel reading one per input, chunks
+    // reading -@ (at most one per input). Returns false if any reader failed
+    // (and then no further input is begun). Read counts are accumulated into
+    // the caller's sums.
     template <class Ops, class Reader>
     bool run_stage(gtl::vector<open_input> &stage_inputs, Reader reader,
                    dbg_index &dbgi, auto Process_Func, u64 &valid_sum,
@@ -705,11 +733,13 @@ struct assembler {
         constexpr size_t kRecordsPerWorker = 64;
         const size_t capacity =
             kRecordsPerWorker * static_cast<size_t>(threads.work);
-        // One reader thread per input in parallel reading mode, else one.
-        const size_t producers = [&]() -> size_t {
-            if (parallel_file_reading) return stage_inputs.size();
-            return 1;
-        }();
+        size_t producers = 1;
+        if (reading == file_reading_mode::parallel) {
+            producers = stage_inputs.size();
+        } else if (reading == file_reading_mode::chunks) {
+            producers = std::min(stage_inputs.size(),
+                                 static_cast<size_t>(std::max(threads.io, 1)));
+        }
         data_queue_of<typename Ops::record> data_queue{capacity, producers};
         queue_of<typename Ops::record> recycle_queue{capacity, 1, 1};
         std::atomic<bool> done{false};
@@ -729,33 +759,31 @@ struct assembler {
         }
 
         std::atomic<bool> read_failed{false};
-        // Reads one input to its end and closes it.
-        auto read_input = [&](open_input &input) {
-            const bool ok =
-                reader(input.path, *input.stream, data_queue, recycle_queue);
-            input.stream.reset();
-            if (!ok) {
-                fprintf(stderr, "Failed to read from input %s\n",
-                        input.path.c_str());
-                read_failed.store(true);
+        std::atomic<size_t> next_input{0};
+        // Reads inputs to their end and closes them, one after another.
+        auto produce = [&]() {
+            for (size_t i = next_input++;
+                 i < stage_inputs.size() && !read_failed.load();
+                 i = next_input++) {
+                open_input &input = stage_inputs[i];
+                bool ok = false;
+                if (input.cut) {
+                    ok = read_chunk(input, data_queue, recycle_queue);
+                } else {
+                    ok = reader(input.path, *input.stream, data_queue,
+                                recycle_queue);
+                }
+                input.stream.reset();
+                if (!ok) {
+                    fprintf(stderr, "Failed to read from input %s\n",
+                            input.path.c_str());
+                    read_failed.store(true);
+                }
             }
-            return ok;
         };
-        if (parallel_file_reading) {
-            gtl::vector<std::thread> readers;
-            readers.reserve(stage_inputs.size());
-            for (auto &input : stage_inputs) {
-                readers.emplace_back(
-                    [&read_input, &input]() { read_input(input); });
-            }
-            for (auto &r : readers) {
-                r.join();
-            }
-        } else {
-            for (auto &input : stage_inputs) {
-                if (!read_input(input)) break;
-            }
-        }
+        gtl::vector<std::thread> readers;
+        for (size_t p = 0; p < producers; ++p) readers.emplace_back(produce);
+        for (auto &r : readers) r.join();
 
         done.store(true);
         for (auto &worker : workers) {
@@ -773,11 +801,23 @@ struct assembler {
 
     // Runs `Process_Func` over every input, routing each file to the BAM
     // reader or the FASTX reader according to its detected format. Every
-    // input is opened once, and its format detected, before any is read.
+    // input is opened once, and its format detected, before any is read. In
+    // chunks mode every file that can be cut at record starts becomes chunks
+    // of its group; the others are read whole, each with a note why, and go
+    // first, so that a long single-threaded read does not run alone at the
+    // end of the stage.
     bool run_over_inputs(dbg_index &dbgi, auto Process_Func, u64 &valid_sum,
                          u64 &all_sum) {
+        // Chunks per producer, so that one done early takes another chunk
+        // and the producers finish together.
+        constexpr size_t kChunksPerProducer = 4;
         gtl::vector<open_input> bam_inputs;
         gtl::vector<open_input> fastx_inputs;
+        // The chunks of each group, read after its whole files.
+        gtl::vector<open_input> bam_chunks;
+        gtl::vector<open_input> fastx_chunks;
+        // The cut inputs, kept open while their chunks are read.
+        std::vector<std::unique_ptr<chunked_input>> cut_inputs;
         // check_inputs refused one file given twice, except where only the
         // open descriptor shows the file (macOS /dev/stdin, /dev/fd/N).
         std::vector<struct stat> seen;
@@ -801,12 +841,40 @@ struct assembler {
                         format.error().c_str());
                 return false;
             }
-            if (*format == input_format::fastx) {
-                fastx_inputs.push_back({input, std::move(stream)});
-            } else {
-                bam_inputs.push_back({input, std::move(stream)});
+            auto *group = &fastx_inputs;
+            auto *chunk_group = &fastx_chunks;
+            if (*format == input_format::bam) {
+                group = &bam_inputs;
+                chunk_group = &bam_chunks;
             }
+            if (reading == file_reading_mode::chunks) {
+                auto cut = std::make_unique<chunked_input>();
+                const size_t parts =
+                    kChunksPerProducer *
+                    static_cast<size_t>(std::max(threads.io, 1));
+                const char *why =
+                    cut_into_chunks(*stream, st, input, *format, parts, *cut);
+                if (!why) {
+                    cut->stream = std::move(stream);
+                    for (size_t c = 0; c < cut->chunks.size(); ++c) {
+                        chunk_group->push_back({input, nullptr, cut.get(), c});
+                    }
+                    cut_inputs.push_back(std::move(cut));
+                    continue;
+                }
+                // Once per input, not again for every --multipass pass.
+                if (!chunk_notes_printed) {
+                    fprintf(stderr,
+                            "[config] --file-reading-mode chunks: %s is read "
+                            "whole (%s)\n",
+                            input.c_str(), why);
+                }
+            }
+            group->push_back({input, std::move(stream)});
         }
+        chunk_notes_printed = true;
+        for (auto &c : bam_chunks) bam_inputs.push_back(std::move(c));
+        for (auto &c : fastx_chunks) fastx_inputs.push_back(std::move(c));
         bool ok = true;
         if (!bam_inputs.empty()) {
             ok = run_stage<seq_record_ops>(bam_inputs, read_bam, dbgi,

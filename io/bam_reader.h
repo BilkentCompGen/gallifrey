@@ -13,10 +13,12 @@
 // at, so secondary and supplementary records are read like any other. Records
 // come out as seq_record in the packed nt16 layout of the BAM SEQ field.
 
-// Contiguous byte ranges over an input_stream's blocks. A range inside the
-// current block points into it; only a range straddling blocks is copied.
+// Contiguous byte ranges over a source's blocks. A range inside the current
+// block points into it; only a range straddling blocks is copied. `Source`:
+// bool next(const uint8_t *&, size_t &), as input_stream.
+template <class Source>
 class byte_cursor {
-    input_stream &in_;
+    Source &in_;
     const uint8_t *p_ = nullptr;
     size_t left_ = 0;
     std::vector<uint8_t> carry_;
@@ -24,7 +26,7 @@ class byte_cursor {
     bool refill() { return in_.next(p_, left_); }
 
    public:
-    explicit byte_cursor(input_stream &in) : in_(in) {}
+    explicit byte_cursor(Source &in) : in_(in) {}
 
     // The next `n` (> 0) bytes, valid until the next call. nullptr when the
     // stream ends first; `got` is then the count that was left.
@@ -64,17 +66,21 @@ class byte_cursor {
     }
 };
 
+// Fixed part of a BAM record after block_size (SAM spec 4.2).
+inline constexpr size_t kBamCoreSize = 32;
+
+// `Source` hands out the decompressed bytes as input_stream does: next() and
+// error() (empty after a clean end).
+template <class Source>
 class bam_reader {
-    // Fixed part of a BAM record after block_size (SAM spec 4.2).
-    static constexpr size_t kBamCoreSize = 32;
     static constexpr size_t kBamReadNameLenAt = 8;
     static constexpr size_t kBamCigarCountAt = 12;
     static constexpr size_t kBamSeqLenAt = 16;
     // block_size is an int32 in the spec; htslib refuses larger records.
     static constexpr uint32_t kBamMaxBlockSize = INT32_MAX - kBamCoreSize;
 
-    input_stream &in_;
-    byte_cursor cur_{in_};
+    Source &in_;
+    byte_cursor<Source> cur_{in_};
     std::string error_;
 
     bool fail(const char *what) {
@@ -85,8 +91,8 @@ class bam_reader {
 
    public:
     // Reads the BAM file `in` (opened by the caller and not owned) from its
-    // start.
-    explicit bam_reader(input_stream &in) : in_(in) {}
+    // start, or from a record start when read_header() is not called.
+    explicit bam_reader(Source &in) : in_(in) {}
     bam_reader(const bam_reader &) = delete;
     bam_reader &operator=(const bam_reader &) = delete;
 
