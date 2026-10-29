@@ -594,15 +594,19 @@ struct assembler {
         charsi chs;
         pos_scratch pos_buf;
         lcp_read lr;
+        // Counted locally and stored once: the counts of all workers share
+        // cache lines.
+        int valid = 0;
+        int all = 0;
         while (next_item(data_queue, done, data_p)) {
-            all_reads++;
+            all++;
             lr.clear();
             const int64_t rle_len = parse_cores_from_nibbles(
                 Ops::seq(data_p), Ops::len(data_p), lcp_level, &str,
                 syncmer_functor, chs, lr, pos_buf);
             // Skip reads with too few cores; the record is recycled regardless.
             if (lr.cores.size() >= static_cast<size_t>(lcmer_l + 2)) {
-                ++processed_read_count;
+                ++valid;
                 Process_Func(lr, dbgi, thread_id, lcmer_index, lcmer_l);
                 if (prime_reverse) {
                     prime_reverse_complement(
@@ -616,6 +620,8 @@ struct assembler {
                 data_p = NULL;
             }
         }
+        processed_read_count = valid;
+        all_reads = all;
     }
 
     // Producer loop shared by every reader: takes a recycled record (or
