@@ -8,7 +8,7 @@
 #include <string>
 
 #include "asm.h"
-#include "fastx.h"
+#include "io/fastx.h"
 #include "lcmer.h"
 #include "syncmer.h"
 #include "syncmer_option.h"

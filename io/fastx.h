@@ -7,8 +7,8 @@
 #include <cstring>
 #include <string>
 
+#include "../nt16.h"
 #include "input_stream.h"
-#include "nt16.h"
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>

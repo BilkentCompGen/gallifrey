@@ -23,10 +23,10 @@
 #include <vector>
 
 #include "asm.h"
-#include "bam_reader.h"
 #include "config.h"
-#include "fastx.h"
 #include "graph.h"
+#include "io/bam_reader.h"
+#include "io/fastx.h"
 #include "layout_graph.h"
 #include "lcmer.h"
 #include "syncmer.h"
