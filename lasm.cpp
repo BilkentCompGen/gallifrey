@@ -1,318 +1,308 @@
 #include <CLI/CLI.hpp>
 #include <string>
+#include <string_view>
 #include <vector>
-
-#include "CLI/CLI.hpp"
 
 #define LCPTOOLS_IMPL
 #include "asm.h"
-#include "bamdoctor.h"
+#include "config.h"
 #include "dump_cores.h"
 #include "ext/lcptools/lcptools_ho.h"
-#ifdef BUILD_HISTOGRAM_UTILS
-#include "stats.h"
-#include "sthist.h"
-#endif
+#include "syncmer_option.h"
 using std::string;
 
-// auto lam = []() -> int {
-//     CPUType type = nibble2base_resolve();
-//     std::cerr << "CPU Type: " << (int)type << std::endl;
-//     return 0;
-// }();
-struct bloom_parameters;
-int asm_program(CLI::App &parent) {
-    auto *app_ = parent.add_subcommand("hifi", "run hifi assembly");
-    auto &app = *app_;
-    asm_config *p = new asm_config;
-    auto *inputs = new std::vector<std::string>;
-    auto *file_reading_mode = new std::string{"sequential"};
-    app.add_option("input", *inputs, "Input bam files")->required();
-    app.add_option("-o,--output", p->output, "Output gfa file")->required();
-    app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
-        ->required();
-    app.add_option("--dbg-lcmer-l", p->dbg_lcmer_l, "DBG LCMER window length")
-        ->capture_default_str();
-    app.add_option("-t,--threads", p->threads.work, "Number of worker threads")
-        ->capture_default_str();
-    app.add_option("-@,--io-threads", p->threads.io,
-                   "Number of IO threads (Used by htslib for decompressing)")
-        ->capture_default_str();
-    app.add_option("--random-seed", p->seed, "Random seed")
-        ->capture_default_str();
-    app.add_option("--file-reading-mode", *file_reading_mode,
-                   "Input reader mode: parallel or sequential")
-        ->check(CLI::IsMember({"parallel", "sequential"}))
-        ->capture_default_str();
-
-    app.add_flag("--rle", p->rle, "Enable Run Length Encoding")
-        ->capture_default_str();
-
-
-    app.add_flag("--print-raw-dbg", p->print_precleanup_graph,
-                 "Print DBG before cleanup (with .raw.gfa suffix)")
-        ->capture_default_str();
-    app.add_flag("--print-bi-dbg", p->print_prelayout_graph,
-                 "Print DBG before layout (with .bi.gfa suffix)")
-        ->capture_default_str();
-    app.add_flag("--silent", p->silent, "Do not print progress to stderr")
-        ->capture_default_str();
-    app.add_option("--spaced-seed-mask", p->syncmer.spaced_seed_mask,
-                   "Mask for spaced seeding. (0->skip, 1->keep, 2->mask left "
-                   "bit, 3->mask right bit.")
-        ->capture_default_str();
-    app.add_option("--syncmer-k", p->syncmer.k, "K-mer length")
-        ->capture_default_str();
-    app.add_option("--density", p->syncmer.density,
-                   "Density of selected k-mers")
-        ->expected(0.0F, 1.0F);
-    app.add_option("--submer-s", p->syncmer.mincode.s,
-                   "Size of submers for mincode syncmers")
-        ->excludes("--density");
-    app.add_option("--submer-t", p->syncmer.mincode.t,
-                   "Position of submers for mincode syncmers (Closed syncmer "
-                   "if omitted)")
-        ->excludes("--density")
-        ->needs("--submer-s");
-    auto bfg =
-        app.add_option_group("bloomfilter", "Parameters to setup bloom filter");
-    bfg->add_option("--projected-element-count", p->bloom.projected_count,
-                    "Projected element count")
-        ->capture_default_str();
-    bfg->add_option("--false-positive-probability",
-                    p->bloom.false_positive_rate, "False positive probability")
-        ->capture_default_str();
-    auto gcg = app.add_option_group("graphcleaning",
-                                    "Parameters to setup graph cleaning");
-    gcg->add_option("--iterations", p->graph_cleaning.iterations,
-                    "Number of iterations of graph cleaning")
-        ->capture_default_str();
-    gcg->add_option("--max-tip-length", p->graph_cleaning.max_tip_length,
-                    "Maximum tip length to cut in terms of cores")
-        ->capture_default_str();
-    gcg->add_option("--min-bubble-depth-difference-ratio",
-                    p->graph_cleaning.min_bubble_depth_difference_percentage,
-                    "Minimum bubble length to pop in terms of cores")
-        ->capture_default_str();
-    gcg->add_option("--min-bubble-length-difference",
-                    p->graph_cleaning.min_bubble_length_difference,
-                    "Minimum difference between the two ends of the bubbles to "
-                    "pop. if depth(P1) * arg > depth(P2) then pop();")
-        ->capture_default_str();
-    gcg->add_flag(
-           "--open-simple-loops", p->graph_cleaning.enable_loop_opening,
-           "Enable simple loop opening during graph cleaning. Warning: may "
-           "cause misassembly if loop copy counts are mispredicted.")
-        ->capture_default_str();
-    app.callback([=]() {
-        if (inputs->empty()) {
-            delete file_reading_mode;
-            delete inputs;
-            delete p;
-            return -1;
+// Lists an option's names without the "{false}" CLI11 appends to negated flag
+// names (--no-end-joins{false}), which reads as the flag's default.
+class HelpFormatter : public CLI::Formatter {
+   public:
+    std::string make_option_name(const CLI::Option *opt,
+                                 bool is_positional) const override {
+        if (is_positional) {
+            return CLI::Formatter::make_option_name(opt, true);
         }
-        p->parallel_file_reading = (*file_reading_mode == "parallel");
-        p->inputs = *inputs;
-        int ret = run_assembly(*p);
-        delete file_reading_mode;
-        delete inputs;
-        delete p;
-        return ret;
-    });
-    return 0;
-}
-int map_prog(CLI::App &parent) {
-    auto *app_ = parent.add_subcommand("map", "run hifi assembly");
-    auto &app = *app_;
-    asm_config *p = new asm_config;
-    auto *inputs = new std::vector<std::string>;
-    auto *file_reading_mode = new std::string{"sequential"};
-    app.add_option("input", *inputs, "Input bam files")->required();
-    app.add_option("-o,--output", p->output,
-                   "Second input file (query; kept for current run_mapping semantics)")
-        ->required();
-    app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
-        ->required();
-    app.add_option("--dbg-lcmer-l", p->dbg_lcmer_l, "DBG LCMER window length")
-        ->capture_default_str();
-    app.add_option("-t,--threads", p->threads.work, "Number of worker threads")
-        ->capture_default_str();
-    app.add_option("-@,--io-threads", p->threads.io, "Number of IO threads")
-        ->capture_default_str();
-    app.add_option("--random-seed", p->seed, "Random seed")
-        ->capture_default_str();
-    app.add_option("--file-reading-mode", *file_reading_mode,
-                   "Input reader mode: parallel or sequential")
-        ->check(CLI::IsMember({"parallel", "sequential"}))
-        ->capture_default_str();
-    app.add_flag("--rle", p->rle, "Enable Run Length Encoding")
-        ->capture_default_str();
-    app.add_option("--spaced-seed-mask", p->syncmer.spaced_seed_mask,
-                   "Mask for spaced seeding. (0->skip, 1->keep, 2->mask left "
-                   "bit, 3->mask right bit.")
-        ->capture_default_str();
-    app.add_option("--syncmer-k", p->syncmer.k, "K-mer length")
-        ->capture_default_str();
-    app.add_option("--density", p->syncmer.density,
-                   "Density of selected k-mers")
-        ->expected(0.0F, 1.0F);
-    app.add_option("--submer-s", p->syncmer.mincode.s,
-                   "Size of submers for mincode syncmers")
-        ->excludes("--density");
-    app.add_option("--submer-t", p->syncmer.mincode.t,
-                   "Position of submers for mincode syncmers (Closed syncmer "
-                   "if omitted)")
-        ->excludes("--density")
-        ->needs("--submer-s");
-    app.callback([=]() {
-        if (inputs->empty()) {
-            delete file_reading_mode;
-            delete inputs;
-            delete p;
-            return -1;
-        }
-        p->parallel_file_reading = (*file_reading_mode == "parallel");
-        p->inputs = *inputs;
-        int ret = run_mapping(*p);
-        delete file_reading_mode;
-        delete inputs;
-        delete p;
-        return ret;
-    });
-    return 0;
-}
-#ifdef BUILD_HISTOGRAM_UTILS
-void stats_program(CLI::App &parent) {
-    auto *app_ = parent.add_subcommand("bam-stats", "Print stats on input bam");
-    auto &app = *app_;
-    struct parameters {
-        string input_file;
-        int update_frequency;
-        int lcmer_level;
-        double density;
-    };
-    parameters *params = new parameters{"", 100, 5, 0.01};
-    app.add_option("input", params->input_file, "Input bam file")->required();
-    app.add_option("--update-frequency", params->update_frequency,
-                   "Update frequency")
-        ->capture_default_str();
-    app.add_option("-l,--level", params->lcmer_level,
-                   "Depth of lcmers to be computed")
-        ->capture_default_str();
-    app.add_option("--density", params->density, "Density of selected k-mers")
-        ->required();
+        std::vector<std::string> names;
+        for (const auto &s : opt->get_snames()) names.push_back("-" + s);
+        for (const auto &l : opt->get_lnames()) names.push_back("--" + l);
+        return CLI::detail::join(names);
+    }
+};
 
-    app.callback([=]() {
-        int ret = run_stats(params->input_file, params->update_frequency,
-                            params->lcmer_level, params->density);
-        delete params;
-        return ret;
-    });
+// CLI11 shows no default for flags, so negatable flags state it in their help.
+static std::string with_default(const std::string &desc, bool on) {
+    if (on) return desc + " (default: on)";
+    return desc + " (default: off)";
 }
 
-void stdin_hist_prog(CLI::App &parent) {
-    auto *app_ = parent.add_subcommand("mephisto",
-                                       "Testing HTSLib Multi File movements");
-    auto &app = *app_;
-    struct parameters {
-        int dims;
-        int freq;
-    };
-    // Allocate parameters as heap and set default values
-    parameters *params = new parameters{1, 10};
-    app.add_option("--dims", params->dims, "screen dimensions")
-        ->capture_default_str();
-    app.add_option("--freq", params->freq, "Frequency of histogram updates")
-        ->capture_default_str();
+// Each subcommand is a command object that owns its parsed parameters and
+// registers itself with the parent CLI::App on construction. The objects
+// live for all of main (enclosing CLI11_PARSE), so bound options and the
+// `this`-capturing callbacks stay valid. Copy/move is deleted.
 
-    app.callback([=]() {
-        int ret = run_hist_on_stdin(params->dims, params->freq);
-        delete params;
-        return ret;
-    });
-}
-#endif
+class AsmProgram {
+    asm_config cfg;
+    std::string file_reading_mode_text{"sequential"};
+    int olc_lcmer_l_ignored = 0;  // --olc-lcmer-l: accepted, no effect
+    std::string multipass_text;
 
-int sam_read_testing(CLI::App &parent) {
-    struct parameters {
-        string input;
-        int lcp_level;
-        int threads;
-        SamReadTestingMode mode;
-        string job;
-        double density;
-    };
-    auto *app_ = parent.add_subcommand("bamdoctor", "read bam file fast");
-    auto &app = *app_;
-    parameters *p =
-        new parameters{"", 5, 8, SamReadTestingMode::BASIC, "read_count", 0.01};
-    app.add_option("input", p->input, "Input bam file")->required();
-    app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
-        ->required();
-    app.add_option("-t,--threads", p->threads, "Number of threads")
-        ->capture_default_str();
-    app.add_option("--density", p->density, "Density of selected k-mers")
-        ->required();
+   public:
+    // show_advanced: --help-all is on the command line. CLI11 hides options
+    // whose group is "", so the advanced groups get headings only then; they
+    // parse either way.
+    AsmProgram(CLI::App &parent, bool show_advanced) {
+        auto &app = *parent.add_subcommand("hifi", "run hifi assembly");
+        app.set_help_all_flag("--help-all",
+                              "Print help including advanced options and exit");
+        auto advanced = [show_advanced](const std::string &heading) {
+            if (show_advanced) return heading;
+            return std::string{};
+        };
+        app.add_option("input", cfg.inputs,
+                       "Input read files: BAM or FASTA/FASTQ "
+                       "(plain or gzipped). Format is detected from content; "
+                       "formats may be mixed. - reads standard input.")
+            ->required();
+        app.add_option("-o,--output", cfg.output, "Output gfa file")
+            ->required();
+        app.add_option("-t,--threads", cfg.threads.work,
+                       "Number of worker threads")
+            ->check(CLI::Range(1, MAXIMUM_WORK_THREADS))
+            ->capture_default_str();
+        auto *io_opt =
+            app.add_option("-@,--io-threads", cfg.threads.io,
+                           "Number of decompression threads per BGZF input "
+                           "(BAM, bgzipped FASTA/FASTQ), or of readers with "
+                           "--file-reading-mode chunks; default: half of "
+                           "--threads, at least " +
+                               std::to_string(kMinDefaultIoThreads) +
+                               " and at most " +
+                               std::to_string(kMaxDefaultIoThreads))
+                ->check(CLI::Range(0, 64));
+        app.add_option("--file-reading-mode", file_reading_mode_text,
+                       "Input reader mode: sequential (one file after "
+                       "another), parallel (all files at once, one reader "
+                       "each) or chunks (unaligned BAM and FASTA/FASTQ "
+                       "files, uncompressed or bgzipped, are cut into chunks "
+                       "that -@ readers take in turn; other files are read "
+                       "whole)")
+            ->check(CLI::IsMember({"sequential", "parallel", "chunks"}))
+            ->capture_default_str();
+        auto *level_opt =
+            app.add_option("-l,--level", cfg.lcp_level, "LCP level to compute")
+                ->check(CLI::Range(1, 64));
+        auto *window_opt =
+            app.add_option("-w,--window", cfg.lcmer_l,
+                           "Cores per lcmer window, used for DBG construction "
+                           "and overlap detection")
+                ->check(CLI::Range(1, 64))
+                ->capture_default_str();
+        auto *multipass_opt =
+            app.add_option(
+                   "--multipass", multipass_text,
+                   "Multi-pass assembly: LEVEL:WINDOW[,LEVEL:WINDOW...] gives "
+                   "the LCP level and cores per lcmer window of each pass, "
+                   "e.g. 4:8,5:6,5:10 (replaces -l and -w). Each pass "
+                   "assembles the reads together with the previous pass's "
+                   "contigs; only the last pass writes the output. Order "
+                   "the passes from small to large windows.")
+                ->excludes(level_opt)
+                ->excludes(window_opt);
+        app.add_option("--ploidy", cfg.graph_cleaning.ploidy,
+                       "Ploidy of the sample: 1 for a haploid (or fully "
+                       "homozygous) genome, 2 for a diploid one")
+            ->check(CLI::Range(1, 2))
+            ->capture_default_str();
+        app.add_flag("--silent", cfg.silent, "Do not print progress to stderr");
+        app.add_option("--olc-lcmer-l", olc_lcmer_l_ignored,
+                       "Ignored; overlap detection uses --window")
+            ->group("");
 
-    std::map<std::string, SamReadTestingMode> SamReadTestingMode_map = {
-        {"basic", SamReadTestingMode::BASIC},
-        {"pool", SamReadTestingMode::POOL},
-    };
+        add_syncmer_option(app, cfg.syncmer);
+        app.add_option("--random-seed", cfg.seed,
+                       "Seed of the syncmer s-mer hash (32-bit)")
+            ->check(CLI::Range(uint64_t{0}, uint64_t{UINT32_MAX}))
+            ->capture_default_str();
 
-    std::map<std::string, std::string> job_map = {
-        {"read_count", "read_count"},
-        {"core_count", "core_count"},
-    };
-    app.add_option("--job", p->job, "Job to run")
-        ->required()
-        ->transform(CLI::CheckedTransformer(job_map, CLI::ignore_case));
-    app.add_option("--mode", p->mode, "Mode to run")
-        ->required()
-        ->transform(
-            CLI::CheckedTransformer(SamReadTestingMode_map, CLI::ignore_case));
-    app.callback([=]() {
-        int ret = run_sam_read_testing(p->input, p->threads, p->lcp_level,
-                                       p->mode, p->job, p->density);
-        delete p;
-        return ret;
-    });
-    return 0;
-}
+        const std::string bloom_group = advanced("Bloom filter");
+        app.add_option(
+               "--projected-element-count", cfg.bloom.projected_count,
+               "Distinct lcmer keys the Bloom filter is sized for at the "
+               "configured false-positive probability; construction logs the "
+               "fill and modelled false-positive rate and warns when the "
+               "filter is undersized")
+            ->check(CLI::Range((int64_t)1, (int64_t)10000000000))
+            ->capture_default_str()
+            ->group(bloom_group);
+        app.add_option("--false-positive-probability",
+                       cfg.bloom.false_positive_rate,
+                       "False positive probability")
+            ->capture_default_str()
+            ->group(bloom_group);
+        app.add_flag("--prime-reverse,!--no-prime-reverse", cfg.prime_reverse,
+                     with_default(
+                         "Also parse each read's reverse complement and insert "
+                         "its lcmer keys into the Bloom filter only (no node, "
+                         "count or edge), so reads of the other strand are "
+                         "admitted at their first sighting",
+                         cfg.prime_reverse))
+            ->group(bloom_group);
 
-#define DOCTEST_CONFIG_IMPLEMENT
-#include "doctest.h"
+        const std::string cleaning_group = advanced("Graph cleaning");
+        app.add_option("--iterations", cfg.graph_cleaning.iterations,
+                       "Maximum number of graph-cleaning rounds; cleaning "
+                       "stops at convergence")
+            ->check(CLI::Range(0, 100))
+            ->capture_default_str()
+            ->group(cleaning_group);
+        app.add_option("--max-tip-length", cfg.graph_cleaning.max_tip_length,
+                       "Maximum tip length to cut, counted in lcmer windows")
+            ->check(CLI::Range(0, 1000000))
+            ->capture_default_str()
+            ->group(cleaning_group);
+        app.add_option("--min-bubble-length-difference",
+                       cfg.graph_cleaning.min_bubble_length_difference,
+                       "Maximum length ratio of a bubble's removed nodes to "
+                       "its kept path; more divergent bubbles are kept.")
+            ->capture_default_str()
+            ->group(cleaning_group);
+        app.add_option("--max-bubble-length",
+                       cfg.graph_cleaning.max_bubble_length,
+                       "Maximum inner length of a bubble to pop, counted in "
+                       "the lcmer windows of its inner nodes; 0 disables "
+                       "bubble popping.")
+            ->check(CLI::Range(0, 1000000))
+            ->capture_default_str()
+            ->group(cleaning_group);
 
-int tests(int argc, char **argv) {
-    doctest::Context context;
-    context.setOption("abort-after", 5);
-    context.setOption("order-by", "name");
-    context.applyCommandLine(argc, argv);
+        const std::string layout_group = advanced("Layout");
+        app.add_flag(
+               "--drop-crumbs,!--keep-crumbs", cfg.drop_crumbs,
+               with_default(
+                   "Drop crumb nodes (fewer than window+1 lcmer windows, "
+                   "so invisible to overlap detection) that have a single "
+                   "predecessor and continue into a longer node, instead "
+                   "of emitting them as C segments. Halves the contig "
+                   "count at a small genome-fraction cost.",
+                   cfg.drop_crumbs))
+            ->group(layout_group);
+        app.add_flag(
+               "--strict-layout-labels,!--no-strict-layout-labels",
+               cfg.strict_layout_labels,
+               with_default("Accept a core-label match as a seed only if both "
+                            "cores have the same homopolymer-compressed "
+                            "sequence, so cores that merely share a label are "
+                            "not chained",
+                            cfg.strict_layout_labels))
+            ->group(layout_group);
+        app.add_flag("--end-joins,!--no-end-joins", cfg.end_joins,
+                     with_default(
+                         "Join segment ends that overlap as reverse "
+                         "complements (the two strands of one locus stopping "
+                         "at different holes) into one segment",
+                         cfg.end_joins))
+            ->group(layout_group);
 
-    // overrides
-    context.setOption("no-breaks", true);
-
-    int res = context.run();
-
-    if (context.shouldExit()) return res;
-    return res;
-}
+        const std::string other_group = advanced("Other");
+        app.add_flag("--print-raw-dbg", cfg.print_precleanup_graph,
+                     "Print DBG before cleanup (with .raw.gfa suffix)")
+            ->group(other_group);
+        app.add_flag("--print-bi-dbg", cfg.print_prelayout_graph,
+                     "Print DBG before layout (with .bi.gfa suffix)")
+            ->group(other_group);
+        auto *retro_opt =
+            app.add_flag(
+                   "--retro-admission,!--no-retro-admission",
+                   cfg.retro_admission,
+                   with_default(
+                       "Give an lcmer window whose first sightings were on "
+                       "reads' own strand its node, count and links from "
+                       "the first read of the other strand that sees it, "
+                       "so first sightings are not lost (needs "
+                       "--prime-reverse)",
+                       cfg.retro_admission))
+                ->group(other_group);
+        app.add_flag("--link-reverse", cfg.link_reverse,
+                     with_default(
+                         "Let each read's reverse complement add the missing "
+                         "links between lcmer windows that are already in the "
+                         "graph, so the two strands' graphs fill each other's "
+                         "gaps",
+                         cfg.link_reverse))
+            ->group(other_group);
+        app.callback([this, level_opt, multipass_opt, retro_opt, io_opt]() {
+            if (io_opt->count() == 0) {
+                cfg.threads.io = default_io_threads(cfg.threads.work);
+            }
+            if (olc_lcmer_l_ignored != 0) {
+                std::fprintf(stderr,
+                             "[config] --olc-lcmer-l is ignored; overlap "
+                             "detection uses --window (%d)\n",
+                             cfg.lcmer_l);
+            }
+            if (cfg.link_reverse && !cfg.prime_reverse) {
+                std::fprintf(stderr,
+                             "[config] --link-reverse needs --prime-reverse; "
+                             "no links are added\n");
+            }
+            // On by default, so it is turned off quietly unless asked for.
+            if (cfg.retro_admission && !cfg.prime_reverse) {
+                if (retro_opt->count() > 0) {
+                    std::fprintf(stderr,
+                                 "[config] --retro-admission needs "
+                                 "--prime-reverse; it has no effect\n");
+                }
+                cfg.retro_admission = false;
+            }
+            if (multipass_opt->count() > 0) {
+                auto passes = parse_multipass(multipass_text);
+                if (!passes) {
+                    throw CLI::ValidationError(passes.error());
+                }
+                cfg.multipass = std::move(*passes);
+            } else if (level_opt->count() == 0) {
+                throw CLI::RequiredError(level_opt->get_name());
+            }
+            const bool low_level = [&] {
+                if (cfg.multipass.empty()) return cfg.lcp_level < 3;
+                return std::any_of(
+                    cfg.multipass.begin(), cfg.multipass.end(),
+                    [](const pass_params &p) { return p.lcp_level < 3; });
+            }();
+            if (low_level) {
+                std::fprintf(stderr,
+                             "Warning: LCP levels lower than 3 are not "
+                             "intended for actual use and may use "
+                             "significantly more memory and build "
+                             "suboptimal assemblies.\n");
+            }
+            cfg.reading = file_reading_mode::sequential;
+            if (file_reading_mode_text == "parallel") {
+                cfg.reading = file_reading_mode::parallel;
+            } else if (file_reading_mode_text == "chunks") {
+                cfg.reading = file_reading_mode::chunks;
+            }
+            // CLI11 callbacks return void; surface a nonzero rc as a
+            // CLI::RuntimeError so the failure reaches the process exit status.
+            if (int rc = run_assembly(cfg); rc != 0) {
+                throw CLI::RuntimeError("assembly failed", rc);
+            }
+        });
+    }
+    AsmProgram(const AsmProgram &) = delete;
+    AsmProgram &operator=(const AsmProgram &) = delete;
+};
 
 int main(int argc, char **argv) {
-    if (argc > 1 && string{argv[1]} == "tests") {
-        return tests(argc - 1, argv + 1);
-    }
     CLI::App app("lasm");
     app.require_subcommand(1);
-    // app.set_help_all_flag("--help-all", "Expand all help");
+    app.formatter(std::make_shared<HelpFormatter>());
 
-    asm_program(app);
-    map_prog(app);
-#ifdef BUILD_HISTOGRAM_UTILS
-    stats_program(app);
-    stdin_hist_prog(app);
-#endif
-    sam_read_testing(app);
-    dump_cores_program(app);
+    bool show_advanced = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--help-all") show_advanced = true;
+    }
+    AsmProgram hifi{app, show_advanced};
+    DumpCoresProgram dumpcores{app};
+
     CLI11_PARSE(app, argc, argv);
     return 0;
 }

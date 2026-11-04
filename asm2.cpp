@@ -1,15 +1,12 @@
 #include <blockingconcurrentqueue.h>
-#include <fcntl.h>
-#include <htslib/bgzf.h>
-#include <htslib/hfile.h>
-#include <htslib/hts.h>
-#include <htslib/sam.h>
-#include <htslib/thread_pool.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
-#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +16,7 @@
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -26,33 +24,81 @@
 
 #include "asm.h"
 #include "config.h"
-#include "ext/doctest.h"
 #include "graph.h"
+#include "io/bam_reader.h"
+#include "io/chunked_input.h"
+#include "io/fastx.h"
 #include "layout_graph.h"
 #include "lcmer.h"
-#include "lcptools/lcptools_ho.h"
 #include "syncmer.h"
 
 using std::string;
-enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
+// OLC end-skip policy: cores skipped at each end of a DBG node before
+// overlap-anchoring (see find_lcmer_ranges). Function-like macros of the OLC
+// lcmer length `l`. A node needs (l + OLC_SKIP_FIRST(l) + OLC_SKIP_LAST(l))
+// cores to anchor any overlap.
+#ifndef OLC_SKIP_FIRST
+#define OLC_SKIP_FIRST(l) (1)
+#endif
+#ifndef OLC_SKIP_LAST
+#define OLC_SKIP_LAST(l) ((l) / 2)
+#endif
+
+// Records `st`, the status of `input`, in `seen`, which holds the status of
+// each earlier entry of `inputs` in order. An input given twice is refused
+// whatever it is: given as `-` and as /dev/stdin, both descriptors share one
+// file position.
+static bool record_unique_input(const std::string &input, const auto &inputs,
+                                std::vector<struct stat> &seen,
+                                const struct stat &st) {
+    for (size_t i = 0; i < seen.size(); ++i) {
+        if (same_file(seen[i], st)) {
+            fprintf(stderr, "Error: input %s is given twice (also as %s)\n",
+                    input.c_str(), inputs[i].c_str());
+            return false;
+        }
+    }
+    seen.push_back(st);
+    return true;
+}
+
+// With --retro-admission and --prime-reverse the Bloom filter holds a
+// window's own-strand and reverse-complement sightings under two entries.
+// A window of the genome is seen on both strands and so takes two, but most
+// distinct windows of high-accuracy long reads are read errors seen once,
+// so the entries grow by about this factor over the distinct windows
+// (measured on HiFi data; other error rates give other factors). The filter
+// is sized for that many entries per --projected-element-count window.
+constexpr double kStrandTagScale = 1.15;
 
 struct assembler {
     using SYNCMER_HASHER = syncmer::MurMur;
-    using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
+    using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
 
-    using dqt = moodycamel::BlockingConcurrentQueue<bam1_t *>;
+    template <class Rec>
+    using queue_of = moodycamel::BlockingConcurrentQueue<Rec *>;
+    // Records from the readers to the workers; a full queue blocks readers.
+    template <class Rec>
+    using data_queue_of = bounded_queue<Rec *>;
+    using record_queue = queue_of<seq_record>;
     gtl::vector<string> inputs;
     string output;
     decltype(asm_config::threads) threads;
     int lcp_level;
-    double density;
     decltype(asm_config::bloom) bloom;
-    uint64_t seed;
+    uint32_t seed;
     decltype(asm_config::syncmer) syncmer_params;
     SyncmerType syncmer_functor;
-    int dbg_lcmer_l;
-    int olc_lcmer_l;
-    bool parallel_file_reading;
+    int lcmer_l;
+    file_reading_mode reading;
+    // The chunks-mode fallback notes were printed (by the first pass).
+    bool chunk_notes_printed = false;
+    bool drop_crumbs;
+    bool prime_reverse;
+    bool retro_admission;
+    bool link_reverse;
+    bool strict_layout_labels;
+    bool end_joins;
 
     assembler(const asm_config &cfg)
         : inputs{},
@@ -62,18 +108,44 @@ struct assembler {
           bloom{cfg.bloom},
           seed{cfg.seed},
           syncmer_params{cfg.syncmer},
-          syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)},
-          dbg_lcmer_l{cfg.dbg_lcmer_l},
-          olc_lcmer_l{cfg.dbg_lcmer_l},
-          parallel_file_reading{cfg.parallel_file_reading} {
+          syncmer_functor{syncmer_params, seed},
+          lcmer_l{cfg.lcmer_l},
+          reading{cfg.reading},
+          drop_crumbs{cfg.drop_crumbs},
+          prime_reverse{cfg.prime_reverse},
+          retro_admission{cfg.retro_admission},
+          link_reverse{cfg.link_reverse},
+          strict_layout_labels{cfg.strict_layout_labels},
+          end_joins{cfg.end_joins} {
         inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
     }
 
-    template <class BFT>
+    // Seeded (--multipass segment windows): the window adds no count and marks
+    // its node seeded; edges are made as for reads. A new node gets its first
+    // fragment, fragment(key), while the insert holds the submap lock.
+    template <class BFT, bool Seeded = false, class Fragment>
     static inline auto insert_lcmer_helper(const gtl::vector<uint64_t> &ll,
                                            const uint32_t &i,
-                                           dbg_index_base<BFT> &dbgi) -> bool {
+                                           dbg_index_base<BFT> &dbgi,
+                                           Fragment &&fragment) -> bool {
         using index_type = dbg_index_base<BFT>;
+        using val_type = typename index_type::bidbg_val;
+        constexpr unsigned kCount = [] {
+            if constexpr (Seeded) {
+                return 0U;
+            } else {
+                return 1U;
+            }
+        }();
+        const auto make = [&](auto... args) {
+            val_type v{args...};
+            if constexpr (Seeded) v.seeded = true;
+            v.seq.push_back(fragment(ll[i]));
+            return v;
+        };
+        const auto mark = [](val_type &v) {
+            if constexpr (Seeded) v.seeded = true;
+        };
         if (ll[i] == 0) {
             return false;
         }
@@ -84,10 +156,11 @@ struct assembler {
                 return dbgi.dbg.lazy_emplace_l(
                     ll[i],
                     [&](index_type::dbg_map_t::value_type &val) {
-                        val.second.counts.core_count++;
+                        val.second.counts.core_count += kCount;
+                        mark(val.second);
                     },
                     [&](const index_type::dbg_map_t::constructor &ctr) {
-                        ctr(ll[i], typename index_type::bidbg_val{1});
+                        ctr(ll[i], make(kCount));
                     });
             }
         } else {
@@ -95,51 +168,32 @@ struct assembler {
                 return dbgi.dbg.lazy_emplace_l(
                     ll[i],
                     [&](index_type::dbg_map_t::value_type &val) {
-                        val.second.emplace_prev(
-                            ll[i - 1]);  // TODO verify this CC logic holds
-                        // val.second.cc++;
+                        val.second.emplace_prev(ll[i - 1]);
+                        mark(val.second);
                     },
                     [&](const index_type::dbg_map_t::constructor &ctr) {
-                        ctr(ll[i],
-                            typename index_type::bidbg_val{0U, ll[i - 1]});
+                        ctr(ll[i], make(0U, ll[i - 1]));
                     });
             } else {
                 return dbgi.dbg.lazy_emplace_l(
                     ll[i],
                     [&](index_type::dbg_map_t::value_type &val) {
                         val.second.emplace_prev(ll[i - 1]);
-                        val.second.counts.core_count++;
+                        val.second.counts.core_count += kCount;
+                        mark(val.second);
                     },
                     [&](const index_type::dbg_map_t::constructor &ctr) {
-                        ctr(ll[i],
-                            typename index_type::bidbg_val{1U, ll[i - 1]});
+                        ctr(ll[i], make(kCount, ll[i - 1]));
                     });
             }
         }
     }
-    static gtl::vector<uint64_t> find_lcmers(const lcp_read &lr,
-                                             const dbg_index &dbgi,
-                                             int lcmer_l) {
-        LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
-
-        gtl::vector<uint64_t> ll(1, 0);
-        ll.reserve(lr.cores.size() - lcmer_l + 3);
-        dbg_index::lci_type lval = dbgi.get(l);
-        ll.push_back(lval.id);
-        for (size_t i = static_cast<size_t>(lcmer_l + 1);
-             i < lr.cores.size() - 1; ++i) {
-            uint32_t in_core = lr.cores[i];
-            l.update_lcmer(in_core, lr.cores[i - lcmer_l], lcmer_l);
-            lval = dbgi.get(l);
-            ll.push_back(lval.id);
-        }
-        ll.push_back(0);
-        return ll;
-    }
-    static auto find_lcmer_ranges(const lcp_read &lr, const dbg_index &dbgi,
+    static auto find_lcmer_ranges(const lcp_read &lr, const unitig_graph &graph,
                                   int lcmer_l) {
-        long skip_first = lcmer_l;
-        long skip_last = 2 * lcmer_l;
+        // Cores skipped at each node end before overlap-anchoring (OLC_SKIP_*
+        // macros).
+        const long skip_first = OLC_SKIP_FIRST(lcmer_l);
+        const long skip_last = OLC_SKIP_LAST(lcmer_l);
         // Need enough cores to form at least one valid lcmer after skipping
         if (lr.cores.size() <
             static_cast<size_t>(lcmer_l + skip_first + skip_last)) {
@@ -149,15 +203,14 @@ struct assembler {
         LCmer l{lr.cores.begin() + skip_first, lcmer_l};  // Skip first core;
         gtl::vector<std::tuple<u64, u64, u64, LCmer, LCmer>> llr;
 
-        dbg_index::lci_type lval = dbgi.get(l);
+        unitig_graph::lci_type lval = graph.get(l);
         llr.emplace_back(lval.id, skip_first, skip_first, l, l);
-        // Fix: ensure we don't go out of bounds when accessing i +
-        // runtime_lcmer_l
+        // Loop bound keeps i + lcmer_l in range.
         for (long long i = skip_first + 1;
              i < ((long long)lr.cores.size() - lcmer_l - skip_last); ++i) {
             uint32_t in_core = lr.cores[i + lcmer_l - 1];
             l.update_lcmer(in_core, lr.cores[i - 1], lcmer_l);
-            lval = dbgi.get(l);
+            lval = graph.get(l);
             if (lval.id == std::get<0>(llr.back())) {  // Extend the previous
                 std::get<2>(llr.back()) = i;
                 std::get<4>(llr.back()) = l;
@@ -166,6 +219,34 @@ struct assembler {
             }
         }
         return llr;
+    }
+
+    // The fragment of window j of lr (cores j..j+L-1), the bases its last
+    // core adds: [end(j+L-2), end(j+L-1)).
+    static SequenceContainerType window_fragment(const lcp_read &lr, size_t j,
+                                                 int lcmer_l, u64 key,
+                                                 word_arena &arena) {
+        return SequenceContainerType(lr.data, lr.pos[j + lcmer_l - 2].second,
+                                     lr.pos[j + lcmer_l - 1].second, key,
+                                     arena);
+    }
+    // window_fragment for a reverse-complement parse lr of the len-base read
+    // `nibbles`, whose positions are on the reverse complement: the bases
+    // are read from the forward nibbles, complemented.
+    static SequenceContainerType reverse_window_fragment(
+        const uint8_t *nibbles, size_t len, const lcp_read &lr, size_t j,
+        int lcmer_l, u64 key, word_arena &arena) {
+        const size_t a = lr.pos[j + lcmer_l - 2].second;
+        const size_t b = lr.pos[j + lcmer_l - 1].second;
+        SequenceContainerType out{b - a, 0, arena};
+        out.origin_node = key;
+        for (size_t k = a; k < b; ++k) {
+            const uint8_t nib = bam_seqi(nibbles, len - 1 - k);
+            const uint64_t code = seq_nt16_int[nibble_complement(nib)] & 3;
+            const size_t bit = (k - a) * 2;
+            out.data[bit >> 6] |= code << (bit & 63);
+        }
+        return out;
     }
     template <class BFT>
     static void process_cores(const lcp_read &lr, dbg_index_base<BFT> &dbgi,
@@ -185,523 +266,742 @@ struct assembler {
         }
         ll.push_back(0);
 
+        // Node ll[i] is the window of cores i..i+L-1. It stores the bases its
+        // own last core adds, [end(i+L-2), end(i+L-1)): they lie inside the
+        // key window, so a successor's fragment starts where this one ends on
+        // every path, and spelling a path concatenates fragments exactly.
         for (size_t i = 1; i < ll.size() - 1; ++i) {
-            if (insert_lcmer_helper(ll, i, dbgi)) {
-                // Lets try atomic
-                dbgi.dbg.modify_if(
-                    ll[i],
-                    [&lr, i,
-                     lcmer_l](dbg_index_base<BFT>::dbg_map_t::value_type &val) {
-                        val.second.seq.emplace_back(
-                            lr.data, lr.pos[i + lcmer_l - 1].second,
-                            lr.pos[i + lcmer_l].second, val.first);
-                    });
-            }
+            insert_lcmer_helper(ll, i, dbgi, [&](u64 key) {
+                return window_fragment(lr, i, lcmer_l, key,
+                                       dbgi.fragment_arena(thread_id));
+            });
         }
     }
-    static void process_cores_for_basespace(
-        const lcp_read &lr, dbg_index &dbgi, [[maybe_unused]] int thread_id,
-        [[maybe_unused]] uint64_t &lcmer_index, int lcmer_l) {
-        // Keep the DBG node sequences in BASE space (actual substrings), but do
-        // NOT convert overlap/layout coordinates to base space during
-        // layouting/merging.
-        //
-        // Layouting will be done in core-index space. Only at the final
-        // emission step will we scale core-space layout positions into base
-        // offsets.
+
+    // --retro-admission: a node for `key` if it has none, with count 0, the
+    // fragment `fragment(key)` and marked as owing links. Made at the
+    // reverse-complement sighting that admits a window whose earlier
+    // sightings were all on reads' own strand.
+    template <class BFT, class Fragment>
+    static void ensure_node(dbg_index_base<BFT> &dbgi, u64 key,
+                            Fragment &&fragment) {
+        using index_type = dbg_index_base<BFT>;
+        dbgi.dbg.lazy_emplace_l(
+            key, [](index_type::dbg_map_t::value_type &) {},
+            [&](const index_type::dbg_map_t::constructor &ctr) {
+                typename index_type::bidbg_val v{0U};
+                v.owes_links = true;
+                v.seq.push_back(fragment(key));
+                ctr(key, std::move(v));
+            });
+    }
+
+    // --retro-admission: the previous window of a reverse-complement parse.
+    // `node` is its key if it has a node, else 0; `owes` whether that node
+    // owes links; `fresh` whether its sighting in this parse was the one
+    // that admitted it after own-strand sightings only.
+    struct retro_cursor {
+        u64 node = 0;
+        bool owes = false;
+        bool fresh = false;
+    };
+    // --retro-admission, step 3 of prime_reverse_complement for window `key`
+    // after `prev`; returns the cursor for the next window. When either
+    // window is fresh, this parse stands in for the lost own-strand
+    // sighting: the edge is added and the upstream window gets its count,
+    // even if another read made the edge. Otherwise, when either window owes
+    // links and the edge is missing, the link is offered to
+    // resolve_owed_links.
+    template <class BFT>
+    static retro_cursor retro_sight(
+        dbg_index_base<BFT> &dbgi, u64 key,
+        const typename dbg_index_base<BFT>::reverse_sighting &seen,
+        const retro_cursor &prev) {
+        retro_cursor here;
+        if (!seen.admitted) return here;
+        here.fresh = seen.needs_node;
+        bool linked = false;
+        bool offer = false;
+        dbgi.dbg.modify_if(key, [&](auto &val) {
+            // A node that existed before its first reverse-complement
+            // sighting owes links too.
+            if (seen.needs_node) val.second.owes_links = true;
+            here.node = key;
+            here.owes = val.second.owes_links;
+            if (prev.node == 0 || !(here.owes || prev.owes)) return;
+            if (here.fresh || prev.fresh) {
+                val.second.emplace_prev(prev.node);
+                linked = true;
+                return;
+            }
+            const auto &preds = val.second.prev;
+            offer =
+                std::find(preds.begin(), preds.end(), prev.node) == preds.end();
+        });
+        if (linked) {
+            dbgi.dbg.modify_if(prev.node, [](auto &val) {
+                val.second.counts.core_count += 1;
+            });
+        }
+        if (offer) dbgi.owed.offer(prev.node, key);
+        return here;
+    }
+
+    // --prime-reverse: parses the read's reverse complement and inserts those
+    // lcmer keys into the Bloom filter only (no node, count or edge), so the
+    // first sighting of the sequence on the other strand is admitted. The
+    // windows are the ones process_cores would take. chs/pos_buf hold the
+    // read's run-length stream of rle_len runs, as parse_cores_from_nibbles
+    // left it; it is turned into the reverse complement's in place. `lr` is
+    // caller scratch; `thread_id` picks the fragment arena of nodes made under
+    // --retro-admission. Each window takes one Bloom sighting, and the steps
+    // below act on it in this order:
+    // 1. --retro-admission: a window this sighting admits after sightings on
+    //    reads' own strand only, which added nothing (sight_reverse's
+    //    needs_node), gets its node here, from this parse's bases, and is
+    //    marked as owing links.
+    // 2. --link-reverse: when this window and the previous one are both
+    //    admitted and both have nodes, the edge between them is added if
+    //    missing. No node or count changes, so the other strand's depth is
+    //    not counted twice.
+    // 3. --retro-admission (retro_sight): when this window and the previous
+    //    one both have nodes and either got its node at its sighting in this
+    //    parse, this parse stands in for the lost own-strand sighting: the
+    //    edge between them is added if missing and the upstream window gets
+    //    the count the own strand's read would have given it
+    //    (insert_lcmer_helper). A later read that links a node owing links
+    //    to a neighbour it lacks offers that link to resolve_owed_links,
+    //    which adds it after reading only where it joins a dead end to a
+    //    source.
+    template <class BFT>
+    static void prime_reverse_complement(
+        const uint8_t *nibbles, size_t len, int64_t rle_len, int lcp_level,
+        core_buf *str, const SyncmerType &syncmer_functor, charsi &chs,
+        pos_scratch &pos_buf, lcp_read &lr, dbg_index_base<BFT> &dbgi,
+        int lcmer_l, int thread_id, bool link_reverse) {
+        const int64_t rc_len =
+            rle_reverse_complement(nibbles, static_cast<int64_t>(len), chs.data,
+                                   pos_buf.data, rle_len);
+        lr.clear();
+        parse_cores_from_rle(chs.data, pos_buf.data, rc_len, len, lcp_level,
+                             str, syncmer_functor, lr);
+        if (lr.cores.size() < static_cast<size_t>(lcmer_l + 2)) {
+            return;
+        }
         LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
-
-        uint64_t val = dbgi.get(l).id;
-
+        // The previous window's key if it was admitted, else 0.
+        u64 prev_admitted = 0;
+        retro_cursor retro_prev;
+        // Window j (cores j..j+L-1).
+        const auto sight = [&](size_t j) {
+            const u64 key = dbg_index_base<BFT>::lcmer_id(l);
+            const auto seen = dbgi.sight_reverse(key);
+            if (seen.needs_node) {
+                ensure_node(dbgi, key, [&](u64 k) {
+                    return reverse_window_fragment(
+                        nibbles, len, lr, j, lcmer_l, k,
+                        dbgi.fragment_arena(thread_id));
+                });
+            }
+            if (link_reverse) {
+                if (seen.admitted && prev_admitted != 0 &&
+                    dbgi.dbg.contains(prev_admitted)) {
+                    dbgi.dbg.modify_if(key, [&](auto &val) {
+                        val.second.emplace_prev(prev_admitted);
+                    });
+                }
+                prev_admitted = 0;
+                if (seen.admitted) prev_admitted = key;
+            }
+            if (dbgi.retro_admission) {
+                retro_prev = retro_sight(dbgi, key, seen, retro_prev);
+            }
+        };
+        sight(1);
         for (size_t i = static_cast<size_t>(lcmer_l + 1);
              i < lr.cores.size() - 1; ++i) {
-            uint64_t from = lr.pos[i - 1].second;
-            uint64_t to = lr.pos[i].second;
+            l.update_lcmer(lr.cores[i], lr.cores[i - lcmer_l], lcmer_l);
+            sight(i - static_cast<size_t>(lcmer_l) + 1);
+        }
+    }
 
-            dbgi.dbg.modify_if(val, [&](dbg_index::dbg_map_t::value_type &val) {
-                if (val.second.seq.size() == 0) {
-                    if (to - from > 0) {
-                        val.second.seq.emplace_back(lr.data, from, to,
-                                                    val.first);
-                        // assert((to & 3) + 4 < lr.data_length);
+    // ── --multipass: seeding a pass with the previous pass's segments ─────
+    // Base j of seq[from, to), or of its reverse complement.
+    static uint8_t range_base(const SequenceContainerType &seq, size_t from,
+                              size_t to, bool rc, size_t j) {
+        if (rc) return static_cast<uint8_t>(3 ^ seq.code(to - 1 - j));
+        return seq.code(from + j);
+    }
+
+    // Cores of seq[from, to) (or of its reverse complement) at lcp_level,
+    // positions in the range's own coordinates. The run-length stream is
+    // read straight from the 2-bit words, so the range is never copied.
+    static void parse_range(const SequenceContainerType &seq, size_t from,
+                            size_t to, bool rc, int lcp_level, core_buf *str,
+                            const SyncmerType &syncmer_functor, lcp_read &lr) {
+        lr.clear();
+        const size_t len = to - from;
+        const auto [rle_data, rle_pos] = str->rle_scratch(len);
+        int64_t rle_len = 0;
+        uint8_t prev = 255;
+        for (size_t j = 0; j < len; ++j) {
+            const uint8_t b = range_base(seq, from, to, rc, j);
+            if (b != prev) {
+                rle_data[rle_len] = b;
+                rle_pos[rle_len] = static_cast<uint32_t>(j);
+                ++rle_len;
+                prev = b;
+            }
+        }
+        parse1_rle_syncmers(rle_data, rle_pos, rle_len,
+                            static_cast<int64_t>(len), str, syncmer_functor);
+        str->deepen(lcp_level);
+        lr.reserve(str->size);
+        str->append_to(lr);
+    }
+
+    // Bases [a, b) of the range seq[from, to) in the orientation it was
+    // parsed in, as a node fragment with its words from `arena`.
+    static SequenceContainerType range_fragment(
+        const SequenceContainerType &seq, size_t from, size_t to, bool rc,
+        size_t a, size_t b, u64 origin_node, word_arena &arena) {
+        SequenceContainerType out{b - a, 0, arena};
+        out.origin_node = origin_node;
+        for (size_t j = a; j < b; ++j) {
+            const size_t bit = (j - a) * 2;
+            out.data[bit >> 6] |=
+                static_cast<uint64_t>(range_base(seq, from, to, rc, j))
+                << (bit & 63);
+        }
+        return out;
+    }
+
+    // The windows process_cores takes from a read, seeded: keyed without the
+    // Bloom filter, no count, node marked seeded. A new node's fragment comes
+    // from the parsed range. Returns the number of windows. `ll` is scratch.
+    template <class BFT>
+    static size_t process_seeded_cores(const lcp_read &lr,
+                                       const SequenceContainerType &seq,
+                                       size_t from, size_t to, bool rc,
+                                       dbg_index_base<BFT> &dbgi, int lcmer_l,
+                                       gtl::vector<uint64_t> &ll, int tid) {
+        if (lr.cores.size() < static_cast<size_t>(lcmer_l + 2)) return 0;
+        uint64_t unused_index = 0;
+        LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
+        ll.assign(1, 0);
+        ll.push_back(dbgi.emplace_nobloomfilter(l, unused_index, 0));
+        for (size_t i = static_cast<size_t>(lcmer_l + 1);
+             i < lr.cores.size() - 1; ++i) {
+            l.update_lcmer(lr.cores[i], lr.cores[i - lcmer_l], lcmer_l);
+            ll.push_back(dbgi.emplace_nobloomfilter(l, unused_index, 0));
+        }
+        ll.push_back(0);
+        for (size_t i = 1; i < ll.size() - 1; ++i) {
+            insert_lcmer_helper<BFT, true>(ll, i, dbgi, [&](u64 key) {
+                return range_fragment(seq, from, to, rc,
+                                      lr.pos[i + lcmer_l - 2].second,
+                                      lr.pos[i + lcmer_l - 1].second, key,
+                                      dbgi.fragment_arena(tid));
+            });
+        }
+        return ll.size() - 2;
+    }
+
+    // Segments are seeded in chunks, so parse buffers stay chunk-sized; the
+    // overlap is far above one window plus the cores a parse loses at each
+    // end, so every window of a segment lies inside some chunk.
+    static constexpr size_t kSeedChunkBases = size_t{1} << 20;
+    static constexpr size_t kSeedChunkOverlap = size_t{1} << 16;
+
+    // Seeds dbgi with every window of every segment, in both orientations
+    // (the LCP parse is not strand-symmetric). Run after all reads, so read
+    // nodes keep their read fragments. Returns {chunks, windows}.
+    std::pair<size_t, size_t> insert_segments(
+        dbg_index &dbgi, const gtl::vector<SequenceContainerType> &segments,
+        size_t chunk_bases = kSeedChunkBases,
+        size_t chunk_overlap = kSeedChunkOverlap) const {
+        struct chunk {
+            size_t seg, from, to;
+        };
+        gtl::vector<chunk> chunks;
+        for (size_t s = 0; s < segments.size(); ++s) {
+            const size_t len = segments[s].len;
+            for (size_t from = 0; from < len;
+                 from += chunk_bases - chunk_overlap) {
+                const size_t to = std::min(len, from + chunk_bases);
+                chunks.push_back({s, from, to});
+                if (to == len) break;
+            }
+        }
+        std::atomic<size_t> next{0};
+        std::atomic<size_t> windows{0};
+        gtl::vector<std::thread> workers;
+        for (int t = 0; t < threads.work; ++t) {
+            workers.emplace_back([&, t]() {
+                core_buf str;
+                lcp_read lr;
+                gtl::vector<uint64_t> ll;
+                size_t n = 0;
+                for (size_t c = next++; c < chunks.size(); c = next++) {
+                    const auto &[s, from, to] = chunks[c];
+                    for (bool rc : {false, true}) {
+                        parse_range(segments[s], from, to, rc, lcp_level, &str,
+                                    syncmer_functor, lr);
+                        n += process_seeded_cores(lr, segments[s], from, to, rc,
+                                                  dbgi, lcmer_l, ll, t);
                     }
                 }
+                windows += n;
             });
-            uint32_t in_core = lr.cores[i];
-            l.update_lcmer(in_core, lr.cores[i - lcmer_l], lcmer_l);
-            val = dbgi.get(l).id;
         }
+        for (auto &w : workers) w.join();
+        return {chunks.size(), windows.load()};
     }
 
-    static std::pair<int, int> get_thread_dist(int threads) {
-        if (threads == 0) {
-            return {0, 0};
-        }
-        if (threads < 16) {
-            int sam_threads = threads / 2;
-            return {sam_threads, threads - sam_threads};
-        }
-        return {8, threads - 8};
-    }
+    // Record traits. The worker loop only needs the packed nt16 sequence and
+    // its base count; every reader fills the same recycled seq_record.
+    struct seq_record_ops {
+        using record = seq_record;
+        static record *create() { return seq_record_init(); }
+        static void destroy(record *r) { seq_record_destroy(r); }
+        static const uint8_t *seq(const record *r) { return r->nibbles; }
+        static size_t len(const record *r) { return r->len; }
+    };
 
-    // static auto process_data_from_chunks(int thread_id, int lcp_level,
-    //                                      string filename, cqt &chunk_queue,
-    //                                      dbg_index &dbgi,
-    //                                      std::atomic<bool> &done,
-    //                                      int &processed_read_count,
-    //                                      int &all_reads) {
-    //     uint64_t lcmer_index = 0;
-    // }
-    static auto process_data(int thread_id, int lcp_level, dqt &data_queue,
-                             dqt &recycle_queue, dbg_index &dbgi,
-                             std::atomic<bool> &done, int &processed_read_count,
-                             int &all_reads, auto Process_Func,
-                             SyncmerType syncmer_functor, int lcmer_l) {
-        uint64_t lcmer_index = 0;
-        bam1_t *data_p = NULL;
-        lps str = {0, 0, 0, 0};
-        charsi chs;
-        pos_scratch pos_buf;
-        lcp_read lr;
-        while (true) {
-            if (!data_queue.wait_dequeue_timed(data_p, WAIT_QUEUE_TIMEOUT)) {
-                // if (!data_queue.try_dequeue(data_p)) {
-                if (done.load()) {
-                    break;
-                }
-                // std::this_thread::sleep_for(std::chrono::nanoseconds(100));
-                continue;
-            }
-            all_reads++;
-            lr.clear();
-            parse_cores_from_bam_record(bam_get_seq(data_p),
-                                        data_p->core.l_qseq, lcp_level, &str,
-                                        syncmer_functor, chs, lr, pos_buf);
-            if (lr.cores.size() < static_cast<size_t>(lcmer_l + 2)) {
-                // printf("Skipping read %lld, cores.size()=%zu\n", here,
-                // lr.cores.size());
-                goto pd_cleanup;
-            }
-            ++processed_read_count;
-            Process_Func(lr, dbgi, thread_id, lcmer_index, lcmer_l);
-        pd_cleanup:
-            if (!recycle_queue.try_enqueue(data_p)) {
-                bam_destroy1(data_p);
-                data_p = NULL;
-            }
+    // Waits for the next item; false once the producers are done (`done`) and
+    // the queue is empty. An item enqueued just before `done` was set may
+    // still arrive after the wait timed out, hence the final try_dequeue.
+    static bool next_item(auto &queue, const std::atomic<bool> &done,
+                          auto &item) {
+        while (!queue.wait_dequeue_timed(item, WAIT_QUEUE_TIMEOUT)) {
+            if (done.load()) return queue.try_dequeue(item);
         }
-        free_lps(&str);
-    }
-
-    [[nodiscard]] auto generate_data(const std::string &input, dqt &data_queue,
-                                     dqt &recycle_queue, int threads) {
-        samFile *fp = sam_open(input.c_str(), "r");
-
-        if (!fp) {
-            std::cerr << "Error: Could not open " << input << std::endl;
-            return false;
-        }
-        hts_set_threads(fp, threads);
-        // htsThreadPool pool = {NULL, 0};
-        // if (threads > 1) {
-        //     pool.pool = hts_tpool_init(threads);
-        //     // hts_set_thread_pool(fp, &pool);
-        //     hts_set_cache_size(fp, 1024 * 1024 * 1024);
-        //     hts_set_opt(fp, HTS_OPT_THREAD_POOL, &pool);
-        // }
-
-        bam_hdr_t *hdr = sam_hdr_read(fp);
-        bam1_t *rec = nullptr;
-        while (true) {
-            // Try to get a recycled record object
-            if (rec == nullptr && !recycle_queue.try_dequeue(rec)) {
-                // If the recycle queue is empty, allocate a new one as a
-                // fallback
-                rec = bam_init1();
-            }
-
-            if (sam_read1(fp, hdr, rec) >= 0) {
-                while (!data_queue.try_enqueue(rec)) {
-                    std::this_thread::sleep_for(std::chrono::nanoseconds(10));
-                }
-                rec = nullptr;
-            } else {
-                // End of file or error. Destroy the unused record and exit.
-                bam_destroy1(rec);
-                break;
-            }
-        }
-        bam_hdr_destroy(hdr);
-        sam_close(fp);
-        // if (pool.pool) {
-        //     hts_tpool_destroy(pool.pool);
-        // }
         return true;
     }
 
-    auto construct_dbg() {
-        dqt data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
-        dqt recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
+    template <class Ops>
+    static auto process_data(int thread_id, int lcp_level,
+                             data_queue_of<typename Ops::record> &data_queue,
+                             queue_of<typename Ops::record> &recycle_queue,
+                             dbg_index &dbgi, std::atomic<bool> &done,
+                             int &processed_read_count, int &all_reads,
+                             auto Process_Func, SyncmerType syncmer_functor,
+                             int lcmer_l, bool prime_reverse,
+                             bool link_reverse) {
+        uint64_t lcmer_index = 0;
+        typename Ops::record *data_p = NULL;
+        core_buf str;
+        charsi chs;
+        pos_scratch pos_buf;
+        lcp_read lr;
+        // Counted locally and stored once: the counts of all workers share
+        // cache lines.
+        int valid = 0;
+        int all = 0;
+        while (next_item(data_queue, done, data_p)) {
+            all++;
+            lr.clear();
+            const int64_t rle_len = parse_cores_from_nibbles(
+                Ops::seq(data_p), Ops::len(data_p), lcp_level, &str,
+                syncmer_functor, chs, lr, pos_buf);
+            // Skip reads with too few cores; the record is recycled regardless.
+            if (lr.cores.size() >= static_cast<size_t>(lcmer_l + 2)) {
+                ++valid;
+                Process_Func(lr, dbgi, thread_id, lcmer_index, lcmer_l);
+                if (prime_reverse) {
+                    prime_reverse_complement(
+                        Ops::seq(data_p), Ops::len(data_p), rle_len, lcp_level,
+                        &str, syncmer_functor, chs, pos_buf, lr, dbgi, lcmer_l,
+                        thread_id, link_reverse);
+                }
+            }
+            if (!recycle_queue.try_enqueue(data_p)) {
+                Ops::destroy(data_p);
+                data_p = NULL;
+            }
+        }
+        processed_read_count = valid;
+        all_reads = all;
+    }
+
+    // Producer loop shared by every reader: takes a recycled record (or
+    // allocates one), lets `fill` populate it from the source, and enqueues it
+    // for the workers. Returns when `fill` reports end of input; whether that
+    // end was clean is the caller's to determine from its source.
+    template <class Ops, class Fill>
+    static void enqueue_records(data_queue_of<typename Ops::record> &data_queue,
+                                queue_of<typename Ops::record> &recycle_queue,
+                                Fill &&fill) {
+        typename Ops::record *rec = nullptr;
+        while (true) {
+            if (rec == nullptr && !recycle_queue.try_dequeue(rec)) {
+                rec = Ops::create();
+            }
+            if (!fill(rec)) {
+                Ops::destroy(rec);
+                return;
+            }
+            data_queue.enqueue(rec);
+            rec = nullptr;
+        }
+    }
+
+    // What one producer reads: an input opened, and its format detected,
+    // before any input is read (`stream`), or chunk `chunk` of a cut input
+    // (`cut`).
+    struct open_input {
+        string path;
+        std::unique_ptr<input_stream> stream;
+        const chunked_input *cut = nullptr;
+        size_t chunk = 0;
+    };
+
+    [[nodiscard]] static bool read_bam(const string &path, input_stream &in,
+                                       data_queue_of<seq_record> &data_queue,
+                                       record_queue &recycle_queue) {
+        bam_reader reader(in);
+        if (!reader.read_header()) {
+            std::cerr << "Error: Could not read " << path << ": "
+                      << reader.error() << std::endl;
+            return false;
+        }
+        // A truncated file must fail the run, not silently assemble a subset.
+        enqueue_records<seq_record_ops>(
+            data_queue, recycle_queue,
+            [&](seq_record *rec) { return reader.next(*rec); });
+        if (reader.failed()) {
+            std::cerr << "Error: truncated or corrupt input " << path << " ("
+                      << reader.error() << ")" << std::endl;
+            return false;
+        }
+        return true;
+    }
+
+    // FASTA/FASTQ: bases are packed into the record's nibble buffer during
+    // the block scan.
+    [[nodiscard]] static bool read_fastx(const string &path, input_stream &in,
+                                         data_queue_of<seq_record> &data_queue,
+                                         record_queue &recycle_queue) {
+        fastx_reader reader(in);
+        enqueue_records<seq_record_ops>(
+            data_queue, recycle_queue,
+            [&](seq_record *rec) { return reader.next(*rec); });
+        if (!reader.stream_error().empty()) {
+            std::cerr << "Error: truncated or corrupt input " << path << " ("
+                      << reader.stream_error() << ")" << std::endl;
+            return false;
+        }
+        if (reader.failed()) {
+            std::cerr << "Error: malformed or unreadable FASTA/FASTQ input "
+                      << path << std::endl;
+            return false;
+        }
+        return true;
+    }
+
+    // One chunk of a cut input, with the record checks that make a false cut
+    // fail the run.
+    [[nodiscard]] static bool read_chunk(const open_input &input,
+                                         data_queue_of<seq_record> &data_queue,
+                                         record_queue &recycle_queue) {
+        chunk_reader reader(*input.cut, input.chunk);
+        enqueue_records<seq_record_ops>(
+            data_queue, recycle_queue,
+            [&](seq_record *rec) { return reader.next(*rec); });
+        if (const std::string error = reader.error(); !error.empty()) {
+            fprintf(stderr, "Error: input %s: %s\n", input.path.c_str(),
+                    error.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    template <class Ops>
+    static void drain_and_destroy(auto &q) {
+        typename Ops::record *rec = nullptr;
+        while (q.try_dequeue(rec)) {
+            Ops::destroy(rec);
+        }
+    }
+
+    // One worker pool over one group of same-format inputs (whole files or
+    // chunks), read by producer threads that each take the next input:
+    // sequential reading has one, parallel reading one per input, chunks
+    // reading -@ (at most one per input). Returns false if any reader failed
+    // (and then no further input is begun). Read counts are accumulated into
+    // the caller's sums.
+    template <class Ops, class Reader>
+    bool run_stage(gtl::vector<open_input> &stage_inputs, Reader reader,
+                   dbg_index &dbgi, auto Process_Func, u64 &valid_sum,
+                   u64 &all_sum) {
+        // Records in flight per worker before the readers block. Each holds a
+        // whole read, so the bound keeps the buffered reads small.
+        constexpr size_t kRecordsPerWorker = 64;
+        const size_t capacity =
+            kRecordsPerWorker * static_cast<size_t>(threads.work);
+        size_t producers = 1;
+        if (reading == file_reading_mode::parallel) {
+            producers = stage_inputs.size();
+        } else if (reading == file_reading_mode::chunks) {
+            producers = std::min(stage_inputs.size(),
+                                 static_cast<size_t>(std::max(threads.io, 1)));
+        }
+        data_queue_of<typename Ops::record> data_queue{capacity, producers};
+        queue_of<typename Ops::record> recycle_queue{capacity, 1, 1};
         std::atomic<bool> done{false};
 
-        dbg_index *dbg_pt = new dbg_index{bloom.false_positive_rate,
-                                          bloom.projected_count, seed};
-        dbg_index &dbgi = *dbg_pt;
-
         gtl::vector<std::thread> workers;
-
         gtl::vector<int> valid_read_counts(threads.work, 0);
         gtl::vector<int> all_read_counts(threads.work, 0);
 
         for (int tid = 1; tid <= threads.work; ++tid) {
             workers.emplace_back([&, tid]() {
-                process_data(tid, lcp_level, data_queue, recycle_queue, dbgi,
-                             done, valid_read_counts[tid - 1],
-                             all_read_counts[tid - 1], process_cores<DefaultBF>,
-                             syncmer_functor, dbg_lcmer_l);
+                process_data<Ops>(tid, lcp_level, data_queue, recycle_queue,
+                                  dbgi, done, valid_read_counts[tid - 1],
+                                  all_read_counts[tid - 1], Process_Func,
+                                  syncmer_functor, lcmer_l, prime_reverse,
+                                  link_reverse);
             });
         }
 
         std::atomic<bool> read_failed{false};
-        if (parallel_file_reading) {
-            gtl::vector<std::thread> readers;
-            readers.reserve(inputs.size());
-            for (const auto &input : inputs) {
-                readers.emplace_back([&, input]() {
-                    if (!generate_data(input, std::ref(data_queue),
-                                       std::ref(recycle_queue), threads.io)) {
-                        fprintf(stderr, "Failed to read from input %s\n", input.c_str());
-                        read_failed.store(true);
-                    }
-                });
-            }
-            for (auto &reader : readers) {
-                reader.join();
-            }
-        } else {
-            for (const auto &input : inputs) {
-                if (!generate_data(input, std::ref(data_queue),
-                                   std::ref(recycle_queue), threads.io)) {
-                    fprintf(stderr, "Failed to read from input %s\n", input.c_str());
-                    break;
+        std::atomic<size_t> next_input{0};
+        // Reads inputs to their end and closes them, one after another.
+        auto produce = [&]() {
+            for (size_t i = next_input++;
+                 i < stage_inputs.size() && !read_failed.load();
+                 i = next_input++) {
+                open_input &input = stage_inputs[i];
+                bool ok = false;
+                if (input.cut) {
+                    ok = read_chunk(input, data_queue, recycle_queue);
+                } else {
+                    ok = reader(input.path, *input.stream, data_queue,
+                                recycle_queue);
+                }
+                input.stream.reset();
+                if (!ok) {
+                    fprintf(stderr, "Failed to read from input %s\n",
+                            input.path.c_str());
+                    read_failed.store(true);
                 }
             }
-        }
-        if (read_failed.load()) {
-            fprintf(stderr, "Error in reading data for DBG construction. Terminating.\n");
-            exit(-1);
-        }
+        };
+        gtl::vector<std::thread> readers;
+        for (size_t p = 0; p < producers; ++p) readers.emplace_back(produce);
+        for (auto &r : readers) r.join();
 
         done.store(true);
         for (auto &worker : workers) {
             worker.join();
         }
+        drain_and_destroy<Ops>(data_queue);
+        drain_and_destroy<Ops>(recycle_queue);
 
+        for (size_t i = 0; i < valid_read_counts.size(); ++i) {
+            valid_sum += static_cast<u64>(valid_read_counts[i]);
+            all_sum += static_cast<u64>(all_read_counts[i]);
+        }
+        return !read_failed.load();
+    }
+
+    // Runs `Process_Func` over every input, routing each file to the BAM
+    // reader or the FASTX reader according to its detected format. Every
+    // input is opened once, and its format detected, before any is read. In
+    // chunks mode every file that can be cut at record starts becomes chunks
+    // of its group; the others are read whole, each with a note why, and go
+    // first, so that a long single-threaded read does not run alone at the
+    // end of the stage.
+    bool run_over_inputs(dbg_index &dbgi, auto Process_Func, u64 &valid_sum,
+                         u64 &all_sum) {
+        // Chunks per producer, so that one done early takes another chunk
+        // and the producers finish together.
+        constexpr size_t kChunksPerProducer = 4;
+        gtl::vector<open_input> bam_inputs;
+        gtl::vector<open_input> fastx_inputs;
+        // The chunks of each group, read after its whole files.
+        gtl::vector<open_input> bam_chunks;
+        gtl::vector<open_input> fastx_chunks;
+        // The cut inputs, kept open while their chunks are read.
+        std::vector<std::unique_ptr<chunked_input>> cut_inputs;
+        // check_inputs refused one file given twice, except where only the
+        // open descriptor shows the file (macOS /dev/stdin, /dev/fd/N).
+        std::vector<struct stat> seen;
+        for (const auto &input : inputs) {
+            auto stream = std::make_unique<input_stream>();
+            if (!stream->open(input, threads.io)) {
+                fprintf(stderr, "Error: input %s: %s\n", input.c_str(),
+                        stream->error().c_str());
+                return false;
+            }
+            struct stat st;
+            if (!stream->file_status(st)) {
+                fprintf(stderr, "Error: input %s: %s\n", input.c_str(),
+                        strerror(errno));
+                return false;
+            }
+            if (!record_unique_input(input, inputs, seen, st)) return false;
+            const auto format = detect_input_format(*stream);
+            if (!format) {
+                fprintf(stderr, "Error: input %s: %s\n", input.c_str(),
+                        format.error().c_str());
+                return false;
+            }
+            auto *group = &fastx_inputs;
+            auto *chunk_group = &fastx_chunks;
+            if (*format == input_format::bam) {
+                group = &bam_inputs;
+                chunk_group = &bam_chunks;
+            }
+            if (reading == file_reading_mode::chunks) {
+                auto cut = std::make_unique<chunked_input>();
+                const size_t parts =
+                    kChunksPerProducer *
+                    static_cast<size_t>(std::max(threads.io, 1));
+                const char *why =
+                    cut_into_chunks(*stream, st, input, *format, parts, *cut);
+                if (!why) {
+                    cut->stream = std::move(stream);
+                    for (size_t c = 0; c < cut->chunks.size(); ++c) {
+                        chunk_group->push_back({input, nullptr, cut.get(), c});
+                    }
+                    cut_inputs.push_back(std::move(cut));
+                    continue;
+                }
+                // Once per input, not again for every --multipass pass.
+                if (!chunk_notes_printed) {
+                    fprintf(stderr,
+                            "[config] --file-reading-mode chunks: %s is read "
+                            "whole (%s)\n",
+                            input.c_str(), why);
+                }
+            }
+            group->push_back({input, std::move(stream)});
+        }
+        chunk_notes_printed = true;
+        for (auto &c : bam_chunks) bam_inputs.push_back(std::move(c));
+        for (auto &c : fastx_chunks) fastx_inputs.push_back(std::move(c));
+        bool ok = true;
+        if (!bam_inputs.empty()) {
+            ok = run_stage<seq_record_ops>(bam_inputs, read_bam, dbgi,
+                                           Process_Func, valid_sum, all_sum);
+        }
+        if (ok && !fastx_inputs.empty()) {
+            ok = run_stage<seq_record_ops>(fastx_inputs, read_fastx, dbgi,
+                                           Process_Func, valid_sum, all_sum);
+        }
+        return ok;
+    }
+
+    // Populates the caller-owned dbgi (storage lives in run_assembly).
+    std::expected<void, std::string> construct_dbg(dbg_index &dbgi) {
         u64 valid_sum = 0;
         u64 all_sum = 0;
-        for (size_t i = 0; i < valid_read_counts.size(); ++i) {
-            valid_sum += valid_read_counts[i];
-            all_sum += all_read_counts[i];
+        // The tagged keys come only from priming, so without it retro
+        // admission has nothing to go on.
+        dbgi.retro_admission = retro_admission && prime_reverse;
+        if (!run_over_inputs(dbgi, process_cores<DefaultBF>, valid_sum,
+                             all_sum)) {
+            return std::unexpected(
+                "Error in reading data for DBG construction.");
+        }
+        if (dbgi.retro_admission) {
+            const auto [offered, added] = dbgi.resolve_owed_links(threads.work);
+            const u64 erased = dbgi.erase_unlinked_placeholders(threads.work);
+            fprintf(stderr,
+                    "Retro admission: %" PRIu64 " owed links offered, %" PRIu64
+                    " added; %" PRIu64 " unlinked placeholder nodes erased\n",
+                    offered, added, erased);
         }
         fprintf(stderr, "%" PRIu64 " processed\n%" PRIu64 " total reads\n",
                 valid_sum, all_sum);
-        return dbg_pt;
+        const auto &bf = dbgi.bf->implementation;
+        const double fill = bf.fill_fraction();
+        // Exact for the blocked layout, unlike the unblocked fill^(k - 1).
+        const double est_fpr = bf.fpr_for_fill(fill);
+        const double keys = bf.distinct_keys_for_fill(fill);
+        // The advice is in --projected-element-count windows, which the
+        // filter turns into kStrandTagScale entries each under retro
+        // admission.
+        double advised = keys;
+        if (dbgi.retro_admission) advised = keys / kStrandTagScale;
+        fprintf(stderr,
+                "Bloom filter: %.4f of bits set, estimated false-positive "
+                "rate %.2e (about %.4g distinct keys)\n",
+                fill, est_fpr, keys);
+        // The filter meets --false-positive-probability while it holds at
+        // most --projected-element-count distinct keys. Far above that a
+        // false positive admits a first-sighting lcmer as a node, so the
+        // "seen twice" gate weakens. k <= 1 sets no bits: the filter is
+        // deliberately off (eps near 1).
+        // Warn an order of magnitude above the configured rate, not at
+        // run-to-run fill noise.
+        constexpr double kWarnFactor = 10;
+        if (bf.k > 1 && est_fpr > kWarnFactor * bloom.false_positive_rate) {
+            fprintf(stderr,
+                    "Warning: Bloom filter estimated false-positive rate "
+                    "%.2e exceeds 10x the configured %.2e; it holds about "
+                    "%.3g distinct keys, so raise --projected-element-count "
+                    "(now %" PRIu64 ") to at least %.3g\n",
+                    est_fpr, bloom.false_positive_rate, keys,
+                    bloom.projected_count, advised);
+        }
+        // Nothing probes the filter after the reads are in: segment seeding
+        // bypasses it and cleaning and layout never read it.
+        dbgi.bf.reset();
+        return {};
     }
 
-    auto convert2basespace(dbg_index &dbgi) -> int {
-        dqt data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
-        dqt recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
-        std::atomic<bool> done{false};
-
-        gtl::vector<std::thread> workers;
-        gtl::vector<int> valid_read_counts(threads.work, 0);
-        gtl::vector<int> all_read_counts(threads.work, 0);
-
-        for (int tid = 1; tid <= threads.work; ++tid) {
-            workers.emplace_back([&, tid]() {
-                process_data(
-                    tid, lcp_level, data_queue, recycle_queue, dbgi, done,
-                    valid_read_counts[tid - 1], all_read_counts[tid - 1],
-                    process_cores_for_basespace, syncmer_functor, dbg_lcmer_l);
-            });
-        }
-        std::atomic<bool> read_failed{false};
-        if (parallel_file_reading) {
-            gtl::vector<std::thread> readers;
-            readers.reserve(inputs.size());
-            for (const auto &input : inputs) {
-                readers.emplace_back([&, input]() {
-                    if (!generate_data(input, std::ref(data_queue),
-                                       std::ref(recycle_queue), threads.io)) {
-                        read_failed.store(true);
-                    }
-                });
-            }
-            for (auto &reader : readers) {
-                reader.join();
-            }
-        } else {
-            for (const auto &input : inputs) {
-                if (!generate_data(input, std::ref(data_queue),
-                                   std::ref(recycle_queue), threads.io)) {
-                    read_failed.store(true);
-                    break;
-                }
-            }
-        }
-        if (read_failed.load()) {
-            fprintf(stderr, "Error in reading data for basespace conversion\n");
-            exit(-1);
-        }
-
-        done.store(true);
-        for (auto &worker : workers) {
-            worker.join();
-        }
-
-        int valid_sum = 0;
-        int all_sum = 0;
-        for (size_t i = 0; i < valid_read_counts.size(); ++i) {
-            valid_sum += valid_read_counts[i];
-            all_sum += all_read_counts[i];
-        }
-
-        fprintf(stderr, "%d processed\n%d total reads\n", valid_sum, all_sum);
-        return 0;
-    }
-
-    size_t count_seqv_len(const gtl::vector<SequenceContainerType> &seqv) {
-        size_t sum = 0;
-        for (const SequenceContainerType &s : seqv) {
-            sum += s.len;
-        }
-        return sum;
-    }
-    // I need to recompute the LCP, it is likely more expensive to find relavant
-    // nodes.
-    // void iterative_re_dbg(dbg_index &dbgi) {
-    //     gtl::vector<std::pair<u64, size_t>> node_id_len;
-    //     for (const auto &[k, v] : dbgi.dbg) {
-    //         node_id_len.emplace_back(k, v.seq.size());
-    //     }
-    //     std::sort(
-    //         node_id_len.begin(), node_id_len.end(),
-    //         [](const auto &a, const auto &b) { return a.second < b.second;
-    //         });
-    //     // Check this again TODO.
-    //     dbg_index new_index(dbgi.bf.implementation.m,
-    //     dbgi.bf.implementation.n,
-    //                         dbgi.bf.random_seed);
-
-    //     auto it = node_id_len.begin();
-    //     assert(it != node_id_len.end());
-    //     lps str;
-
-    //     auto move_forward_unitig = [&](u64 id) {
-    //         auto node_it = dbgi.dbg.find(id);
-    //         if (node_it != dbgi.dbg.end()) {
-    //             int len = count_seqv_len(node_it->second.seq);
-    //             prepare_lps(&str, len);
-    //             init_lps_crumbled(&str, node_it->second.seq,
-    //             syncmer_functor); lps_deepen(&str, lcp_level);
-    //         }
-    //     };
-    //     auto rev_contig_present_in_the_index =
-    //         [&](const dbg_index::dbg_map_t::value_type &node, auto ctg) {
-    //             return true;
-    //         };
-    //     move_forward_unitig(node_id_len.front().first);
-    //     ++it;
-    //     while (it != node_id_len.end()) {
-    //         auto rev_ctg = calculate_reverse_utig(*it);
-    //         if (rev_contig_present_in_the_index(*it, rev_ctg)) {
-    //         } else {
-    //             move_forward_unitig(it->first);
-    //         }
-    //         ++it;
-    //     }
-    // }
-    struct rev_match {
-        u64 node;
-        struct ival {
-            u64 from;
-            u64 to;
-            u64 size;
-        };
-        ival tgt;
-        ival qry;
-        // u64 from;  // target start in bases (ts)
-        // u64 to;    // target end in bases (te)
-        // u64 size;  // target length in bases (tlen)
-        // u64 qs;    // query start in bases
-        // u64 qe;    // query end in bases
-        // u64 qlen;  // query length in bases (steps)
-
-        // Matching LCMER indices.
-        //
-        // Convention:
-        // - *_query_* refer to the QUERY/SOURCE node (the map key / "from"
-        // node)
-        // - *_target_* refer to the TARGET node (rev_match::node)
-        //
-        // These indices are later used to "switch" between SequenceContainer
-        // streams at overlap boundaries without base-offset arithmetic.
-        LCmer first_matching_lcmer_query;
-        LCmer last_matching_lcmer_query;
-        LCmer first_matching_lcmer_target;
-        LCmer last_matching_lcmer_target;
+    // Overlap coordinate space: inclusive core indices on a node's
+    // (reverse-complemented) core sequence. `len` is the core-span length in
+    // steps (cores - 1).
+    struct CoreSpan {
+        u64 from;
+        u64 to;
+        u64 len;
     };
 
-    auto btg_connected_components(gtl::btree_multimap<u64, rev_match> &recig) {
-        gtl::vector<gtl::vector<u64>> components;
-        gtl::flat_hash_set<u64> visited;
-        for (const auto &[from, to] : recig) {
-            gtl::vector<u64> component;
-            gtl::vector<u64> stack;
-            stack.push_back(from);
-            while (!stack.empty()) {
-                u64 node = stack.back();
-                stack.pop_back();
-                if (visited.find(node) != visited.end()) {
-                    continue;
-                }
-                visited.emplace(node);
-                component.push_back(node);
-                auto range = recig.equal_range(node);
-                for (auto it = range.first; it != range.second; ++it) {
-                    if (visited.find(it->second.node) == visited.end()) {
-                        stack.push_back(it->second.node);
-                    }
-                }
-            }
-            if (component.size() > 1) {
-                components.push_back(component);
-            }
-        }
-        return components;
-    }
+    // Phase-A record: on the key node, an overlap with `other` covers `self`
+    // (coordinates on the key node). The partner's span is joined in phase B.
+    struct SelfMatch {
+        u64 other;
+        CoreSpan self;
+    };
 
-    // std::tuple<int, int> get_start_positions(
-    //     u64 current, u64 neighbor, gtl::btree_multimap<u64, rev_match> rmatch,
-    //     int cgroup) {
-    //     int qs = -9999, ts = -9999;
-    //     int qe = -9999, te = -9999;
-    //     int ql = -9999, tl = -9999;
+    // Phase-B record (reciprocal overlap), keyed by the query node: `target`
+    // is the partner id; `query`/`target_span` are each node's core span in
+    // the shared overlap.
+    struct Overlap {
+        u64 target;
+        CoreSpan query;
+        CoreSpan target_span;
+    };
 
-    //     auto range_c = rmatch.equal_range(current);
-    //     for (auto it = range_c.first; it != range_c.second; ++it) {
-    //         if (it->second.node == neighbor) {
-    //             qe = it->second.tgt.to;
-    //             qs = it->second.tgt.from;
-    //             ql = it->second.tgt.size;
-    //             break;
-    //         }
-    //     }
-    //     // Find the specific reciprocal entry for (neighbor -> current)
-    //     auto range_t = rmatch.equal_range(neighbor);
-    //     for (auto it = range_t.first; it != range_t.second; ++it) {
-    //         if (it->second.node == current) {
-    //             ts = it->second.tgt.from;
-    //             te = it->second.tgt.to;
-    //             tl = it->second.tgt.size;
-    //             break;
-    //         }
-    //     }
-    //     int ngroup = 1 - cgroup;
-    //     if (cgroup == 1) {
-    //         qs = ql - qe;
-    //     }
-    //     if (ngroup == 1) {
-    //         ts = tl - te;
-    //     }
-    //     return std::make_tuple(qs, ts);
-    // }
-
-    auto add_lcmers(const gtl::vector<SequenceContainerType> &subseqs,
-                    auto &node, dbg_index &dbgi, u64 &idx, int tid) {
-        lps str = {0, 0, 0, 0};
-        lcp_read lr;
-        // dbgi.dbg.for_each([&](auto &node) {
-        if (node.second.redirected()) {
-            return;
-        }
-        // good_n.fetch_add(1);
-        lr.clear();
-
-        // Extract a subsequence [from, to) from the concatenated rev_seqs
-        // Returns a single CrumbledSubSeq64 containing the extracted range
-
-        init_lps_crumbled(&str, subseqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
-
-        for (int i = 0; i < str.size; ++i) {
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-        }
-
-
-        if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 1)) {
-            // good_n.fetch_sub(1);
-            free_lps(&str);
-            return;
-        }
-        gtl::vector<u64> ll = {0};
-        LCmer l{lr.cores.begin() + 1, olc_lcmer_l};  // Skip first core;
-        ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
-        for (size_t i = 2; i + olc_lcmer_l + 1 < lr.cores.size(); ++i) {
-            uint32_t in_core = lr.cores[i + olc_lcmer_l];
-            l.update_lcmer(in_core, lr.cores[i], olc_lcmer_l);
-            ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
-        }
-        ll.push_back(0);
-
-        for (size_t i = 1; i < ll.size() - 1; ++i) {
-            if (insert_lcmer_helper(ll, i, dbgi)) {
-                dbgi.dbg.modify_if(
-                    ll[i], [&lr, i, &subseqs,
-                            this](dbg_index::dbg_map_t::value_type &val) {
-                        val.second.seq.emplace_back(
-                            subseqs, lr.pos[i + olc_lcmer_l - 1].second,
-                            lr.pos[i + olc_lcmer_l].second);
-                    });
-            }
-        }
-    }
-
-    static auto build_lr_cores(const gtl::vector<SequenceContainerType> &seqs,
+    static auto build_lr_cores(fragment_span seqs,
                                const SyncmerType &syncmer_functor,
-                               int lcp_level, lps &str) -> lcp_read {
+                               int lcp_level, core_buf &str) -> lcp_read {
         lcp_read lr;
         lr.clear();
 
-        init_lps_crumbled(&str, seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
-
-        for (int i = 0; i < str.size; ++i) {
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-        }
+        lps_parse_crumbled(lr, &str, seqs, syncmer_functor, lcp_level);
         return lr;
     }
 
-    static auto build_lr_cores_with_seqs(
-        const gtl::vector<SequenceContainerType> &seqs,
-        const SyncmerType &syncmer_functor, int lcp_level, lps &str)
+    static auto build_lr_cores_with_seqs(fragment_span seqs,
+                                         const SyncmerType &syncmer_functor,
+                                         int lcp_level, core_buf &str)
         -> std::pair<lcp_read, gtl::vector<SequenceContainerType>> {
         lcp_read lr;
         lr.clear();
         gtl::vector<SequenceContainerType> core_seqs;
 
-        init_lps_crumbled(&str, seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
+        lps_parse_crumbled(lr, &str, seqs, syncmer_functor, lcp_level);
 
-        if (str.size == 0 || seqs.empty()) {
+        if (lr.cores.empty() || seqs.empty()) {
             return {std::move(lr), std::move(core_seqs)};
         }
 
-        lr.cores.reserve(str.size);
-        lr.pos.reserve(str.size);
-        core_seqs.reserve(str.size);
+        core_seqs.reserve(lr.cores.size());
 
         // Co-iterate: track current fragment and its cumulative position
         size_t frag_idx = 0;
@@ -709,11 +1009,8 @@ struct assembler {
 
         size_t prev_end = 0;  // End position of previous core
 
-        for (int i = 0; i < str.size; ++i) {
-            size_t cur_start = str.cores[i].start;
-            size_t cur_end = str.cores[i].end;
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(cur_start, cur_end);
+        for (const auto &core_pos : lr.pos) {
+            const size_t cur_end = core_pos.second;
 
             // Extract non-overlapping portion: [prev_end, cur_end)
             // For the first core, this is [0, cur_end)
@@ -771,362 +1068,196 @@ struct assembler {
         return {std::move(lr), std::move(core_seqs)};
     }
 
-    static auto build_rev_lr_cores(
-        const gtl::vector<SequenceContainerType> &seqs,
-        const SyncmerType &syncmer_functor, int lcp_level, lps &str)
-        -> lcp_read {
-        lcp_read lr;
-        lr.clear();
+    auto fold_dbg_graph(const unitig_graph &graph) {
+        fprintf(stderr, "dbg_size: %zu\n", graph.node_table_size);
 
-        gtl::vector<SequenceContainerType> rev_seqs;
-        for (auto it = seqs.rbegin(); it != seqs.rend(); ++it) {
-            rev_seqs.emplace_back(it->reverse_complement());
-        }
-        init_lps_crumbled(&str, rev_seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
-
-        for (int i = 0; i < str.size; ++i) {
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-        }
-        return lr;
-    }
-
-    static auto build_rev_lr_cores_with_seqs(
-        const gtl::vector<SequenceContainerType> &seqs,
-        const SyncmerType &syncmer_functor, int lcp_level, lps &str)
-        -> std::pair<lcp_read, gtl::vector<SequenceContainerType>> {
-        lcp_read lr;
-        lr.clear();
-        gtl::vector<SequenceContainerType> core_seqs;
-
-        gtl::vector<SequenceContainerType> rev_seqs;
-        rev_seqs.reserve(seqs.size());
-        for (auto it = seqs.rbegin(); it != seqs.rend(); ++it) {
-            rev_seqs.emplace_back(it->reverse_complement());
-        }
-
-        init_lps_crumbled(&str, rev_seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
-
-        if (str.size == 0 || rev_seqs.empty()) {
-            return {std::move(lr), std::move(core_seqs)};
-        }
-
-        lr.cores.reserve(str.size);
-        lr.pos.reserve(str.size);
-        core_seqs.reserve(str.size);
-
-        // Co-iterate: track current fragment and its cumulative position
-        size_t frag_idx = 0;
-        size_t frag_cumulative = 0;  // start position of current fragment
-
-        size_t prev_end = 0;  // End position of previous core
-
-        for (int i = 0; i < str.size; ++i) {
-            size_t cur_start = str.cores[i].start;
-            size_t cur_end = str.cores[i].end;
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(cur_start, cur_end);
-
-            // Extract non-overlapping portion: [prev_end, cur_end)
-            // For the first core, this is [0, cur_end)
-            size_t from = prev_end;
-            size_t to = cur_end;
-            size_t sub_len = to - from;
-
-            core_seqs.emplace_back(sub_len, 0);
-            auto &result = core_seqs.back();
-            size_t dest_pos = 0;
-
-            // Advance frag_idx until we reach the fragment containing 'from'
-            while (frag_idx < rev_seqs.size() &&
-                   frag_cumulative + rev_seqs[frag_idx].len <= from) {
-                frag_cumulative += rev_seqs[frag_idx].len;
-                ++frag_idx;
-            }
-
-            // Extract bases from fragments, starting from current position
-            size_t cur_frag = frag_idx;
-            size_t cur_cumulative = frag_cumulative;
-
-            while (cur_frag < rev_seqs.size() && dest_pos < sub_len) {
-                const auto &frag = rev_seqs[cur_frag];
-                size_t frag_start = cur_cumulative;
-                size_t frag_end = cur_cumulative + frag.len;
-
-                // Compute overlap of [frag_start, frag_end) with [from, to)
-                size_t overlap_start = std::max(frag_start, from);
-                size_t overlap_end = std::min(frag_end, to);
-
-                if (overlap_start < overlap_end) {
-                    size_t local_from = overlap_start - frag_start;
-                    size_t copy_len = overlap_end - overlap_start;
-
-                    // Copy bases from frag to result
-                    for (size_t b = 0; b < copy_len; ++b) {
-                        size_t src_bit =
-                            (frag.skip_first_n + local_from + b) * 2;
-                        uint64_t code =
-                            (frag.data[src_bit >> 6] >> (src_bit & 63)) & 0x3;
-                        size_t dst_bit = dest_pos * 2;
-                        result.data[dst_bit >> 6] |= code << (dst_bit & 63);
-                        ++dest_pos;
-                    }
-                    result.origin_node = frag.origin_node;
-                }
-                cur_cumulative += frag.len;
-                ++cur_frag;
-            }
-
-            prev_end = cur_end;
-        }
-
-        return {std::move(lr), std::move(core_seqs)};
-    }
-
-    auto find_rev_lcmers(const gtl::vector<SequenceContainerType> &subseqs,
-                         dbg_index &dbgi, int tid, u64 &idx)
-        -> gtl::vector<SequenceContainerType> {
-        lps str = {0, 0, 0, 0};
-        lcp_read lr;
-        lr.clear();
-
-        gtl::vector<SequenceContainerType> rev_seqs;
-        for (auto it = subseqs.rbegin(); it != subseqs.rend(); ++it) {
-            rev_seqs.emplace_back(it->reverse_complement());
-        }
-        init_lps_crumbled(&str, rev_seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
-
-        for (int i = 0; i < str.size; ++i) {
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-        }
-        if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 2)) {
-            free_lps(&str);
-            return {};
-        }
-        LCmer l{lr.cores.begin() + 1, olc_lcmer_l};  // Skip first core;
-        gtl::vector<u64> ll;
-
-        u64 lval = dbgi.emplace_nobloomfilter(l, idx, tid);
-        ll.emplace_back(lval);
-        for (size_t i = 2; i + olc_lcmer_l + 1 < lr.cores.size(); ++i) {
-            uint32_t in_core = lr.cores[i + olc_lcmer_l];
-            l.update_lcmer(in_core, lr.cores[i], olc_lcmer_l);
-            lval = dbgi.emplace_nobloomfilter(l, idx, tid);
-            ll.emplace_back(lval);
-        }
-        gtl::vector<SequenceContainerType> seqs;
-        for (size_t i = 1; i < ll.size() - 1; ++i) {
-            seqs.emplace_back(rev_seqs, lr.pos[i + olc_lcmer_l - 1].second,
-                              lr.pos[i + olc_lcmer_l].second);
-            seqs.back().origin_node = ll[i];
-        }
-        // TODO: index it if needed
-        return seqs;
-    }
-    auto fold_dbg_graph(dbg_index &dbgi) {
-        fprintf(stderr, "dbg_size: %zu\n", dbgi.dbg.size());
-
-        std::atomic<int> all_n{0};
+        std::atomic<int> good{0};
         std::atomic<int> hits{0};
-        std::atomic<int> bad{0};
-        gtl::parallel_flat_hash_map_d<u64, gtl::vector<rev_match>, HT_SHARD_BC,
+        // Phase-0 matching diagnostics.
+        std::atomic<int> too_short{0};   // < 4*lcmer_l cores → no ranges (#4)
+        std::atomic<int> no_ranges{0};   // long enough but 0 lcmer hits
+        std::atomic<int> short_drop{0};  // reciprocal but below span_floor
+        gtl::parallel_flat_hash_map_d<u64, gtl::vector<SelfMatch>, HT_SHARD_BC,
                                       std::mutex>
             matched;
-        for_each_map(
-            dbgi.dbg,
-            [&](int tid, const auto &node) {
-                (void)tid;
-                all_n.fetch_add(1);
-                if (dbgi.active_set.find(node.first) == dbgi.active_set.end()) {
-                    bad.fetch_add(1);
-                    return;
-                }
+        // One parse buffer per worker, reused across its unitigs.
+        std::vector<core_buf> parse_bufs(threads.work);
+        graph.for_each_unitig(
+            threads.work, [&](int tid, const unitig_graph::unitig &node) {
+                if (!graph.active_set.contains(node.id)) return;
 
-                lps str = {0, 0, 0, 0};
+                core_buf &str = parse_bufs[tid];
                 lcp_read lr;
-                // dbgi.dbg.for_each([&](auto &node) {
-                if (node.second.redirected()) {
-                    bad.fetch_add(1);
-                    return;
-                }
-                // good_n.fetch_add(1);
-                lr.clear();
                 gtl::vector<SequenceContainerType> rev_seqs;
-                for (auto it = node.second.seq.rbegin();
-                     it != node.second.seq.rend(); ++it) {
+                for (auto it = node.seq.rbegin(); it != node.seq.rend(); ++it) {
                     rev_seqs.emplace_back(it->reverse_complement());
                 }
-                init_lps_crumbled(&str, rev_seqs, syncmer_functor);
-                lps_deepen(&str, lcp_level);
-
-                for (int i = 0; i < str.size; ++i) {
-                    lr.cores.emplace_back(str.cores[i].label);
-                    lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-                }
-                if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 1)) {
-                    bad.fetch_add(1);
-                    // good_n.fetch_sub(1);
-                    free_lps(&str);
+                lps_parse_crumbled(lr, &str, rev_seqs, syncmer_functor,
+                                   lcp_level);
+                if (lr.cores.size() < static_cast<size_t>(lcmer_l + 1)) {
                     return;
                 }
-                // Keep everything in CORE-INDEX space for layouting.
-                // `find_lcmer_ranges()` already returns [from_core,to_core] in
-                // core indices (inclusive), which is the correct coordinate
-                // system for connected_comp_plus_layout().
-                auto found_ranges = find_lcmer_ranges(lr, dbgi, olc_lcmer_l);
+                good.fetch_add(1);
+                // Layout works in core-index space; find_lcmer_ranges returns
+                // inclusive [from_core,to_core]. Diagnostic below mirrors its
+                // gate via OLC_SKIP_*.
+                if (lr.cores.size() <
+                    static_cast<size_t>(lcmer_l + OLC_SKIP_FIRST(lcmer_l) +
+                                        OLC_SKIP_LAST(lcmer_l))) {
+                    too_short.fetch_add(1);  // fails find_lcmer_ranges gate (#4)
+                }
+                auto found_ranges = find_lcmer_ranges(lr, graph, lcmer_l);
+                bool any_hit = false;
                 for (const auto &[id, from_core, to_core, from_lcmer,
                                   to_lcmer] : found_ranges) {
                     if (id != 0) {
-                        if (to_core - from_core <
-                            lr.pos.size() / 20) {  // TODO: parameterize this
-                            continue;
-                        }
+                        any_hit = true;
                         hits.fetch_add(1);
 
-                        // Store match intervals in CORE indices (inclusive).
-                        // IMPORTANT: rev_match fields are u64 and we keep them
-                        // semantically as core-space indices here. Base-space
-                        // scaling happens at emission time.
-                        //
-                        // We also store "length" fields in core-space to keep
-                        // conversions consistent. Core-space length is number
-                        // of steps between endpoints: (cores.size() - 1).
+                        // Store the overlap on THIS node in CORE indices
+                        // (inclusive; see CoreSpan). Core-space length is
+                        // (cores.size() - 1) steps.
                         const u64 core_len_steps =
                             (lr.cores.size() > 0)
                                 ? static_cast<u64>(lr.cores.size() - 1)
                                 : 0;
 
                         matched.lazy_emplace_l(
-                            node.first,
+                            node.id,
                             [&](auto &val) {
                                 val.second.emplace_back(
                                     id,
-                                    rev_match::ival{static_cast<u64>(from_core),
-                                                    static_cast<u64>(to_core),
-                                                    core_len_steps},
-                                    rev_match::ival{0, 0, 0}, from_lcmer,
-                                    to_lcmer, LCmer{}, LCmer{});
+                                    CoreSpan{static_cast<u64>(from_core),
+                                             static_cast<u64>(to_core),
+                                             core_len_steps});
                             },
                             [&](const auto &ctr) {
-                                ctr(node.first,
-                                    gtl::vector<rev_match>{rev_match{
+                                ctr(node.id,
+                                    gtl::vector<SelfMatch>{SelfMatch{
                                         id,
-                                        rev_match::ival{
-                                            static_cast<u64>(from_core),
-                                            static_cast<u64>(to_core),
-                                            core_len_steps},
-                                        rev_match::ival{0, 0, 0}, from_lcmer,
-                                        to_lcmer, LCmer{}, LCmer{}}});
+                                        CoreSpan{static_cast<u64>(from_core),
+                                                 static_cast<u64>(to_core),
+                                                 core_len_steps}}});
                             });
                     }
                 }
-                free_lps(&str);
-            },
-            threads.work);
+                if (!any_hit &&
+                    lr.cores.size() >=
+                        static_cast<size_t>(lcmer_l + OLC_SKIP_FIRST(lcmer_l) +
+                                            OLC_SKIP_LAST(lcmer_l)))
+                    no_ranges.fetch_add(1);
+            });
 
-        gtl::btree_multimap<u64, rev_match> reciprocal;
+        gtl::btree_multimap<u64, Overlap> reciprocal;
+        int non_recip = 0, recip_kept = 0;
+        // Absolute overlap-span floor in cores: half an lcmer window; below
+        // this an overlap is treated as noise.
+        const u64 span_floor = std::max<u64>(2, (u64)lcmer_l / 2);
         for (const auto &[k, v] : matched) {
             for (const auto &match : v) {
-                // if (k < match.node) {  // smaller node is the key
-                auto it = matched.find(
-                    match.node);  // and matched node also has overlaps
-                if (it != matched.end()) {
-                    auto ff = std::find_if(
-                        it->second.begin(), it->second.end(),
-                        [k](const auto &val) { return val.node == k; });
-                    if (ff != it->second.end()) {  // and has the reverse match
-                        // Store both query and target coordinates in CORE-INDEX
-                        // space. match.from/to are core indices on k's rev_comp
-                        // (query) ff->from/to are core indices on match.node's
-                        // rev_comp (target)
-                        //
-                        // NOTE: rev_match uses generic u64 fields; here we
-                        // interpret them as core-space units. Base-space
-                        // scaling will be applied only when emitting merged
-                        // sequences / reporting.
-                        rev_match full_match;
-                        full_match.node = match.node;
-                        full_match.tgt.from =
-                            ff->tgt.from;  // ts (target start) in cores
-                        full_match.tgt.to =
-                            ff->tgt.to;  // te (target end) in cores
-                        full_match.tgt.size =
-                            ff->tgt.size;  // tlen in cores (steps)
-                        full_match.qry.from =
-                            match.tgt.from;  // qs (query start) in cores
-                        full_match.qry.to =
-                            match.tgt.to;  // qe (query end) in cores
-                        full_match.qry.size =
-                            match.tgt.size;  // qlen in cores (steps)
-                        full_match.first_matching_lcmer_query =
-                            match.first_matching_lcmer_query;
-                        full_match.last_matching_lcmer_query =
-                            match.last_matching_lcmer_query;
-                        full_match.first_matching_lcmer_target =
-                            ff->first_matching_lcmer_query;
-                        full_match.last_matching_lcmer_target =
-                            ff->last_matching_lcmer_query;
-                        reciprocal.emplace(k, full_match);
-
-                        // printf("%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n", k,
-                        //        match.node, match.from, match.to,
-                        //        ff->from, ff->to);
-                        // printf(
-                        //     "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%llu\t%"
-                        //     "llu\t%llu\t%llu\t%llu\t%d\n",
-                        //     k, match.size + runtime_lcmer_l, match.from,
-                        //     match.to + runtime_lcmer_l, match.node, ff->size
-                        //     + runtime_lcmer_l, ff->from, ff->to +
-                        //     runtime_lcmer_l, ff->to - ff->from, ff->to -
-                        //     ff->from, 250);
-                    } else {  // Handle after reciprocals are good
-                        // printf(
-                        //     "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%d\t%d\t%d\t%"
-                        //     "d\t%d\t%d\n",
-                        //     k, match.size + runtime_lcmer_l, match.from,
-                        //     match.to, match.node, -1, -1, -1, -1, -1, 250);
+                // Keep the overlap only if the partner records the reverse one
+                // too. `match.self` is k's core span; `ff->self` is the
+                // partner's.
+                auto it = matched.find(match.other);
+                auto ff = (it != matched.end())
+                              ? std::find_if(it->second.begin(),
+                                             it->second.end(),
+                                             [k](const auto &val) {
+                                                 return val.other == k;
+                                             })
+                              : gtl::vector<SelfMatch>::const_iterator{};
+                if (it != matched.end() && ff != it->second.end()) {
+                    // Overlap extent must be >= span_floor cores on both
+                    // nodes. No length-relative gate: a fraction of the
+                    // shorter node rejected the few-kb end overlaps that join
+                    // Mb-scale nodes.
+                    const u64 span_a = match.self.to - match.self.from;
+                    const u64 span_b = ff->self.to - ff->self.from;
+                    if (std::min(span_a, span_b) < span_floor) {
+                        short_drop.fetch_add(1);
+                        continue;
                     }
-                    // }
+                    reciprocal.emplace(k,
+                                       Overlap{match.other, match.self, ff->self});
+                    ++recip_kept;
+                } else {
+                    ++non_recip;
                 }
-                // printf("%llu\t%llu\t%llu\t%llu\n", k, match.node, match.from,
-                //        match.to);
             }
         }
-        fprintf(stderr, "all:%d\ngood: %d nodes\nhits: %d\n", all_n.load(),
-                all_n.load() - bad.load(), hits.load());
+
+        fprintf(stderr, "all:%zu\ngood: %d nodes\nhits: %d\n",
+                graph.node_table_size, good.load(), hits.load());
+        fprintf(stderr,
+                "[match-diag] too_short:%d no_ranges:%d short_drop:%d "
+                "recip_kept:%d non_recip:%d\n",
+                too_short.load(), no_ranges.load(), short_drop.load(),
+                recip_kept, non_recip);
         auto layouts =
             layout_graph_algo::connected_comp_plus_layout(reciprocal);
+        gtl::flat_hash_set<u64> dropped;
+        if (drop_crumbs) dropped = find_droppable_crumbs(graph);
+        return std::make_tuple(std::move(reciprocal), std::move(layouts),
+                               std::move(dropped));
+    }
 
-        return std::make_pair(reciprocal, layouts);
+    // Crumbs: nodes with fewer than lcmer_l+1 cores, too short to form
+    // an lcmer and therefore invisible to overlap detection. A crumb with a
+    // single live predecessor that continues into a longer node is not
+    // emitted as its own C segment. Crumbs that sit between two long nodes
+    // (a hub) or whose only continuation is a collapsed repeat (depth above
+    // 3x the live median) are kept.
+    gtl::flat_hash_set<u64> find_droppable_crumbs(
+        const unitig_graph &graph) const {
+        const u64 min_cores = static_cast<u64>(lcmer_l + 1);
+        gtl::vector<double> depths;
+        depths.reserve(graph.active_set.size());
+        for (u64 nid : graph.active_set) {
+            const auto *node = graph.find(nid);
+            if (node == nullptr || node->seq.empty()) continue;
+            depths.push_back(node->avg_core_count());
+        }
+        double depth_median = 0.0;
+        if (!depths.empty()) {
+            std::sort(depths.begin(), depths.end());
+            depth_median = 0.5 * (depths[(depths.size() - 1) / 2] +
+                                  depths[depths.size() / 2]);
+        }
+        constexpr double kPileupMaxMult = 3.0;
+        const double pileup_cap = depth_median * kPileupMaxMult;
+        const auto fwds = GraphCleaning::build_live_fwd(graph);
+
+        gtl::flat_hash_set<u64> dropped;
+        for (u64 id : graph.active_set) {
+            const auto *node = graph.find(id);
+            if (node == nullptr) continue;
+            const u64 span = static_cast<u64>(node->seq.size());
+            if (span == 0 || span >= min_cores) continue;
+            if (node->prev.size() != 1 ||
+                graph.find(node->prev[0]) == nullptr) {
+                continue;
+            }
+            auto fit = fwds.find(id);
+            if (fit == fwds.end()) continue;
+            u64 long_succs = 0;
+            bool continues = false;
+            for (u64 q : fit->second) {
+                const auto *succ = graph.find(q);
+                if (succ == nullptr || succ->seq.empty()) continue;
+                if (static_cast<u64>(succ->seq.size()) >= min_cores) {
+                    ++long_succs;
+                }
+                if (pileup_cap <= 0.0 || succ->avg_core_count() <= pileup_cap) {
+                    continues = true;
+                }
+            }
+            if (long_succs >= 2 || !continues) continue;
+            dropped.insert(id);
+        }
+        fprintf(stderr, "[crumbs] dropped %zu crumb nodes\n", dropped.size());
+        return dropped;
     }
 };
-
-// TODO do not use extensions to identify input type.
-input_type identify_input(const std::string &input) {
-    std::string_view sv(input);
-    if (sv.ends_with(".bam")) {
-        return input_type::BAM;
-    } else if (sv.ends_with(".sam")) {
-        return input_type::SAM;
-    } else if (sv.ends_with(".fastq") || sv.ends_with(".fq") ||
-               sv.ends_with(".fasta") || sv.ends_with(".fa") ||
-               sv.ends_with(".fna")) {
-        return input_type::FASTX;
-    } else if (sv.ends_with(".fastq.gz") || sv.ends_with(".fq.gz") ||
-               sv.ends_with(".fasta.gz") || sv.ends_with(".fa.gz") ||
-               sv.ends_with(".fna.gz")) {
-        return input_type::FASTXGZ;
-    } else if (sv.ends_with(".fastq.bz2") || sv.ends_with(".fq.bz2") ||
-               sv.ends_with(".fasta.bz2") || sv.ends_with(".fa.bz2") ||
-               sv.ends_with(".fna.bz2")) {
-        return input_type::FASTXBZ2;
-    }
-    return input_type::UNKNOWN;
-}
 
 static bool validate_path(const std::string &path) {
     auto slash = path.rfind('/');
@@ -1141,36 +1272,118 @@ static bool validate_path(const std::string &path) {
     return true;
 }
 
-int run_assembly(const asm_config &cfg) {
-    if (!validate_path(cfg.output)) return 1;
+// Each pass opens every input once and reads it once. A pipe, a FIFO or
+// standard input can only be read once, so --multipass, which reads every
+// input again in each pass, needs regular files. Nothing is opened here, so a
+// FIFO cannot block the check.
+static bool check_inputs(const asm_config &cfg) {
+    std::vector<struct stat> seen;
+    for (const auto &input : cfg.inputs) {
+        struct stat st;
+        if (!stat_input(input, st)) {
+            fprintf(stderr, "Error: input %s: cannot open: %s\n", input.c_str(),
+                    strerror(errno));
+            return false;
+        }
+        if (!cfg.multipass.empty() && !S_ISREG(st.st_mode)) {
+            fprintf(stderr,
+                    "Error: input %s is not a regular file; --multipass reads "
+                    "every input once per pass, so it cannot read a pipe or "
+                    "standard input\n",
+                    input.c_str());
+            return false;
+        }
+        if (!record_unique_input(input, cfg.inputs, seen, st)) return false;
+    }
+    return true;
+}
+
+// Checks shared by both drivers, before any work; prints the configuration.
+static bool prepare_run(const asm_config &cfg) {
+    if (!validate_path(cfg.output)) return false;
+    if (!check_inputs(cfg)) return false;
+
+    // Validate the syncmer configuration once, up front, before any syncmer
+    // functor is constructed (the functor ctor assumes a valid rule).
+    if (auto v = cfg.syncmer.validate(); !v) {
+        fprintf(stderr, "Error: %s\n", v.error().c_str());
+        return false;
+    }
 
     if (!cfg.silent) cfg.print_cfg(stderr);
-    // free(malloc(1024ULL * 1024 * 1024 * 20)); INTIMIDATE the OS for the
-    // ram
+    return true;
+}
+
+// Debug dump of the DBG's unitigs (--print-raw-dbg, --print-bi-dbg).
+static bool dump_dbg(const std::string &path, const dbg_index &dbg) {
+    FILE *out = fopen(path.c_str(), "w");
+    if (!out) {
+        fprintf(stderr, "Cannot open output: %s\n", path.c_str());
+        return false;
+    }
+    print_dbg_seqs(out, dbg);
+    fclose(out);
+    return true;
+}
+
+// The cleaned graph in compact form: the node table, mostly redirect stubs,
+// is freed; its fragment arenas move to the compact graph with the sequences.
+// The freed memory stays with malloc and serves the fold and layout buffers;
+// returning it to the OS here (malloc_trim) is slow and does not lower the
+// peak.
+static std::unique_ptr<unitig_graph> compact_graph(
+    std::unique_ptr<dbg_index> graph, int threads) {
+    auto unitigs = std::make_unique<unitig_graph>(*graph, threads);
+    graph.reset();
+    return unitigs;
+}
+
+// Layout of the cleaned graph, written as the output GFA.
+static bool write_output_gfa(const asm_config &cfg, assembler &as,
+                             const unitig_graph &graph) {
+    FILE *out = fopen(cfg.output.c_str(), "w");
+    if (!out) {
+        fprintf(stderr, "Cannot open output: %s\n", cfg.output.c_str());
+        return false;
+    }
+    layout_graph_emit::emit_ultra_merged_graph(as, graph, out);
+    fclose(out);
+    return true;
+}
+
+static int run_passes(const asm_config &cfg);
+
+// Distinct entries the Bloom filter is sized for (see kStrandTagScale).
+static uint64_t filter_entries(const asm_config &cfg) {
+    if (!cfg.retro_admission || !cfg.prime_reverse) {
+        return cfg.bloom.projected_count;
+    }
+    return static_cast<uint64_t>(
+        std::llround(kStrandTagScale * cfg.bloom.projected_count));
+}
+
+int run_assembly(const asm_config &cfg) {
+    if (!cfg.multipass.empty()) return run_passes(cfg);
+    if (!prepare_run(cfg)) return 1;
 
     INIT_TIMERS(HIFI_ASSEMBLY);
 
-    // auto inty = identify_input(cfg.inputs.front());
-
-    // if (inty == input_type::UNKNOWN) {
-    //     fprintf(stderr, "Unknown input type %s\n", cfg.inputs.front().c_str());
-    //     return -1;
-    // }
-
     assembler as(cfg);
-    dbg_index *dbgp = as.construct_dbg();
-    dbg_index &dbg = *dbgp;
+    auto graph = std::make_unique<dbg_index>(cfg.bloom.false_positive_rate,
+                                             filter_entries(cfg), cfg.seed);
+    dbg_index &dbg = *graph;
+    if (auto r = as.construct_dbg(dbg); !r) {
+        fprintf(stderr, "%s Terminating.\n", r.error().c_str());
+        return 1;
+    }
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "DBG construction");
 
-    dbg.count_forward_edges();
+    dbg.count_forward_edges(cfg.threads.work);
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
                        "Count forward edges");
 
     if (cfg.print_precleanup_graph) {
-        FILE *out = fopen((cfg.output + ".raw").c_str(), "w");
-        print_dbg_seqs(out, dbg);
-        fclose(out);
-
+        if (!dump_dbg(cfg.output + ".raw.gfa", dbg)) return 1;
         IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "DBG printing");
     }
 
@@ -1178,702 +1391,144 @@ int run_assembly(const asm_config &cfg) {
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph cleaning");
 
-
-    // Dump pre-layout unitig graph
-    {
-        FILE *pre = fopen((cfg.output + ".pre_layout").c_str(), "w");
-        print_dbg_seqs(pre, dbg);
-        fclose(pre);
+    // Dump pre-layout (bidirected) unitig graph, gated on --print-bi-dbg.
+    if (cfg.print_prelayout_graph && !dump_dbg(cfg.output + ".bi.gfa", dbg)) {
+        return 1;
     }
 
-    // Later stages commented out for profiling graph building
-    {
-        FILE *out = fopen(cfg.output.c_str(), "w");
-        // print_dbg_seqs(out, dbg);
-        layout_graph_emit::emit_ultra_merged_graph(as, dbg, out);
-        fclose(out);
-    }
+    auto unitigs = compact_graph(std::move(graph), cfg.threads.work);
+    IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph compaction");
+
+    if (!write_output_gfa(cfg, as, *unitigs)) return 1;
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Merged/Printed");
 
-#if 0
-    // ultra
-    auto [recig, layouts] = as.fold_dbg_graph(dbg);
-    // Find largest layout
-
-    int hash_combine_len = as.olc_lcmer_l;
-    u64 layout_idx = 0;
-    for (const auto &current_layout : layouts) {
-        layout_small_graph small_bg;
-        for (const auto &[ctg_id, layout] : current_layout) {
-            auto [from, to, ori] = layout;
-            auto nodeit = dbg.dbg.find(ctg_id);
-            if (nodeit == dbg.dbg.end()) {
-                fprintf(stderr, "Error: Node %" PRIu64 " not found in graph\n",
-                        ctg_id);
-                exit(EXIT_FAILURE);
-            }
-            auto &node = nodeit->second;
-            lps str = {0, 0, 0, 0};
-            u64 hw = 0;
-            if (ori) {
-                init_lps_crumbled(&str, node.seq, as.syncmer_functor);
-                lps_deepen(&str, as.lcp_level);
-                // printf(">%llu +\n", ctg_id);
-                seqveciterator svit;
-                if (str.size > hash_combine_len) {
-                    svit.move_only(node.seq, str.cores[hash_combine_len - 1].end);
-                }
-                for (int i = 0; i < str.size; ++i) {
-                    u64 before = hw;
-                    hw ^= str.cores[i].label;
-                    hw &= (0x00000000FFFFFFFFull);
-                    hw |= ((u64)str.cores[i].label << 32);
-
-                    if (i >= hash_combine_len) {
-                        hw ^= (str.cores[i - hash_combine_len].label);
-                        auto it_and_result =
-                            small_bg.try_emplace(hw, 1, before);
-                        if (!it_and_result.second) {  // Otherw
-                            it_and_result.first->second.counts.core_count++;
-                            it_and_result.first->second.emplace_prev(before);
-                            svit.move_only(node.seq, str.cores[i].end);
-                        } else {  // If this is a new emplacement. Add its seq
-                            it_and_result.first->second.seq.emplace_back(
-                                svit.get_and_move(node.seq, str.cores[i].end));
-                        }
-                    }
-                    // printf("%llu %u %llu %llu %llu\n", hw,
-                    // str.cores[i].label, str.cores[i].bit_rep,
-                    // str.cores[i].start, str.cores[i].end);
-                }
-            } else {
-                gtl::vector<SequenceContainerType> rev_seqs;
-                for (auto it = node.seq.rbegin(); it != node.seq.rend(); ++it) {
-                    rev_seqs.emplace_back(it->reverse_complement());
-                }
-                seqveciterator svit;
-                init_lps_crumbled(&str, rev_seqs, as.syncmer_functor);
-                lps_deepen(&str, as.lcp_level);
-                // printf(">%llu +\n", ctg_id);
-
-                if (str.size > hash_combine_len) {
-                    svit.move_only(rev_seqs, str.cores[hash_combine_len - 1].end);
-                }
-                for (int i = 0; i < str.size; ++i) {
-                    u64 before = hw;
-                    hw ^= str.cores[i].label;
-                    hw &= (0x00000000FFFFFFFFull);
-                    hw |= ((u64)str.cores[i].label << 32);
-
-                    if (i >= hash_combine_len) {
-                        hw ^= (str.cores[i - hash_combine_len].label);
-                        auto it_and_result =
-                            small_bg.try_emplace(hw, 1, before);
-                        if (!it_and_result.second) {  // Otherw
-                            it_and_result.first->second.counts.core_count++;
-                            it_and_result.first->second.emplace_prev(before);
-                            svit.move_only(rev_seqs, str.cores[i].end);
-                        } else {  // If this is a new emplacement. Add its seq
-                            it_and_result.first->second.seq.emplace_back(
-                                svit.get_and_move(rev_seqs, str.cores[i].end));
-                        }
-                    }
-                    // printf("%llu %u %llu %llu %llu\n", hw,
-                    // str.cores[i].label, str.cores[i].bit_rep,
-                    // str.cores[i].start, str.cores[i].end);
-                }
-            }
-        }
-        charsi chs;
-        printf("S\t%" PRIu64 "\t", layout_idx);
-        std::set<u64> ids_seen;
-        for (const auto &[id,s] : layout_graph_algo::longest_path(small_bg) ){
-            auto it = ids_seen.find(id);
-            if(it != ids_seen.end()){
-                fprintf(stderr, "Duplicate ID: %" PRIu64 "\n", id);
-                __builtin_trap();
-            }
-            else{
-                ids_seen.insert(id);
-            }
-            chs.require(s[0].len);
-            s[0].convert_to_ascii((char *)chs.data);
-            printf("%s", chs.data);
-        }
-        printf("\n");
-        // charsi chs;
-        // for (const auto &[k, v] : small_bg) {
-        //     printf("S\t%llu\t", k);
-        //     for (const SequenceContainerType &s : v.seq) {
-        //         chs.require(s.len);
-        //         s.convert_to_ascii((char *)chs.data);
-        //         printf("%s\t", chs.data);
-        //     }
-        //     printf("\n");
-        //     for (const u64 pnode : v.prev) {
-        //         printf("L\t%llu\t+\t%llu\t+\t0M\n", pnode, k);
-        //     }
-        // }
-        layout_idx++;
-    }
-#endif
+    // Never torn down: the process exits once the GFA is written, so
+    // teardown is pure overhead.
+    (void)unitigs.release();
     return 0;
 }
 
-void tests_mock_fill_seq(dbg_index &dbgi) {
-    for (auto &node : dbgi.dbg) {
-        node.second.seq.emplace_back();
-    }
+static size_t total_bases(const gtl::vector<SequenceContainerType> &seqs) {
+    size_t sum = 0;
+    for (const auto &s : seqs) sum += s.len;
+    return sum;
 }
 
-// TEST_CASE("Graph simplification simple") {
-//     dbg_index dbgi{0.95, 10, 0};
-//     gtl::vector<u32> mock_cores;
-//     int MOCK_CORE_COUNT = 40;
-//     for (int i = 0; i < MOCK_CORE_COUNT; i++) {
-//         mock_cores.push_back(MurmurHash3_32(&i, sizeof(int), 156));
-//     }
-//     LCmer l(mock_cores.begin());
-//     u64 idx = 0;
-
-//     gtl::vector<u64> ll(1, 0);
-//     ll.reserve(MOCK_CORE_COUNT - runtime_lcmer_l + 3);
-//     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     for (int i = runtime_lcmer_l + 1; i < MOCK_CORE_COUNT - 1; ++i) {
-//         uint32_t in_core = mock_cores[i];
-//         l.update_lcmer(in_core);
-//         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     }
-//     ll.push_back(0);
-
-//     for (size_t i = 1; i <= ll.size() - 1; i++) {
-//         assembler::insert_lcmer_helper(ll, i, dbgi);
-//     }
-
-//     SUBCASE("Check ll vec") {
-//         for (size_t i = 1; i < ll.size() - 1; ++i) {
-//             CHECK(ll[i] == (i - 1) * 128);
-//         }
-//     }
-//     SUBCASE("Pre simplify dbg") {
-//         for (auto &node : dbgi.dbg) {
-//             INFO(node.first, "\t.\t.\t", node.second.seq.size());
-//             CHECK(node.second.counts.core_count < 2);
-//             CHECK(node.second.prev.size() < 2);
-//         }
-//         CAPTURE(dbgi.dbg.size());
-//         CHECK(dbgi.lci.size() == MOCK_CORE_COUNT - 2 - runtime_lcmer_l + 1);
-//     }
-
-//     tests_mock_fill_seq(dbgi);
-//     for (auto &n : dbgi.dbg) {  // Main Path has 10X depth
-//         n.second.counts.core_count *= 10;
-//     }
-//     dbgi.count_forward_edges();
-
-//     GraphCleaning::run(dbgi, {.graph_cleaning = {1, 10, 10, 2}});
-//     SUBCASE("Post simplify dbg") {
-//         for (auto &node : dbgi.dbg) {
-//             INFO(node.first, "\t.\t.\t", node.second.seq.size());
-//         }
-//         CAPTURE(dbgi.dbg.size());
-//         CHECK(dbgi.dbg.size() == 1);
-//         CHECK(dbgi.dbg.begin()->second.seq.size() == 30);
-//     }
-
-//     // // Write Dot file
-//     // FILE *dot_file = fopen("graph.dot", "w");
-
-//     // if (dot_file) {
-//     //     // print_raw_dbg(dot_file, dbgi);
-//     //     fprintf(dot_file, "digraph G {\n");
-//     //     for (auto &node : dbgi.dbg) {
-//     //         fprintf(dot_file, "\t%" PRIu64 " [label=\"%" PRIu64
-//     "\"];\n",
-//     //         node.first,
-//     //                 node.first);
-//     //         for (auto &prev : node.second.prev) {
-//     //             fprintf(dot_file, "\t%" PRIu64 " -> %" PRIu64 ";\n",
-//     prev,
-//     //             node.first);
-//     //         }
-//     //     }
-//     //     fprintf(dot_file, "}\n");
-//     //     fclose(dot_file);
-//     // }
-// }
-
-// TEST_CASE("Graph simplification Bubble") {
-//     dbg_index dbgi{0.95, 10, 0};
-//     gtl::vector<u32> mock_cores;
-//     int MOCK_CORE_COUNT = 40;
-//     for (int i = 0; i < MOCK_CORE_COUNT; i++) {
-//         mock_cores.push_back(MurmurHash3_32(&i, sizeof(int), 156));
-//     }
-//     LCmer l(mock_cores.begin());
-//     u64 idx = 0;
-
-//     gtl::vector<u64> ll(1, 0);
-//     ll.reserve(MOCK_CORE_COUNT - runtime_lcmer_l + 3);
-//     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     for (int i = runtime_lcmer_l; i < MOCK_CORE_COUNT - 1; ++i) {
-//         uint32_t in_core = mock_cores[i];
-//         l.update_lcmer(in_core);
-//         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     }
-//     ll.push_back(0);
-//     for (size_t i = 1; i <= ll.size() - 1; i++) {
-//         assembler::insert_lcmer_helper(ll, i, dbgi);
-//     }
-
-//     ll.clear();
-//     mock_cores[MOCK_CORE_COUNT / 2] = 123123123;
-//     l = LCmer(mock_cores.begin());
-
-//     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     for (int i = runtime_lcmer_l; i < MOCK_CORE_COUNT - 1; ++i) {
-//         uint32_t in_core = mock_cores[i];
-//         l.update_lcmer(in_core);
-//         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     }
-//     ll.push_back(0);
-//     for (size_t i = 1; i <= ll.size() - 1; i++) {
-//         assembler::insert_lcmer_helper(ll, i, dbgi);
-//     }
-
-//     dbgi.count_forward_edges();
-//     for (auto &n : dbgi.dbg) {  // Main Path has 10X depth
-//         n.second.counts.core_count *= 10;
-//     }
-//     tests_mock_fill_seq(dbgi);
-//     print_dbg_dot(dbgi, 0);
-
-//     GraphCleaning::run(dbgi, {.graph_cleaning = {1, 10, 10, 2}});
-//     print_dbg_dot(dbgi, 1);
-
-//     SUBCASE("Post simplify dbg iter 2") {
-//         for (auto &node : dbgi.dbg) {
-//             INFO(node.first, "\t.\t.\t", node.second.seq.size());
-//         }
-//         CAPTURE(dbgi.dbg.size());
-//         CHECK(dbgi.dbg.size() == 1);
-//     }
-
-//     print_dbg_dot(dbgi, 2);
-// }
-
-// TEST_CASE("Graph simplification Tips (Outgoing)") {
-//     dbg_index dbgi{0.95, 10, 0};
-//     gtl::vector<u32> mock_cores;
-//     int MOCK_CORE_COUNT = 30;
-//     for (int i = 0; i < MOCK_CORE_COUNT; i++) {
-//         mock_cores.push_back(MurmurHash3_32(&i, sizeof(int), 156));
-//     }
-//     LCmer l(mock_cores.begin());
-//     u64 idx = 0;
-
-//     gtl::vector<u64> ll(1, 0);
-//     ll.reserve(MOCK_CORE_COUNT - runtime_lcmer_l + 3);
-//     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     for (int i = runtime_lcmer_l; i < MOCK_CORE_COUNT - 1; ++i) {
-//         uint32_t in_core = mock_cores[i];
-//         l.update_lcmer(in_core);
-//         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     }
-//     ll.push_back(0);
-//     for (size_t i = 1; i <= ll.size() - 1; i++) {
-//         assembler::insert_lcmer_helper(ll, i, dbgi);
-//     }
-//     for (auto &n : dbgi.dbg) {  // Main Path has 10X depth
-//         n.second.counts.core_count *= 10;
-//     }
-//     ll.clear();
-//     mock_cores[12] = 123123123;
-//     l = LCmer(mock_cores.begin());
-
-//     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     for (int i = runtime_lcmer_l; i < MOCK_CORE_COUNT - 1; ++i) {
-//         uint32_t in_core = mock_cores[i];
-//         l.update_lcmer(in_core);
-//         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     }
-//     ll.push_back(0);
-//     for (size_t i = 1; i <= ll.size() / 2 - 1; i++) {
-//         assembler::insert_lcmer_helper(ll, i, dbgi);
-//     }
-
-//     dbgi.count_forward_edges();
-
-//     tests_mock_fill_seq(dbgi);
-//     print_dbg_dot(dbgi, 3);
-
-//     GraphCleaning::run(dbgi, {.graph_cleaning = {1, 10, 10, 2}});
-//     SUBCASE("Post simplify dbg") {
-//         for (auto &node : dbgi.dbg) {
-//             INFO(node.first, "\t.\t.\t", node.second.seq.size());
-//         }
-//         CAPTURE(dbgi.dbg.size());
-//         CHECK(dbgi.dbg.size() == 1);
-//     }
-//     print_dbg_dot(dbgi, 4);
-// }
-// TEST_CASE("Graph simplification Tips (Incoming)") {
-//     dbg_index dbgi{0.95, 10, 0};
-//     gtl::vector<u32> mock_cores;
-//     LCmer l;
-//     gtl::vector<u64> ll;
-
-//     u64 idx = 0;
-//     int MOCK_CORE_COUNT = 30;
-//     for (int i = 0; i < MOCK_CORE_COUNT; i++) {
-//         mock_cores.push_back(MurmurHash3_32(&i, sizeof(int), 156));
-//     }
-//     for (int DEPTH = 0; DEPTH < 10; ++DEPTH) {
-//         l = LCmer(mock_cores.begin());
-
-//         ll.push_back(0);
-
-//         ll.reserve(MOCK_CORE_COUNT - runtime_lcmer_l + 3);
-//         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//         for (int i = runtime_lcmer_l; i < MOCK_CORE_COUNT - 1; ++i) {
-//             uint32_t in_core = mock_cores[i];
-//             l.update_lcmer(in_core);
-//             ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//         }
-//         ll.push_back(0);
-//         for (size_t i = 1; i <= ll.size() - 1; i++) {
-//             assembler::insert_lcmer_helper(ll, i, dbgi);
-//         }
-
-//         ll.clear();
-//     }
-//     ll.push_back(0);
-//     mock_cores[8] = 123123123;
-//     l = LCmer(mock_cores.begin() + 7);
-
-//     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     for (int i = runtime_lcmer_l + 7; i < MOCK_CORE_COUNT - 1; ++i) {
-//         uint32_t in_core = mock_cores[i];
-//         l.update_lcmer(in_core);
-//         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     }
-//     ll.push_back(0);
-//     for (size_t i = 1; i <= ll.size() / 2 - 1; i++) {
-//         assembler::insert_lcmer_helper(ll, i, dbgi);
-//     }
-
-//     dbgi.count_forward_edges();
-
-//     tests_mock_fill_seq(dbgi);
-//     print_dbg_dot(dbgi, 6);
-//     GraphCleaning::run(dbgi, {.graph_cleaning = {1, 10, 10, 2}});
-
-//     SUBCASE("Post simplify dbg") {
-//         for (auto &node : dbgi.dbg) {
-//             INFO(node.first, "\t.\t.\t", node.second.seq.size());
-//         }
-//         CAPTURE(dbgi.dbg.size());
-//         CHECK(dbgi.dbg.size() == 1);
-//     }
-//     print_dbg_dot(dbgi, 7);
-// }
-
-TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
-    using SYNCMER_HASHER = syncmer::MurMur;
-    using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
-    decltype(asm_config::syncmer) spara;
-    spara.k = 8;
-    spara.density = 0.05;
-    SyncmerType syncmer_functor(spara, 42);
-    int lcp_level = 3;
-
-    // Create test sequences - must be long enough and varied enough to produce
-    // cores
-    const char *seq1 =
-        "ACGTACGTAAGGCCTTAACCGGTTAAGGCCTTAACCGGTTACGTACGTAAGGCCTT"
-        "TGCATGCAGGAATTCCGGAATTCCGGAATTCCTGCATGCAGGAATTCCGGAATTCC"
-        "AACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTT"
-        "GGCCAATTGGCCAATTGGCCAATTGGCCAATTGGCCAATTGGCCAATTGGCCAATT";
-    const char *seq2 =
-        "TGCATGCATGCAACGTACGTACGTTGCATGCATGCAACGTACGTACGTTGCATGCA"
-        "GGAATTCCGGAATTCCAACCGGTTGGAATTCCGGAATTCCAACCGGTTGGAATTCC"
-        "AACCGGTTAACCGGTTGGCCAATTAACCGGTTAACCGGTTGGCCAATTAACCGGTT"
-        "TTGGCCAATTGGCCAACCGGTTAATTGGCCAATTGGCCAACCGGTTAATTGGCCAA";
-    const char *seq3 =
-        "GGCCGGCCAATTAATTGGCCGGCCAATTAATTGGCCGGCCAATTAATTGGCCGGCC"
-        "ACGTACGTAACCGGTTACGTACGTAACCGGTTACGTACGTAACCGGTTACGTACGT"
-        "TGCATGCAGGAATTCCTGCATGCAGGAATTCCTGCATGCAGGAATTCCTGCATGCA"
-        "AATTGGCCAATTGGCCAATTGGCCAATTGGCCAATTGGCCAATTGGCCAATTGGCC";
-
-    gtl::vector<SequenceContainerType> seqs;
-    seqs.emplace_back(seq1, 0, strlen(seq1), 0,
-                      SequenceContainerType::from_ascii{});
-    seqs.emplace_back(seq2, 0, strlen(seq2), 0,
-                      SequenceContainerType::from_ascii{});
-    seqs.emplace_back(seq3, 0, strlen(seq3), 0,
-                      SequenceContainerType::from_ascii{});
-
-    // Build concatenated reference string
-    std::string concat_ref =
-        std::string(seq1) + std::string(seq2) + std::string(seq3);
-
-    SUBCASE("build_lr_cores_with_seqs") {
-        lps lps_buf = {0, 0, 0, 0};
-        auto [lr, core_seqs] = assembler::build_lr_cores_with_seqs(
-            seqs, syncmer_functor, lcp_level, lps_buf);
-        auto lr_original =
-            assembler::build_lr_cores(seqs, syncmer_functor, lcp_level, lps_buf);
-        free_lps(&lps_buf);
-
-        // Ensure we actually have cores to test
-        REQUIRE(lr.cores.size() > 0);
-
-        // Check that cores match the original function
-        REQUIRE(lr.cores.size() == lr_original.cores.size());
-        REQUIRE(lr.pos.size() == lr_original.pos.size());
-        for (size_t i = 0; i < lr.cores.size(); ++i) {
-            CHECK_EQ(lr.cores[i], lr_original.cores[i]);
-            CHECK_EQ(lr.pos[i].first, lr_original.pos[i].first);
-            CHECK_EQ(lr.pos[i].second, lr_original.pos[i].second);
-        }
-
-        REQUIRE(lr.cores.size() == core_seqs.size());
-        REQUIRE(lr.pos.size() == core_seqs.size());
-
-        // Verify non-overlapping extraction: core_seqs[i] should be [prev_end,
-        // cur_end)
-        char buffer[2048];
-        size_t prev_end = 0;
-        for (size_t i = 0; i < core_seqs.size(); ++i) {
-            size_t cur_end = lr.pos[i].second;
-            // Expected is the non-overlapping portion: [prev_end, cur_end)
-            std::string expected =
-                concat_ref.substr(prev_end, cur_end - prev_end);
-
-            core_seqs[i].convert_to_ascii(buffer);
-            std::string actual(buffer);
-
-            INFO("Core ", i, " prev_end=", prev_end, " cur_end=", cur_end);
-            CHECK_EQ(expected, actual);
-
-            prev_end = cur_end;
-        }
-    }
-
-    SUBCASE("build_rev_lr_cores_with_seqs") {
-        lps lps_buf = {0, 0, 0, 0};
-        auto [lr, core_seqs] = assembler::build_rev_lr_cores_with_seqs(
-            seqs, syncmer_functor, lcp_level, lps_buf);
-        auto lr_original =
-            assembler::build_rev_lr_cores(seqs, syncmer_functor, lcp_level, lps_buf);
-        free_lps(&lps_buf);
-
-        // Ensure we actually have cores to test
-        REQUIRE(lr.cores.size() > 0);
-
-        // Check that cores match the original function
-        REQUIRE(lr.cores.size() == lr_original.cores.size());
-        REQUIRE(lr.pos.size() == lr_original.pos.size());
-        for (size_t i = 0; i < lr.cores.size(); ++i) {
-            CHECK_EQ(lr.cores[i], lr_original.cores[i]);
-            CHECK_EQ(lr.pos[i].first, lr_original.pos[i].first);
-            CHECK_EQ(lr.pos[i].second, lr_original.pos[i].second);
-        }
-
-        // Build reverse-complemented concatenated reference
-        gtl::vector<SequenceContainerType> rev_seqs;
-        for (auto it = seqs.rbegin(); it != seqs.rend(); ++it) {
-            rev_seqs.emplace_back(it->reverse_complement());
-        }
-        std::string rev_concat_ref;
-        char temp_buf[2048];
-        for (const auto &rs : rev_seqs) {
-            rs.convert_to_ascii(temp_buf);
-            rev_concat_ref += std::string(temp_buf);
-        }
-
-        REQUIRE(lr.cores.size() == core_seqs.size());
-        REQUIRE(lr.pos.size() == core_seqs.size());
-
-        // Verify non-overlapping extraction: core_seqs[i] should be [prev_end,
-        // cur_end)
-        char buffer[2048];
-        size_t prev_end = 0;
-        for (size_t i = 0; i < core_seqs.size(); ++i) {
-            size_t cur_end = lr.pos[i].second;
-            // Expected is the non-overlapping portion: [prev_end, cur_end)
-            std::string expected =
-                rev_concat_ref.substr(prev_end, cur_end - prev_end);
-
-            core_seqs[i].convert_to_ascii(buffer);
-            std::string actual(buffer);
-
-            INFO("Core ", i, " prev_end=", prev_end, " cur_end=", cur_end);
-            CHECK_EQ(expected, actual);
-
-            prev_end = cur_end;
-        }
-    }
-
-    SUBCASE("core sequences span fragment boundaries correctly") {
-        // Build cores from vector of 3 sequences
-        lps lps_buf = {0, 0, 0, 0};
-        auto [lr, core_seqs] = assembler::build_lr_cores_with_seqs(
-            seqs, syncmer_functor, lcp_level, lps_buf);
-        free_lps(&lps_buf);
-
-        // Ensure we actually have cores to test
-        REQUIRE(lr.cores.size() > 0);
-
-        // Get fragment boundaries
-        size_t frag1_end = strlen(seq1);
-        size_t frag2_end = frag1_end + strlen(seq2);
-
-        // Find non-overlapping portions that span fragment boundaries
-        bool found_spanning_seq = false;
-        char buffer[2048];
-        size_t prev_end = 0;
-        for (size_t i = 0; i < core_seqs.size(); ++i) {
-            size_t cur_end = lr.pos[i].second;
-
-            // Check if this non-overlapping portion [prev_end, cur_end) spans a
-            // fragment boundary
-            bool spans_boundary =
-                (prev_end < frag1_end && cur_end > frag1_end) ||
-                (prev_end < frag2_end && cur_end > frag2_end);
-            if (spans_boundary) {
-                found_spanning_seq = true;
-
-                // Verify the extracted sequence matches the non-overlapping
-                // portion
-                std::string expected =
-                    concat_ref.substr(prev_end, cur_end - prev_end);
-                core_seqs[i].convert_to_ascii(buffer);
-                std::string actual(buffer);
-
-                INFO("Spanning seq ", i, " prev_end=", prev_end,
-                     " cur_end=", cur_end, " frag1_end=", frag1_end,
-                     " frag2_end=", frag2_end);
-                CHECK_EQ(expected, actual);
-            }
-
-            prev_end = cur_end;
-        }
-
-        // We expect at least one sequence to span fragment boundaries with
-        // these test sequences
-        INFO("Total cores: ", lr.cores.size());
-        CHECK(found_spanning_seq);
-    }
-
-    SUBCASE("rev: core sequences span fragment boundaries correctly") {
-        // Build cores from vector of 3 sequences (reverse complemented)
-        lps lps_buf = {0, 0, 0, 0};
-        auto [lr, core_seqs] = assembler::build_rev_lr_cores_with_seqs(
-            seqs, syncmer_functor, lcp_level, lps_buf);
-        free_lps(&lps_buf);
-
-        // Build reverse-complemented concatenated reference
-        gtl::vector<SequenceContainerType> rev_seqs;
-        for (auto it = seqs.rbegin(); it != seqs.rend(); ++it) {
-            rev_seqs.emplace_back(it->reverse_complement());
-        }
-        std::string rev_concat_ref;
-        char temp_buf[2048];
-        for (const auto &rs : rev_seqs) {
-            rs.convert_to_ascii(temp_buf);
-            rev_concat_ref += std::string(temp_buf);
-        }
-
-        // Ensure we actually have cores to test
-        REQUIRE(lr.cores.size() > 0);
-
-        // Get fragment boundaries (in rev_seqs order: seq3_rc, seq2_rc,
-        // seq1_rc)
-        size_t frag1_end = strlen(seq3);  // seq3 is first in reverse order
-        size_t frag2_end = frag1_end + strlen(seq2);
-
-        // Find non-overlapping portions that span fragment boundaries
-        bool found_spanning_seq = false;
-        char buffer[2048];
-        size_t prev_end = 0;
-        for (size_t i = 0; i < core_seqs.size(); ++i) {
-            size_t cur_end = lr.pos[i].second;
-
-            // Check if this non-overlapping portion [prev_end, cur_end) spans a
-            // fragment boundary
-            bool spans_boundary =
-                (prev_end < frag1_end && cur_end > frag1_end) ||
-                (prev_end < frag2_end && cur_end > frag2_end);
-            if (spans_boundary) {
-                found_spanning_seq = true;
-
-                // Verify the extracted sequence matches the non-overlapping
-                // portion
-                std::string expected =
-                    rev_concat_ref.substr(prev_end, cur_end - prev_end);
-                core_seqs[i].convert_to_ascii(buffer);
-                std::string actual(buffer);
-
-                INFO("Spanning seq ", i, " prev_end=", prev_end,
-                     " cur_end=", cur_end, " frag1_end=", frag1_end,
-                     " frag2_end=", frag2_end);
-                CHECK_EQ(expected, actual);
-            }
-
-            prev_end = cur_end;
-        }
-
-        // We expect at least one sequence to span fragment boundaries with
-        // these test sequences
-        INFO("Total cores: ", lr.cores.size());
-        CHECK(found_spanning_seq);
-    }
+// Sequences of the segments a layout of the cleaned graph would write: the
+// input of the next pass.
+static gtl::vector<SequenceContainerType> collect_segments(
+    assembler &as, const unitig_graph &graph) {
+    gtl::vector<SequenceContainerType> segments;
+    layout_graph_emit::build_merged_graph(
+        as, graph, "Segment collection",
+        [&](const layout_graph_emit::supernode_vec &supernodes,
+            const layout_graph_emit::edge_map &) {
+            segments = layout_graph_emit::segment_sequences(supernodes,
+                                                            as.threads.work);
+        });
+    return segments;
 }
 
-TEST_CASE(
-    "CrumbledSubSeq64 iterator-range constructor concatenates represented "
-    "sequence") {
-    const char *src = "TTTTACGTACGTGGGGCCAAATTTCCGG";
-    gtl::vector<SequenceContainerType> frags;
-    frags.emplace_back(src, 3, 9, 101, SequenceContainerType::from_ascii{});
-    frags.emplace_back(src, 10, 18, 102, SequenceContainerType::from_ascii{});
-    frags.emplace_back(src, 20, 27, 103, SequenceContainerType::from_ascii{});
+// --multipass driver. Pass p uses the stages of a single pass at its own LCP
+// level and lcmer length: reads into a fresh graph (construct_dbg), then the
+// previous pass's segments as seeded windows (insert_segments), edge counts,
+// cleaning and layout. Earlier passes keep only their segments and free
+// their graph; the last pass writes the outputs.
+static int run_passes(const asm_config &cfg) {
+    if (!prepare_run(cfg)) return 1;
 
-    auto to_ascii = [](const SequenceContainerType &s) {
-        std::string out;
-        out.resize(s.len);
-        if (!out.empty()) {
-            s.convert_to_ascii(out.data());
+    INIT_TIMERS(HIFI_ASSEMBLY);
+    INIT_TIMERS(MULTIPASS);
+
+    assembler as(cfg);
+    const std::vector<pass_params> &passes = cfg.multipass;
+    const size_t n = passes.size();
+    // The previous pass's segments: the only data kept between passes.
+    gtl::vector<SequenceContainerType> segments;
+    for (size_t p = 0; p < n; ++p) {
+        const bool last = p + 1 == n;
+        as.lcp_level = passes[p].lcp_level;
+        as.lcmer_l = passes[p].lcmer_l;
+        if (!cfg.silent)
+            fprintf(stderr,
+                    "[multipass] pass %zu/%zu: level %d, window %d, seeding "
+                    "%zu segments (%zu bp, both strands)\n",
+                    p + 1, n, as.lcp_level, as.lcmer_l, segments.size(),
+                    total_bases(segments));
+        // A fresh index (map and Bloom filter) per pass.
+        auto graph = std::make_unique<dbg_index>(cfg.bloom.false_positive_rate,
+                                                 filter_entries(cfg), cfg.seed);
+        dbg_index &dbg = *graph;
+        if (auto r = as.construct_dbg(dbg); !r) {
+            fprintf(stderr, "%s Terminating.\n", r.error().c_str());
+            return 1;
         }
-        return out;
-    };
+        IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                           "DBG construction");
 
-    SUBCASE("full range") {
-        SequenceContainerType merged(frags.begin(), frags.end());
-        const std::string expected = std::string(src + 3, 9 - 3) +
-                                     std::string(src + 10, 18 - 10) +
-                                     std::string(src + 20, 27 - 20);
-        CHECK_EQ(merged.len, expected.size());
-        CHECK_EQ(to_ascii(merged), expected);
-        CHECK_EQ(merged.skip_first_n, 0);
-        CHECK_EQ(merged.origin_node, 103);
-    }
+        if (!segments.empty()) {
+            const auto [chunks, windows] = as.insert_segments(dbg, segments);
+            gtl::vector<SequenceContainerType>().swap(segments);
+            IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                               "Segment seeding (%zu chunks, %zu windows)",
+                               chunks, windows);
+        }
 
-    SUBCASE("sub range") {
-        SequenceContainerType merged(frags.begin() + 1, frags.end());
-        const std::string expected =
-            std::string(src + 10, 18 - 10) + std::string(src + 20, 27 - 20);
-        CHECK_EQ(merged.len, expected.size());
-        CHECK_EQ(to_ascii(merged), expected);
-        CHECK_EQ(merged.origin_node, 103);
-    }
+        dbg.count_forward_edges(cfg.threads.work);
+        IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                           "Count forward edges");
 
-    SUBCASE("empty range") {
-        SequenceContainerType merged(frags.begin(), frags.begin());
-        CHECK_EQ(merged.len, 0);
-        CHECK_EQ(merged.skip_first_n, 0);
-        CHECK_EQ(merged.origin_node, 0);
+        if (last && cfg.print_precleanup_graph) {
+            if (!dump_dbg(cfg.output + ".raw.gfa", dbg)) return 1;
+            IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                               "DBG printing");
+        }
+
+        GraphCleaning::run(dbg, cfg);
+        IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                           "Graph cleaning");
+
+        if (last && cfg.print_prelayout_graph &&
+            !dump_dbg(cfg.output + ".bi.gfa", dbg)) {
+            return 1;
+        }
+        auto unitigs = compact_graph(std::move(graph), cfg.threads.work);
+        IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                           "Graph compaction");
+
+        if (!last) {
+            segments = collect_segments(as, *unitigs);
+            unitigs->clear_parallel(cfg.threads.work);
+            unitigs.reset();
+#if defined(__GLIBC__)
+            // Return the freed pass graph to the OS; glibc otherwise keeps
+            // most of it in its arenas while the next pass runs.
+            malloc_trim(0);
+#endif
+            IF_TIME_CHECKPOINT(!cfg.silent, MULTIPASS, stderr,
+                               "pass %zu/%zu (%d:%d) done", p + 1, n,
+                               as.lcp_level, as.lcmer_l);
+            if (!cfg.silent)
+                fprintf(stderr,
+                        "[multipass] pass %zu/%zu: %zu segments (%zu bp) kept "
+                        "for the next pass\n",
+                        p + 1, n, segments.size(), total_bases(segments));
+            continue;
+        }
+
+        if (!write_output_gfa(cfg, as, *unitigs)) return 1;
+        IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr,
+                           "Merged/Printed");
+        IF_TIME_CHECKPOINT(!cfg.silent, MULTIPASS, stderr,
+                           "pass %zu/%zu (%d:%d) done", p + 1, n, as.lcp_level,
+                           as.lcmer_l);
+        if (!cfg.silent)
+            fprintf(stderr, "[multipass] pass %zu/%zu: output written\n", p + 1,
+                    n);
+        // The last graph is never torn down: the process exits once the GFA
+        // is written, so teardown is pure overhead.
+        (void)unitigs.release();
     }
+    return 0;
 }

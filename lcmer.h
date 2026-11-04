@@ -1,23 +1,27 @@
 #pragma once
-#include <cstdint>
+#if defined(__SSSE3__)
+#include <tmmintrin.h>
+#endif
 
-#include "nibble2base.hpp"
 #ifndef LCMER_H
 #define LCMER_H
-#include <htslib/sam.h>
+#include <stdint.h>
 
 #include <algorithm>
-#include <array>
 #include <bit>
 #include <cstring>
 #include <gtl/vector.hpp>
 #include <iterator>
-#include <string>
 #include <type_traits>
 
-#include "ext/lcptools/lcptools_ho.h"
+#include "kmer_lcp.h"
 #include "nibble2base.hpp"
+#include "nt16.h"
+#include "syncmer.h"
 using SequenceContainerType = CrumbledSubSeq64;
+// The fragments of one sequence, in order, wherever they are stored (a node's
+// fragment list, a layout's vector).
+using fragment_span = std::span<const SequenceContainerType>;
 
 // Makes sure we have enough scratch space
 template <class T, double GF = 2, size_t ALIGN_BLOCK_BITS = 5>
@@ -54,160 +58,13 @@ struct charsi_base {
             free(data);
             size_t target_cap = capacity * sizeof(T);
             target_cap = (target_cap | align_block_mask) + 1;
-            data = (decltype(data))std::aligned_alloc(32, target_cap);
+            data = (decltype(data))aligned_alloc(32, target_cap);
         }
         return data == NULL;
     }
 };
 using charsi = charsi_base<uint8_t, 2.0, 5>;
 using pos_scratch = charsi_base<uint32_t, 2.0, 5>;
-int onehotto2bitDNA2(const uint8_t *data, char *ret);
-struct sv {
-    char *from;
-    char *to;
-    sv() : from(0), to(0) {}
-    sv(char *from, char *to) : from(from), to(to) {}
-
-    void expand_until(char c) {
-        while (*to != 0 && *to != c) {
-            to++;
-        }
-    }
-    void skip_next(char c) {
-        expand_until(c);
-        if (*to) ++to;
-        from = to;
-    }
-    template <int N, char DEL>
-    void get() {
-        for (int i = 0; i < N; ++i) {
-            skip_next(DEL);
-        }
-        expand_until(DEL);
-    }
-    // operator std::string() { return {from, to}; }
-};
-
-struct lcp_read {
-    gtl::vector<uint32_t> cores;
-    gtl::vector<std::pair<uint32_t, uint32_t>> pos;
-    const uint8_t *data;
-    void reserve(size_t size) {
-        cores.reserve(size);
-        pos.reserve(size);
-    }
-    void clear() {
-        cores.clear();
-        pos.clear();
-        data = NULL;
-    }
-};
-
-template <int N>
-struct lcmer {
-    // static uint32_t MaskedMurmur3(const std::array<uint32_t, N> &key,
-    //                               uint32_t seed) {
-    //     //        const uint8_t *data = (const uint8_t *)key;
-
-    //     uint32_t h1 = seed;
-
-    //     const uint32_t c1 = 0xcc9e2d51;
-    //     const uint32_t c2 = 0x1b873593;
-
-    //     // Body: Process blocks of 4 bytes at a time
-    //     const uint32_t *blocks = key.data() + N;
-
-    //     for (int i = -N; i; i++) {
-    //         uint32_t k1 = lcmer<N>::mask[i + N] ? blocks[i] : 0;
-
-    //         k1 *= c1;
-    //         k1 = (k1 << 15) | (k1 >> (32 - 15));
-    //         k1 *= c2;
-
-    //         h1 ^= k1;
-    //         h1 = (h1 << 15) | (h1 >> (32 - 15));
-    //         h1 = h1 * 5 + 0xe6546b64;
-    //     }
-    //     // Finalization: Mix the hash to ensure the last few bits are fully
-    //     // mixed
-    //     // h1 ^= (N*4);
-
-    //     /* fmix32 */
-    //     h1 ^= h1 >> 16;
-    //     h1 *= 0x85ebca6b;
-    //     h1 ^= h1 >> 13;
-    //     h1 *= 0xc2b2ae35;
-    //     h1 ^= h1 >> 16;
-    //     return h1;
-    // }
-    static constexpr size_t size = N;
-    std::array<uint32_t, N> data;
-
-    lcmer() {}
-    lcmer(const lcmer<N> &other) {
-        memcpy(this->data.data(), other.data.data(), N * sizeof(uint32_t));
-    }
-    lcmer(std::forward_iterator auto it) {
-        std::copy(it, it + N, std::begin(data));
-    }
-
-    lcmer<N> operator=(const lcmer<N> &other) {
-        memcpy(this->data.data(), other.data.data(), N * sizeof(uint32_t));
-        return *this;
-    }
-    bool operator==(const lcmer &other) const {
-        return memcmp(data.data(), other.data.data(), N * sizeof(uint32_t)) ==
-               0;
-        // for (int i = 0; i < N; ++i) {
-        //     if (data[i] != other.data[i]) return false;
-        // }
-        // return true;
-    }
-    bool operator<(const lcmer &other) const {
-        for (int i = 0; i < N; ++i) {
-            if (data[i] != other.data[i]) {
-                if (data[i] < other.data[i]) {
-                    return true;
-                } else {
-                    return false;
-                }
-            }
-        }
-        return false;
-    }
-    void print_name(FILE *out) const {
-        fprintf(out, "%0x", data[0]);
-        for (int z = 1; z < N; ++z) {
-            fprintf(out, "%0x", data[z]);
-        }
-    }
-
-    void set0(uint32_t new_core) { data[N - 1] = new_core; }
-    void setN(uint32_t new_core) { data[0] = new_core; }
-    static lcmer<N> left_shift(lcmer<N> l) {
-        for (int i = 1; i < N; ++i) {
-            l.data[i - 1] = l.data[i];
-        }
-        return l;
-    }
-
-    static lcmer<N> right_shift(lcmer<N> l) {
-        for (int i = N - 1; i > 0; --i) {
-            l.data[i] = l.data[i - 1];
-        }
-        return l;
-    }
-
-    uint32_t update_lcmer(uint32_t new_core,
-                          [[maybe_unused]] uint32_t outcore) {
-        uint32_t old_core = data[0];
-        for (int i = 1; i < N; ++i) {
-            data[i - 1] = data[i];
-        }
-        data[N - 1] = new_core;
-        return old_core;
-    }
-};
 
 struct litecmer {
     struct words_t {
@@ -239,11 +96,6 @@ struct litecmer {
         return *this;
     }
 
-    constexpr uint32_t hi() const { return words.hi; }
-    constexpr uint32_t lo() const { return words.lo; }
-    constexpr uint64_t native_bitcast_value() const {
-        return std::bit_cast<uint64_t>(words);
-    }
     constexpr uint64_t value() const {
         return (static_cast<uint64_t>(words.hi) << 32) |
                static_cast<uint64_t>(words.lo);
@@ -257,27 +109,8 @@ struct litecmer {
         return out;
     }
 
-    static litecmer make_poly(std::forward_iterator auto it, int n) {
-        return litecmer(it, n);
-    }
-
-    static litecmer make_xor(std::forward_iterator auto it, int n) {
-        litecmer l;
-        for (int i = 0; i < n - 1; ++i) {
-            l.words.hi ^= *(it++);
-        }
-        l.words.lo = *it;
-        return l;
-    }
-
-    void update_lcmer_xor(uint32_t new_core, uint32_t out_core) {
-        words.hi ^= words.lo;
-        words.hi ^= out_core;
-        words.lo = new_core;
-    }
-
     // Order-sensitive rolling update for first N-1 cores.
-    // Requires state initialized by make_poly().
+    // Requires state initialized by the iterator constructor.
     void update_lcmer_poly(uint32_t new_core, uint32_t out_core, int n) {
         if (n > 1) {
             const uint32_t kOutMul = poly_pow(kPolyBase, n - 2);
@@ -302,19 +135,6 @@ struct litecmer {
 };
 using LCmer = litecmer;
 
-template <int N>
-struct combined_lcmer {
-    lcmer<N> full;
-    litecmer lite;
-
-    combined_lcmer(std::forward_iterator auto it) : full(it), lite(it, N) {}
-
-    void update_lcmer(uint32_t new_core, uint32_t out_core) {
-        full.update_lcmer(new_core, out_core);
-        lite.update_lcmer(new_core, out_core, N);
-    }
-};
-
 template <>
 struct std::hash<litecmer> {
     std::size_t operator()(const litecmer &l) const noexcept {
@@ -322,350 +142,27 @@ struct std::hash<litecmer> {
     }
 };
 
-template <int N>
-struct std::hash<lcmer<N>> {
-    std::size_t operator()(const lcmer<N> &l) const noexcept {
-        return MurmurHash3_32(&l.data, N * sizeof(uint32_t), 12312342);
-    }
-};
-
-template <typename INT_TYPE = uint32_t, INT_TYPE BIT_WIDTH = 2>
-struct KmerViewOnInts {
-    using int_type = INT_TYPE;
-    int_type k;
-    int_type KMASK;
-    int_type value;
-    uint8_t prev;
-
-    static constexpr INT_TYPE BIT_MASK = -1;
-    // static constexpr INT_TYPE BIT_MASK = ((INT_TYPE)1 << BIT_WIDTH) - 1;
-
-    KmerViewOnInts(int_type k)
-        : k{k},
-          KMASK{((int_type)1 << (BIT_WIDTH * k)) - 1},
-          value{0},
-          prev{0xff} {}
-
-    int fill(const uint8_t *data_address) {
-        int_type i;
-        for (i = 0; i < k; i++) {
-            move_get(data_address, i);
-        }
-        return i;
-    }
-
-    int fill_rle(const uint8_t *data_address, int_type cap) {
-        int_type i;
-        prev = 0xff;
-        int_type it = move_get_rle(data_address, 0, cap);
-        for (i = 0; i < k && it < cap; i++) {
-            it = move_get_rle(data_address, it, cap);
-        }
-        return it;
-    }
-
-    int_type move_get(const uint8_t *data_address, int_type index) {
-        value <<= BIT_WIDTH;
-        value &= KMASK;
-        value |= (data_address[index] & BIT_MASK);
-        return index + 1;
-    }
-
-    int_type move_get_rle2(uint8_t prev, const uint8_t *data_address,
-                           int_type index, int_type cap) {
-        while (index < cap && prev == data_address[index]) {
-            index++;
-        }
-        value <<= BIT_WIDTH;
-        value &= KMASK;
-        value |= (data_address[index] & BIT_MASK);
-        return index + 1;
-    }
-
-    int_type move_get_rle(const uint8_t *data_address, int_type index,
-                          int_type cap) {
-        const uint8_t *p = data_address + index;
-        const uint8_t *const end = data_address + cap;
-
-        while (p < end && *p == prev) {
-            ++p;
-        }
-        if (p == end) {
-            return cap;
-        }
-        prev = *p;
-        value = ((value << BIT_WIDTH) & KMASK) | (*p & BIT_MASK);
-        return static_cast<int_type>((p - data_address) + 1);
-    }
-    constexpr int_type get() const noexcept { return value; }
-};
-
-template <class INT_TYPE = uint32_t>
-struct KmerViewOnCrumbs {
-    using int_type = INT_TYPE;
-    int_type k;
-    int_type kmask;
-    int_type value;
-    uint8_t prev;
-    static constexpr uint8_t mask = 3U;
-    KmerViewOnCrumbs(int_type k)
-        : k{k}, kmask{((int_type)1 << (2 * k)) - 1}, value{0}, prev{255} {}
-
-    int fill_rle(const uint8_t *data_address, int_type cap) {
-        int_type i;
-        int_type it = move_get_rle(data_address, 0, cap);
-        for (i = 0; i < k && it < cap; i++) {
-            it = move_get_rle(data_address, it, cap);
-        }
-        return it;
-    }
-
-    int_type move_get_rle(const uint8_t *data_address, int_type index,
-                          int_type cap) {
-        size_t byte_idx = index / 4;
-        size_t crum_idx = index % 4;
-        uint8_t at = (data_address[byte_idx] >> (crum_idx * 2)) & mask;
-        while (index < cap && at == prev) {
-            ++index;
-            byte_idx = index / 4;
-            crum_idx = index % 4;
-            at = (data_address[byte_idx] >> (crum_idx * 2)) & mask;
-        }
-        if (index == cap) {
-            return index;
-        }
-        value = ((value << 2) & kmask) | at;
-        prev = at;
-        return index + 1;
-    }
-    constexpr int_type get() const noexcept { return value; }
-};
-
-// Crumb view for 64-bit packed sequences (2 bits/base, 32 bases/word).
-template <class INT_TYPE = uint64_t>
-struct KmerViewOnCrumbs64 {
-    using int_type = INT_TYPE;
-    int_type k;
-    int_type kmask;
-    int_type value;
-    uint8_t prev;
-    static constexpr uint8_t mask = 3U;
-
-    KmerViewOnCrumbs64(int_type k)
-        : k{k}, kmask{((int_type)1 << (2 * k)) - 1}, value{0}, prev{255} {}
-
-    static inline uint8_t base_at(const uint64_t *data_words, size_t index) {
-        const size_t bit_index = index * 2;
-        return static_cast<uint8_t>(
-            (data_words[bit_index >> 6] >> (bit_index & 63)) & mask);
-    }
-
-    int fill_rle(const uint64_t *data_words, int_type cap,
-                 int_type skip_first_n) {
-        int_type i;
-        int_type it = move_get_rle(data_words, skip_first_n, cap);
-        for (i = 0; i < k && it < cap; i++) {
-            it = move_get_rle(data_words, it, cap);
-        }
-        return it;
-    }
-
-    int_type move_get_rle(const uint64_t *data_words, int_type index,
-                          int_type cap) {
-        uint8_t at = base_at(data_words, index);
-        while (index < cap && at == prev) {
-            ++index;
-            if (index == cap) {
-                break;
-            }
-            at = base_at(data_words, index);
-        }
-        if (index == cap) {
-            return index;
-        }
-        value = ((value << 2) & kmask) | at;
-        prev = at;
-        return index + 1;
-    }
-    constexpr int_type get() const noexcept { return value; }
-    char *to_string() const {
-        static const char *lut = "ACGT";
-        char *buffer = malloc(k + 1);
-        for (int i = 0; i < k; i++) {
-            buffer[i] = lut[(value >> (2 * (k - i - 1))) & 3];
-        }
-        buffer[k] = '\0';
-        return buffer;
-    }
-};
-
-template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
-struct KmerViewOnNibbles {
-    static constexpr int tab[] = {4, 0, 1, 4, 2, 4, 4, 4,
-                                  3, 4, 4, 4, 4, 4, 4, 4};
-
-    using int_type = INT_TYPE;
-    static constexpr int k = _K;
-    int_type value;
-    static constexpr int_type KMASK = ((int_type)1 << (BIT_WIDTH * k)) - 1;
-    KmerViewOnNibbles() : value{0} {}
-
-    int fill(const uint8_t *data_address) {
-        int i;
-        for (i = 0; i < k; i++) {
-            move_get(data_address, i);
-        }
-        return i;
-    }
-    int_type move_get(const uint8_t *data_address, int index) {
-        value <<= BIT_WIDTH;
-        if constexpr (KMASK != -1) value &= KMASK;
-        if constexpr (BIT_WIDTH == 2) {
-            value |= tab[bam_seqi(data_address, index)];
-        } else {
-            value |= bam_seqi(data_address, index);
-        }
-        return value;
-    }
-
-    constexpr int_type get() const noexcept { return value; }
-};
-
-template <int _K, typename INT_TYPE = uint32_t, int BIT_WIDTH = 2>
-struct KmerViewOnBytes {
-    static constexpr const int tab[256] = {
-        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 4, 1, 4,
-        4, 4, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 4, 4, 4, 4, 4, 4,
-        4, 4, 4, 4, 4, 0, 4, 1, 4, 4, 4, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-        4, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4};
-
-    using int_type = INT_TYPE;
-    static constexpr int k = _K;
-    int_type value;
-    static constexpr int_type KMASK = ((int_type)1 << (BIT_WIDTH * k)) - 1;
-    KmerViewOnBytes() : value{0} {}
-
-    int fill(const char *data) {
-        int i;
-        for (i = 0; i < k; i++) {
-            move_get(data, i);
-        }
-        return i;
-    }
-    int_type move_get(const char *data, int index) {
-        value <<= BIT_WIDTH;
-        if constexpr (KMASK != -1) value &= KMASK;
-        if constexpr (BIT_WIDTH == 2) {
-            value |= tab[static_cast<int>(data[index])];
-        } else {
-            value |= data[index];
-        }
-        return value;
-    }
-
-    constexpr int_type get() const noexcept { return value; }
-};
-
-void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
-                   uint64_t si, uint64_t ei);
-
-template <typename _T, int WIDTH = 2>
-void init_core_kmer(struct core *cr, _T Kval, uint64_t si, uint64_t ei, int k) {
-    cr->start = si;
-    cr->end = ei;
-    cr->label = 0;
-    cr->label |= Kval;
-    cr->bit_size = WIDTH * k;
-    cr->bit_rep = uint128_t{0x8000000000000000, cr->label};
-}
-
-template <typename _T>
-void init_core_kmer_xor(struct core *cr, _T Kval, uint64_t si, uint64_t ei,
-                        int k) {
-    cr->start = si;
-    cr->end = ei;
-    cr->label = 0;
-    cr->label |= (Kval ^ reverse_complement_kmer(Kval, k));
-    cr->bit_rep = uint128_t{0x8000000000000000, cr->label};
-    cr->bit_size = 2 * k;
-}
-
-uint8_t *onehotto2bitDNA(const uint8_t *data, size_t len);
-// uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len);
-
-void onehotto2bitDNA_bivec_chs(const uint8_t *data, size_t len, charsi &c);
-void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len,
-                                       charsi &c);
-
-inline int64_t rle_compact(const uint8_t *data, int64_t len, uint8_t *rle_data,
-                           uint32_t *rle_pos) {
-    if (len <= 0) return 0;
-    rle_data[0] = data[0];
-    rle_pos[0] = 0;
-    int64_t out = 1;
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-    int64_t i = 1;
-    for (; i + 16 <= len; i += 16) {
-        uint8x16_t curr = vld1q_u8(data + i);
-        uint8x16_t prev = vld1q_u8(data + i - 1);
-        uint8x16_t neq = vmvnq_u8(vceqq_u8(curr, prev));
-        uint8x8_t narrowed = vshrn_n_u16(vreinterpretq_u16_u8(neq), 4);
-        uint64_t mask64 = vget_lane_u64(vreinterpret_u64_u8(narrowed), 0);
-        if (mask64 == 0) continue;
-        while (mask64) {
-            int nibble_idx = __builtin_ctzll(mask64) >> 2;
-            rle_data[out] = data[i + nibble_idx];
-            rle_pos[out] = static_cast<uint32_t>(i + nibble_idx);
-            ++out;
-            mask64 &= ~(0x0FULL << (nibble_idx * 4));
-        }
-    }
-    for (; i < len; ++i) {
-        if (data[i] != data[i - 1]) {
-            rle_data[out] = data[i];
-            rle_pos[out] = static_cast<uint32_t>(i);
-            ++out;
-        }
-    }
-#else
-    for (int64_t i = 1; i < len; ++i) {
-        if (data[i] != data[i - 1]) {
-            rle_data[out] = data[i];
-            rle_pos[out] = static_cast<uint32_t>(i);
-            ++out;
-        }
-    }
-#endif
-    return out;
-}
-
-// Fused BAM one-hot decode + RLE compaction in a single pass.
-// Input: raw BAM 4-bit encoded data (2 bases per byte), length in bases.
-// Output: rle_data/rle_pos filled with RLE-compacted 2-bit bases.
+// Fused nt16 one-hot decode + RLE compaction in a single pass.
+// Input: packed nt16 nibbles (2 bases per byte, as the BAM and FASTX readers
+// produce), length in bases.
+// Output: rle_data/rle_pos filled with RLE-compacted 2-bit bases. Runs are
+// split on the one-hot nibble and decoded through kOnehotDecode (anything
+// but A/C/G/T, e.g. N, decodes as A) identically on every path.
+// The SIMD paths store whole vectors past the last written entry: callers
+// must provide len + kOnehotRlePad writable entries in rle_data and rle_pos.
+inline constexpr int64_t kOnehotRlePad = 32;
+inline constexpr uint8_t kOnehotDecode[16] = {0, 0, 1, 0, 2, 0, 0, 0,
+                                              3, 0, 0, 0, 0, 0, 0, 0};
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 // Binary reduction: compact 16 one-hot bytes into contiguous packed output.
-//
-// Each input byte is either 0 (dead/unchanged) or (lane_idx << 4) |
-// one_hot_value. One-hot values {1,2,4,8} fit in the low nibble; lane index
-// 0-15 in the high nibble.
-//
-// The reduction merges adjacent pairs in 3 rounds (16→8→4→2), packing kept
-// bytes contiguously using widen + variable-shift + OR. Because one-hot values
-// occupy distinct bit positions within their nibble, OR never causes collision.
-//
-// After 3 rounds: two uint64 values, each holding up to 8 packed bytes from the
-// LSB. Unpack: extract index (>>4) and value (&0xF), decode one-hot→2-bit,
-// store via NEON.
+// Each byte is 0 (unchanged) or (lane_idx << 4) | one_hot_value, one-hot
+// {1,2,4,8} in the low nibble, lane 0-15 in the high nibble. Merge adjacent
+// pairs in 3 rounds (16→8→4→2) via widen + variable-shift + OR, yielding two
+// uint64 of up to 8 packed bytes each; unpack index (>>4) and value (&0xF),
+// decode one-hot→2-bit, store via NEON.
 static inline int compact16_emit(
-    uint8x16_t data_vec,             // 16 one-hot bytes (BAM nibble values)
+    uint8x16_t data_vec,             // 16 one-hot bytes (nt16 nibble values)
     uint8x16_t neq_vec,              // 0xFF where changed, 0x00 where same
     const uint8x16_t &idx_template,  // precomputed (i<<4) for i=0..15
     const uint8x16_t &decode_tbl,    // one-hot→2-bit decode table (16 entries)
@@ -674,8 +171,12 @@ static inline int compact16_emit(
     uint32_t pos_base  // position offset for this half (chunk_start or +16)
 ) {
     // Build combined byte per lane: (lane_idx << 4) | value for changed, 0 for
-    // unchanged.
-    uint8x16_t live = vandq_u8(data_vec, neq_vec);
+    // unchanged. A changed lane 0 of nibble 0 would pack to 0 as well; nibble
+    // 15 decodes the same, so the value packs as that instead.
+    const uint8x16_t zero_nibble = vceqq_u8(data_vec, vdupq_n_u8(0));
+    const uint8x16_t value =
+        vorrq_u8(data_vec, vandq_u8(zero_nibble, vdupq_n_u8(0x0F)));
+    uint8x16_t live = vandq_u8(value, neq_vec);
     uint8x16_t combined = vorrq_u8(live, vandq_u8(neq_vec, idx_template));
 
     // --- Round 1: 16 bytes → 8 uint16 (merge adjacent pairs) ---
@@ -753,23 +254,103 @@ static inline int compact16_emit(
 
     return n_total;
 }
+#elif defined(__SSSE3__)
+// Left-pack table: for an 8-bit lane mask m, idx[m] lists the set lanes in
+// ascending order, padded with 0x80 (pshufb writes 0 for those lanes).
+struct onehot_left_pack_table {
+    uint8_t idx[256][8];
+    constexpr onehot_left_pack_table() : idx{} {
+        for (int m = 0; m < 256; ++m) {
+            int n = 0;
+            for (int lane = 0; lane < 8; ++lane) {
+                if (m & (1 << lane)) idx[m][n++] = static_cast<uint8_t>(lane);
+            }
+            while (n < 8) idx[m][n++] = 0x80;
+        }
+    }
+};
+inline constexpr onehot_left_pack_table kOnehotLeftPack{};
+
+// Emits the run starts among 16 bases without a per-run loop. d: one-hot
+// bytes; mask bit i set = lane i starts a run. Each 8-lane half is packed
+// by one pshufb whose control bytes are also the lanes' indices, so the
+// same control, widened, gives the positions. Stores are unconditional
+// (up to 16 entries past the returned count).
+static inline int onehot_emit16(__m128i d, unsigned mask,
+                                const __m128i &decode_tbl, uint8_t *rle_data,
+                                uint32_t *rle_pos, uint32_t pos_base) {
+    const unsigned m_lo = mask & 0xFF, m_hi = mask >> 8;
+    const int c_lo = std::popcount(m_lo);
+    uint64_t lo_idx, hi_idx;
+    std::memcpy(&lo_idx, kOnehotLeftPack.idx[m_lo], 8);
+    std::memcpy(&hi_idx, kOnehotLeftPack.idx[m_hi], 8);
+    // High half lanes are 8..15; 0x80 padding stays >= 0x80 after the add.
+    const __m128i ctrl =
+        _mm_set_epi64x(static_cast<long long>(hi_idx + 0x0808080808080808ULL),
+                       static_cast<long long>(lo_idx));
+    const __m128i codes =
+        _mm_shuffle_epi8(decode_tbl, _mm_and_si128(d, _mm_set1_epi8(0x0F)));
+    const __m128i packed = _mm_shuffle_epi8(codes, ctrl);
+    _mm_storel_epi64(reinterpret_cast<__m128i *>(rle_data), packed);
+    _mm_storel_epi64(reinterpret_cast<__m128i *>(rle_data + c_lo),
+                     _mm_srli_si128(packed, 8));
+#if defined(__AVX2__)
+    const __m256i base = _mm256_set1_epi32(static_cast<int>(pos_base));
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(rle_pos),
+                        _mm256_add_epi32(_mm256_cvtepu8_epi32(ctrl), base));
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i *>(rle_pos + c_lo),
+        _mm256_add_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(ctrl, 8)), base));
+#else
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i base = _mm_set1_epi32(static_cast<int>(pos_base));
+    const __m128i w_lo = _mm_unpacklo_epi8(ctrl, zero);  // 8 x u16
+    const __m128i w_hi = _mm_unpackhi_epi8(ctrl, zero);
+    auto store4 = [&](uint32_t *dst, __m128i v) {
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(dst),
+                         _mm_add_epi32(v, base));
+    };
+    store4(rle_pos, _mm_unpacklo_epi16(w_lo, zero));
+    store4(rle_pos + 4, _mm_unpackhi_epi16(w_lo, zero));
+    store4(rle_pos + c_lo, _mm_unpacklo_epi16(w_hi, zero));
+    store4(rle_pos + c_lo + 4, _mm_unpackhi_epi16(w_hi, zero));
 #endif
+    return c_lo + std::popcount(m_hi);
+}
+#endif
+
+// Scalar RLE of bases [from, len): `prev` is the one-hot nibble of base
+// from - 1. Shared by every path for the tail and as the portable fallback.
+static inline int64_t onehot_to_rle_scalar(const uint8_t *data, int64_t len,
+                                           int64_t from, uint8_t prev,
+                                           uint8_t *rle_data, uint32_t *rle_pos,
+                                           int64_t out) {
+    for (int64_t i = from; i < len; ++i) {
+        const uint8_t nib =
+            (i & 1) ? (data[i >> 1] & 0x0F) : (data[i >> 1] >> 4);
+        if (nib != prev) {
+            rle_data[out] = kOnehotDecode[nib];
+            rle_pos[out] = static_cast<uint32_t>(i);
+            ++out;
+        }
+        prev = nib;
+    }
+    return out;
+}
 
 inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
                              uint8_t *rle_data, uint32_t *rle_pos) {
     if (len <= 0) return 0;
 
-    static const uint8_t decode4_tbl_arr[16] = {0, 0, 1, 0, 2, 0, 0, 0,
-                                                3, 0, 0, 0, 0, 0, 0, 0};
-
-    // Decode and emit first base
-    rle_data[0] = decode4_tbl_arr[data[0] >> 4];
+    // Base 0 always starts a run.
+    rle_data[0] = kOnehotDecode[data[0] >> 4];
     rle_pos[0] = 0;
     int64_t out = 1;
+    int64_t byte_idx = 0;
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     const uint8x16_t lo_mask = vdupq_n_u8(0x0F);
-    const uint8x16_t decode_tbl = vld1q_u8(decode4_tbl_arr);
+    const uint8x16_t decode_tbl = vld1q_u8(kOnehotDecode);
 
     // Lane index template: high nibble = lane index, used to tag each base with
     // its position
@@ -781,11 +362,10 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
     // Track last one-hot value for cross-chunk comparison.
     // One-hot format: A=1, C=2, G=4, T=8.
     uint8x16_t prev_last = vdupq_n_u8(data[0] >> 4);
-    int64_t byte_idx = 0;
 
     // Each iteration processes 16 input bytes → 32 bases.
     for (; byte_idx + 16 <= len / 2; byte_idx += 16) {
-        // --- Phase 1: Unpack BAM nibbles to one-hot bytes (no decode) ---
+        // --- Phase 1: Unpack nt16 nibbles to one-hot bytes (no decode) ---
         uint8x16_t v = vld1q_u8(data + byte_idx);
         uint8x16_t hi = vshrq_n_u8(v, 4);      // high nibbles as bytes
         uint8x16_t lo = vandq_u8(v, lo_mask);  // low nibbles as bytes
@@ -822,318 +402,428 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
                                   static_cast<uint32_t>(chunk_start + 16));
         }
     }
+#elif defined(__SSSE3__)
+    const __m128i lo_mask = _mm_set1_epi8(0x0F);
+    const __m128i decode_tbl =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(kOnehotDecode));
+    // Last one-hot base of the previous block, in lane 15.
+    __m128i prev_last = _mm_set1_epi8(static_cast<char>(data[0] >> 4));
 
-    // Scalar tail: remaining input bytes
-    for (; byte_idx < len / 2; ++byte_idx) {
-        uint8_t hi_base = 27 - std::countl_zero(static_cast<unsigned>(data[byte_idx]));
-        uint8_t lo_base = std::countr_zero(static_cast<unsigned>(data[byte_idx]));
-        int64_t hi_pos = byte_idx * 2;
-        int64_t lo_pos = byte_idx * 2 + 1;
-        if (hi_pos > 0) {
-            if (hi_base != rle_data[out - 1]) {
-                rle_data[out] = hi_base;
-                rle_pos[out] = static_cast<uint32_t>(hi_pos);
-                ++out;
-            }
-        }
-        if (lo_pos < len) {
-            if (lo_base != rle_data[out - 1]) {
-                rle_data[out] = lo_base;
-                rle_pos[out] = static_cast<uint32_t>(lo_pos);
-                ++out;
-            }
-        }
-    }
-    if (len % 2 == 1) {
-        uint8_t last_base = 27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
-        if (last_base != rle_data[out - 1]) {
-            rle_data[out] = last_base;
-            rle_pos[out] = static_cast<uint32_t>(len - 1);
-            ++out;
-        }
-    }
-#else
-    // Scalar fallback
-    for (int64_t byte_idx = 0; byte_idx < len / 2; ++byte_idx) {
-        uint8_t hi_base = 27 - std::countl_zero(static_cast<unsigned>(data[byte_idx]));
-        uint8_t lo_base = std::countr_zero(static_cast<unsigned>(data[byte_idx]));
-        int64_t hi_pos = byte_idx * 2;
-        int64_t lo_pos = byte_idx * 2 + 1;
-        if (hi_pos > 0 || byte_idx > 0) {  // skip base 0 (already emitted)
-            if (hi_base != rle_data[out - 1]) {
-                rle_data[out] = hi_base;
-                rle_pos[out] = static_cast<uint32_t>(hi_pos);
-                ++out;
-            }
-        }
-        if (lo_pos < len) {
-            if (lo_base != rle_data[out - 1]) {
-                rle_data[out] = lo_base;
-                rle_pos[out] = static_cast<uint32_t>(lo_pos);
-                ++out;
-            }
-        }
-    }
-    if (len % 2 == 1) {
-        uint8_t last_base = 27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
-        if (last_base != rle_data[out - 1]) {
-            rle_data[out] = last_base;
-            rle_pos[out] = static_cast<uint32_t>(len - 1);
-            ++out;
-        }
+    // Each iteration processes 16 input bytes → 32 bases.
+    for (; byte_idx + 16 <= len / 2; byte_idx += 16) {
+        // Unpack nt16 nibbles to one-hot bytes, bases [0..15] and [16..31].
+        const __m128i v =
+            _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + byte_idx));
+        const __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), lo_mask);
+        const __m128i lo = _mm_and_si128(v, lo_mask);
+        const __m128i d0 = _mm_unpacklo_epi8(hi, lo);
+        const __m128i d1 = _mm_unpackhi_epi8(hi, lo);
+        // Predecessor of each base; a lane starts a run if it differs.
+        const __m128i p0 = _mm_alignr_epi8(d0, prev_last, 15);
+        const __m128i p1 = _mm_alignr_epi8(d1, d0, 15);
+        prev_last = d1;
+        unsigned m0 = ~_mm_movemask_epi8(_mm_cmpeq_epi8(d0, p0)) & 0xFFFFu;
+        const unsigned m1 =
+            ~_mm_movemask_epi8(_mm_cmpeq_epi8(d1, p1)) & 0xFFFFu;
+        if (byte_idx == 0) m0 &= ~1u;  // base 0 was already emitted
+
+        const uint32_t chunk_start = static_cast<uint32_t>(byte_idx * 2);
+        out += onehot_emit16(d0, m0, decode_tbl, rle_data + out, rle_pos + out,
+                             chunk_start);
+        out += onehot_emit16(d1, m1, decode_tbl, rle_data + out, rle_pos + out,
+                             chunk_start + 16);
     }
 #endif
+    // Remaining bases (all of them without SIMD). The predecessor of base
+    // 2 * byte_idx is the low nibble of the previous byte.
+    const int64_t from = std::max<int64_t>(1, 2 * byte_idx);
+    const uint8_t prev =
+        (from & 1) ? (data[0] >> 4) : (data[byte_idx - 1] & 0x0F);
+    return onehot_to_rle_scalar(data, len, from, prev, rle_data, rle_pos, out);
+}
+
+// Packs 64 selection bytes (each 0 or 1) into a 64-bit mask, bit i = s[i].
+inline uint64_t sel_mask64(const uint8_t *s) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    // Shift byte i left by i % 8, then three pairwise-add levels sum each run
+    // of 8 bytes into one byte: byte j of the result holds bits 8j..8j+7.
+    const uint8x16x4_t v = vld1q_u8_x4(s);
+    static constexpr int8_t kShift[16] = {0, 1, 2, 3, 4, 5, 6, 7,
+                                          0, 1, 2, 3, 4, 5, 6, 7};
+    const int8x16_t sh = vld1q_s8(kShift);
+    const uint8x16_t p =
+        vpaddq_u8(vshlq_u8(v.val[0], sh), vshlq_u8(v.val[1], sh));
+    const uint8x16_t q =
+        vpaddq_u8(vshlq_u8(v.val[2], sh), vshlq_u8(v.val[3], sh));
+    const uint8x16_t r = vpaddq_u8(vpaddq_u8(p, q), vdupq_n_u8(0));
+    return vgetq_lane_u64(vreinterpretq_u64_u8(r), 0);
+#elif defined(__AVX2__)
+    // Shifting each 16-bit lane left by 7 moves bit 0 of every byte to its
+    // bit 7, which movemask collects.
+    auto half = [](const uint8_t *p) {
+        const __m256i v =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
+        return static_cast<uint32_t>(
+            _mm256_movemask_epi8(_mm256_slli_epi16(v, 7)));
+    };
+    return half(s) | (uint64_t{half(s + 32)} << 32);
+#elif defined(__SSE2__)
+    uint64_t mask = 0;
+    for (int b = 0; b < 4; ++b) {
+        const __m128i v =
+            _mm_loadu_si128(reinterpret_cast<const __m128i *>(s + 16 * b));
+        mask |= uint64_t{static_cast<uint32_t>(
+                    _mm_movemask_epi8(_mm_slli_epi16(v, 7)))}
+                << (16 * b);
+    }
+    return mask;
+#else
+    // 8 bytes of 0/1 → 8 bits via one multiply per word.
+    uint64_t mask = 0;
+    for (int b = 0; b < 8; ++b) {
+        uint64_t w;
+        std::memcpy(&w, s + 8 * b, sizeof w);
+        mask |= ((w * 0x0102040810204080ULL) >> 56) << (8 * b);
+    }
+    return mask;
+#endif
+}
+
+// Level-1 cores of an RLE stream into str (resets it): the selected k-mers.
+inline uint64_t parse1_rle_syncmers(const uint8_t *rle_data,
+                                    const uint32_t *rle_pos, int64_t rle_len,
+                                    int64_t seq_len, core_buf *str,
+                                    const auto &syncmer_functor) {
+    const auto k = syncmer_functor.k();
+    str->level = 1;
+    str->kmer_bits = 2 * static_cast<int>(k);
+    str->size = 0;
+    if (rle_len < k) return 0;
+
+    // Selection for every window at once, then emit only the selected ones:
+    // iterate set bits of a 64-window mask (sel_mask64); each k-mer code is 4
+    // loads of 4-symbol codes. A core spans its RLE-space k-mer (runs
+    // [e-k+1, e]) in original base coordinates: start of the first run up to
+    // the start of the next run.
+    thread_local syncmer::live_scratch scratch;
+    constexpr int64_t kBlock = 64;
+    scratch.require(static_cast<size_t>(rle_len + kBlock));
+    uint8_t *sel = scratch.sel.data();
+    std::memset(sel, 0, k - 1);
+    std::memset(sel + rle_len, 0, kBlock);
+    syncmer_functor.select_live(rle_data, rle_len, scratch);
+    const uint8_t *q = scratch.codes();
+    const uint32_t kmask = static_cast<uint32_t>((1ULL << (2 * k)) - 1);
+    // Room for exactly the selected k-mers (a fraction of the windows).
+    int64_t selected = 0;
+    for (int64_t base = 0; base < rle_len; base += kBlock)
+        selected += std::popcount(sel_mask64(sel + base));
+    str->reserve(selected);
+    int64_t core_index = 0;
+    uint32_t *label = str->label;
+    uint64_t *span = str->span;
+    for (int64_t base = 0; base < rle_len; base += kBlock) {
+        uint64_t mask = sel_mask64(sel + base);
+        while (mask) {
+            const int64_t e = base + std::countr_zero(mask);
+            mask &= mask - 1;
+            const uint32_t si = rle_pos[e - k + 1];
+            const uint32_t ei = (e + 1 < rle_len)
+                                    ? rle_pos[e + 1]
+                                    : static_cast<uint32_t>(seq_len);
+            label[core_index] = syncmer::live_code(q, e, kmask);
+            span[core_index] = si | static_cast<uint64_t>(ei) << 32;
+            core_index++;
+        }
+    }
+    str->size = core_index;
+    return core_index;
+}
+
+// Level-1 cores of bases [from, to) of the concatenated fragments, with
+// positions in whole-sequence coordinates: the RLE stream of the range is
+// windowed with the same code as the read path. A run is NOT restarted when
+// the next fragment begins with the run's base; the range's first run starts
+// at `from`, and a k-mer ending in its last run ends at `to`.
+inline uint64_t parse1_CrumbledSubSeqs_syncmers(fragment_span sseqs,
+                                                size_t from, size_t to,
+                                                core_buf *str,
+                                                const auto &syncmer_functor) {
+    if (sseqs.empty()) {
+        fprintf(stderr, "Error: Empty sequence list\n");
+        str->level = 1;
+        str->size = 0;
+        return 0;
+    }
+    const auto [rle_data, rle_pos] = str->rle_scratch(to - from);
+    int64_t rle_len = 0;
+    size_t l_so_far = 0;
+    uint8_t prev_base = 255;
+    for (const auto &s : sseqs) {
+        if (l_so_far >= to) break;
+        // [lo, hi): the part of this fragment inside the range.
+        const size_t lo = std::max(from, l_so_far) - l_so_far;
+        const size_t hi = std::min(to, l_so_far + s.len) - l_so_far;
+        for (size_t i = lo; i < hi; ++i) {
+            const uint8_t b = s.code(i);
+            if (b != prev_base) {
+                rle_data[rle_len] = b;
+                rle_pos[rle_len] = static_cast<uint32_t>(l_so_far + i);
+                ++rle_len;
+                prev_base = b;
+            }
+        }
+        l_so_far += s.len;
+    }
+    return parse1_rle_syncmers(rle_data, rle_pos, rle_len,
+                               static_cast<int64_t>(to), str, syncmer_functor);
+}
+
+// Level-1 cores of the whole concatenated fragments.
+inline void init_lps_crumbled(core_buf *str, fragment_span sseqs,
+                              const auto &syncmer_functor) {
+    size_t len = 0;
+    for (const auto &s : sseqs) len += s.len;
+    parse1_CrumbledSubSeqs_syncmers(sseqs, 0, len, str, syncmer_functor);
+}
+
+// Bases per window of lps_parse_crumbled. Windows bound the per-thread parse
+// buffers (tens of bytes per base) independently of the sequence length,
+// except where an exact periodic stretch longer than the window forces the
+// window to double until it covers the stretch; the whole-sequence parse
+// holds that stretch anyway. The window is large against the re-parsed
+// overlap (the context of a few final-level cores), so re-parsing stays a
+// small fraction of the work.
+inline constexpr uint64_t kLpsWindowBases = uint64_t{1} << 17;
+
+// Window start of a core that no later window can be anchored on.
+inline constexpr uint64_t kLpsNoReq = UINT64_MAX;
+
+// A window's cores, the caller's scratch, and the per-core req of
+// lps_deepen_window with that function's scratch, reused across the windows
+// of one lps_parse_crumbled.
+struct lps_window {
+    core_buf *cores;
+    gtl::vector<uint64_t> req, next_req;
+};
+
+// One deepening level on a window's cores. `w.cores` holds a run of
+// consecutive whole-parse cores; `left_open`: the run does not start the
+// sequence. core_buf::deepen gives lps_deepen1's cores for the same input
+// (DCT, then parse3's rules), so the argument below is parse3's.
+// - Right end: DCT compresses a core against its left neighbour, and parse3
+//   decides at position j from positions j-1..j+3 and the equal-core run
+//   after j. A decision that would need cores past the end is not taken
+//   (no LMAX in the last 3 positions, no RINT on a run that reaches the
+//   end) and nothing is taken after it, so the outputs of a prefix are a
+//   prefix of the outputs.
+// - Left end: position 0 is not compressed and is never a constituent, and
+//   only an LMAX at position 1 (parse3's begin) would read it; an SSEQ core
+//   is emitted only between two special cores. So the window can miss the
+//   whole parse's outputs before its first special core but emits no core
+//   the whole parse lacks: its outputs are again a run of consecutive
+//   whole-parse cores, and none is trimmed.
+// - req[i] is a window start that guarantees core i: a window starting
+//   there, or earlier, emits it if it reaches far enough right. Output i-1,
+//   if special, is decided at its first constituent first(i-1); if an SSEQ
+//   core, output i is special and decided after it. A window holding input
+//   core first(i-1) - 2 decides both at position 2 or later, where every
+//   decision is the whole parse's, so req[i] is that core's req.
+// Returns false when the parse ends (fewer than two cores).
+inline bool lps_deepen_window(lps_window &w, bool left_open) {
+    core_buf *s = w.cores;
+    const int64_t n = s->size;
+    s->deepen(s->level + 1);
+    // Below two cores, a level leaves none.
+    if (n < 2) return false;
+    const int64_t m = s->size;
+    w.next_req.resize(m);
+    for (int64_t i = 0; i < m; ++i) {
+        uint64_t r = 0;  // a window starting at the sequence start emits it
+        if (i > 0 && s->first(i - 1) >= 2) {
+            r = w.req[s->first(i - 1) - 2];
+        } else if (left_open) {
+            r = kLpsNoReq;
+        }
+        w.next_req[i] = r;
+    }
+    std::swap(w.req, w.next_req);
+    return true;
+}
+
+// Cores of bases [from, to) of `total`, deepened to `lcp_level` and trimmed
+// to those equal to the whole-sequence parse; req as in lps_deepen_window.
+// A level-1 core (an RLE k-mer) is exact unless its first run may be cut by
+// `from` or it ends at `to`; a window starting before it keeps it.
+inline void lps_parse_window(lps_window &w, fragment_span sseqs, uint64_t from,
+                             uint64_t to, uint64_t total,
+                             const auto &syncmer_functor, int lcp_level) {
+    const bool left_open = from > 0;
+    const bool right_open = to < total;
+    core_buf *win = w.cores;
+    parse1_CrumbledSubSeqs_syncmers(sseqs, from, to, win, syncmer_functor);
+    if (right_open && win->size > 0 && win->end(win->size - 1) == to)
+        --win->size;
+    if (left_open && win->size > 0 && win->start(0) == from) win->drop_first();
+    w.req.resize(win->size);
+    for (int64_t i = 0; i < win->size; ++i)
+        w.req[i] = std::max<uint64_t>(win->start(i), 1) - 1;
+    while (win->level < lcp_level && lps_deepen_window(w, left_open)) {
+    }
+}
+
+// Index of the first core after the anchor core (`label`, `pos`: start, end)
+// among a window's cores, or -1 when the window does not hold the anchor.
+inline int64_t lps_after_anchor(const core_buf *win, uint32_t label,
+                                std::pair<uint32_t, uint32_t> pos) {
+    int64_t i = 0;
+    while (i < win->size && win->start(i) < pos.first) ++i;
+    if (i < win->size && win->end(i) == pos.second && win->label[i] == label)
+        return i + 1;
+    return -1;
+}
+
+// Appends to `out` the level-`lcp_level` cores of the concatenated fragments,
+// equal to init_lps_crumbled + deepen on the whole sequence, parsed in
+// windows of `window` bases so `win`, the caller's scratch, does not grow with
+// the sequence. Each later window starts at the req of the last core
+// appended to `out`, so it parses that anchor core again and the two runs of
+// cores join there. A window that cannot reach past its anchor doubles until
+// it can.
+inline void lps_parse_crumbled(lcp_read &out, core_buf *win,
+                               fragment_span sseqs, const auto &syncmer_functor,
+                               int lcp_level,
+                               uint64_t window = kLpsWindowBases) {
+    uint64_t total = 0;
+    for (const auto &s : sseqs) total += s.len;
+    lps_window w{win, {}, {}};
+    const size_t out0 = out.cores.size();
+    uint64_t from = 0;
+    uint64_t extent = window;
+    for (;;) {
+        const uint64_t to = std::min(total, from + extent);
+        lps_parse_window(w, sseqs, from, to, total, syncmer_functor, lcp_level);
+        int64_t i = 0;
+        if (out.cores.size() > out0)
+            i = lps_after_anchor(win, out.cores.back(), out.pos.back());
+        if (i < 0 && to < total) {
+            extent *= 2;
+            continue;
+        }
+        if (i < 0) {
+            fprintf(stderr, "lps_parse_crumbled: windows do not join\n");
+            abort();
+        }
+        if (to == total) {
+            win->append_to(out, i, win->size);
+            break;
+        }
+        int64_t a = win->size - 1;
+        while (a >= i && w.req[a] == kLpsNoReq) --a;
+        if (a < i) {
+            extent *= 2;
+            continue;
+        }
+        win->append_to(out, i, a + 1);
+        // From the same start the window would repeat, holding nothing past a.
+        if (w.req[a] == from) {
+            extent *= 2;
+        } else {
+            extent = window;
+        }
+        from = w.req[a];
+    }
+}
+
+// Complement of a BAM nibble (A<->T, C<->G, anything else N).
+constexpr uint8_t nibble_complement(uint8_t n) {
+    constexpr uint8_t comp[16] = {15, 8,  4,  15, 2,  15, 15, 15,
+                                  1,  15, 15, 15, 15, 15, 15, 15};
+    return comp[n];
+}
+
+// Nonzero iff nibble n is not A, C, G or T, the nibbles with exactly one bit
+// set. Plain bit operations, so a scan of a whole read vectorizes.
+constexpr uint8_t non_acgt_bits(uint8_t n) {
+    return static_cast<uint8_t>((n & (n - 1)) | (n == 0));
+}
+
+// Whether any of len packed nibbles is not A, C, G or T.
+inline bool has_non_acgt(const uint8_t *nibbles, int64_t len) {
+    uint8_t other = 0;
+    for (int64_t i = 0; i < len / 2; ++i) {
+        other |=
+            non_acgt_bits(nibbles[i] >> 4) | non_acgt_bits(nibbles[i] & 0x0F);
+    }
+    if (len % 2 == 1) other |= non_acgt_bits(nibbles[len / 2] >> 4);
+    return other != 0;
+}
+
+// Turns the run-length stream onehot_to_rle wrote for `nibbles` (len bases,
+// rle_len runs) in place into the one it writes for their reverse complement,
+// and returns its run count. The runs come in reverse order, and the run that
+// ended at e starts at len - e. An A, C, G or T run's base b complements to
+// 3 - b. Every other nibble complements to N, which decodes as A, so such a
+// run's base is 0 and neighbouring runs of two such nibbles become one run.
+inline int64_t rle_reverse_complement(const uint8_t *nibbles, int64_t len,
+                                      uint8_t *rle_data, uint32_t *rle_pos,
+                                      int64_t rle_len) {
+    if (rle_len <= 0) return 0;
+    std::reverse(rle_data, rle_data + rle_len);
+    for (int64_t j = 0; j < rle_len; ++j) rle_data[j] ^= 3;
+    // Forward run i ends where run i + 1 starts: once rle_pos[1, rle_len) is
+    // reversed, reverse run j >= 1 starts at len - rle_pos[j].
+    std::reverse(rle_pos + 1, rle_pos + rle_len);
+    for (int64_t j = 1; j < rle_len; ++j) {
+        rle_pos[j] = static_cast<uint32_t>(len) - rle_pos[j];
+    }
+    if (!has_non_acgt(nibbles, len)) return rle_len;
+
+    // Some run is not A, C, G or T: its 3 - b is wrong, and it merges with a
+    // neighbouring such run.
+    int64_t out = 0;
+    bool prev_other = false;
+    for (int64_t j = 0; j < rle_len; ++j) {
+        // Reverse base rle_pos[j] complements forward base `at`, which is the
+        // high nibble of its byte when even.
+        const uint32_t at = static_cast<uint32_t>(len) - 1 - rle_pos[j];
+        const uint8_t nib = (nibbles[at >> 1] >> ((~at & 1u) << 2)) & 0x0F;
+        const bool other = non_acgt_bits(nib) != 0;
+        if (other && prev_other) continue;
+        rle_data[out] = rle_data[j];
+        if (other) rle_data[out] = kOnehotDecode[nibble_complement(nib)];
+        rle_pos[out] = rle_pos[j];
+        ++out;
+        prev_other = other;
+    }
     return out;
 }
 
-inline uint64_t parse1_bam_syncmers(const uint8_t *rle_data,
-                                    const uint32_t *rle_pos, int64_t rle_len,
-                                    struct lps *str,
-                                    const auto &syncmer_functor) {
-    const auto k = syncmer_functor.k();
-    if (rle_len < k) return 0;
-
-    if (str->capacity < rle_len * CONSTANT_FACTOR) {
-        str->capacity = 2 * rle_len * CONSTANT_FACTOR;
-        str->cores = (struct core *)realloc(
-            str->cores, (str->capacity) * sizeof(struct core));
-    }
-
-    uint64_t KMASK = ((uint64_t)1 << (2 * k)) - 1;
-    uint64_t value = 0;
-    for (int64_t i = 0; i < k; ++i) {
-        value = ((value << 2) & KMASK) | rle_data[i];
-    }
-
-    int core_index = 0;
-    auto *cores = str->cores;
-    for (int64_t i = k; i <= rle_len; ++i) {
-        if (syncmer_functor(value)) {
-            uint32_t pos = rle_pos[i - 1] + 1;
-            init_core_kmer<uint32_t>(&(cores[core_index]), value, pos, pos + k,
-                                     k);
-            core_index++;
-        }
-        if (i < rle_len) {
-            value = ((value << 2) & KMASK) | rle_data[i];
-        }
-    }
-    return core_index;
+// Cores of the run-length stream rle_data/rle_pos (rle_len runs of a len-base
+// sequence) at lcp_level, appended to lr.
+inline void parse_cores_from_rle(const uint8_t *rle_data,
+                                 const uint32_t *rle_pos, int64_t rle_len,
+                                 size_t len, int lcp_level, core_buf *str,
+                                 const auto &syncmer_functor, lcp_read &lr) {
+    parse1_rle_syncmers(rle_data, rle_pos, rle_len, static_cast<int64_t>(len),
+                        str, syncmer_functor);
+    str->deepen(lcp_level);
+    str->append_to(lr);
 }
 
-inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
-                                    struct lps *str,
-                                    const auto &syncmer_functor,
-                                    charsi &rle_buf, pos_scratch &pos_buf) {
-    rle_buf.require(len);
-    pos_buf.require(len);
-    int64_t rle_len = rle_compact(data, len, rle_buf.data, pos_buf.data);
-    return parse1_bam_syncmers(rle_buf.data, pos_buf.data, rle_len, str,
-                               syncmer_functor);
-}
-inline uint64_t parse1_CrumbledSubSeqs_syncmers(
-    const gtl::vector<SequenceContainerType> &sseqs, struct lps *str,
-    const auto &syncmer_functor) {
-    int core_index = 0;
-    if (sseqs.empty()) {
-        fprintf(stderr, "Error: Empty sequence list\n");
-        return core_index;
-    }
-    KmerViewOnCrumbs64<uint64_t> kmer_view{syncmer_functor.k()};
-    size_t it1 =
-        kmer_view.fill_rle(sseqs[0].data, sseqs[0].len + sseqs[0].skip_first_n,
-                           sseqs[0].skip_first_n);
-    size_t l_so_far = 0;
-    for (size_t i = 0; i < sseqs.size(); ++i) {
-        for (; it1 < sseqs[i].len + sseqs[i].skip_first_n;) {
-            if (syncmer_functor(kmer_view.get())) {
-                init_core_kmer<uint32_t>(&(str->cores[core_index]),
-                                         kmer_view.get(),
-                                         l_so_far + it1 - sseqs[i].skip_first_n,
-                                         l_so_far + it1 + syncmer_functor.k() -
-                                             sseqs[i].skip_first_n,
-                                         syncmer_functor.k());
-                core_index++;
-            }
-            it1 = kmer_view.move_get_rle(sseqs[i].data, it1,
-                                         sseqs[i].len + sseqs[i].skip_first_n);
-        }
-        if (sseqs.size() > i + 1) {
-            it1 = sseqs[i + 1].skip_first_n;
-        }
-        l_so_far += sseqs[i].len;
-    }
-    return core_index;
-}
-
-uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores);
-
-/// @brief Initializes an lps struct with a given sequence in the bam compressed
-// void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len);
-//
-inline void prepare_lps(lps *lps_ptr, size_t len) {
-    lps_ptr->level = 1;
-    if (lps_ptr->cores == nullptr) {
-        lps_ptr->size = 0;
-        lps_ptr->capacity = (len / CONSTANT_FACTOR);
-        lps_ptr->cores = (struct core *)malloc((len / CONSTANT_FACTOR) *
-                                               sizeof(struct core));
-    } else {
-        if (lps_ptr->capacity < len / CONSTANT_FACTOR) {
-            lps_ptr->capacity = len / CONSTANT_FACTOR;
-            lps_ptr->cores = (struct core *)realloc(
-                lps_ptr->cores, (len / CONSTANT_FACTOR) * sizeof(struct core));
-        }
-    }
-}
-inline void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len,
-                         const auto &syncmer_functor, charsi &rle_buf,
-                         pos_scratch &pos_buf) {
-    prepare_lps(lps_ptr, len);
-    lps_ptr->size = parse1_bam_syncmers(data, len, lps_ptr, syncmer_functor,
-                                        rle_buf, pos_buf);
-}
-
-inline void init_lps_crumbled(lps *lps_ptr,
-                              const gtl::vector<SequenceContainerType> &sseqs,
-                              const auto &syncmer_functor) {
-    size_t len = 0;
-
-    for (auto &sseq : sseqs) {
-        len += sseq.len;
-    }
-    prepare_lps(lps_ptr, len);
-    lps_ptr->size =
-        parse1_CrumbledSubSeqs_syncmers(sseqs, lps_ptr, syncmer_functor);
-    assert(lps_ptr->size < lps_ptr->capacity);
-}
-
-inline void parse_cores_from_bam_record(const uint8_t *data, size_t len,
-                                        int lcp_level, lps *str,
+// Cores of len packed nibbles, appended to lr. The run-length stream stays in
+// chs/pos_buf; returns its run count.
+inline int64_t parse_cores_from_nibbles(const uint8_t *data, size_t len,
+                                        int lcp_level, core_buf *str,
                                         const auto &syncmer_functor,
                                         charsi &chs, lcp_read &lr,
-                                        pos_scratch &pos_buf,
-                                        bool reversed = false) {
-    chs.require(len);
-    pos_buf.require(len);
-    prepare_lps(str, len);
-    if (reversed) {
-        onehotto2bitDNA_bivec_chs_reverse(data, len, chs);
-        str->size = parse1_bam_syncmers(chs.data, len, str, syncmer_functor,
-                                        chs, pos_buf);
-    } else {
-        int64_t rle_len = onehot_to_rle(data, len, chs.data, pos_buf.data);
-        str->size = parse1_bam_syncmers(chs.data, pos_buf.data, rle_len, str,
-                                        syncmer_functor);
-    }
-    lps_deepen(str, lcp_level);
-
-    for (int i = 0; i < str->size; ++i) {
-        lr.cores.emplace_back(str->cores[i].label);
-        lr.pos.emplace_back(str->cores[i].start, str->cores[i].end);
-    }
+                                        pos_scratch &pos_buf) {
+    chs.require(len + kOnehotRlePad);
+    pos_buf.require(len + kOnehotRlePad);
+    const int64_t rle_len = onehot_to_rle(data, len, chs.data, pos_buf.data);
+    parse_cores_from_rle(chs.data, pos_buf.data, rle_len, len, lcp_level, str,
+                         syncmer_functor, lr);
     lr.data = data;
+    return rle_len;
 }
-
-template <int lanes = 4>
-inline std::array<std::pair<uint8_t *, uint8_t *>, lanes> scalar_rlc(charsi &c1,
-                                                                     charsi &c2,
-                                                                     int len) {
-    int lane_len = len / 4;
-
-    uint8_t *rptrs[lanes + 1] = {
-        // TODO alignments
-        c1.data,
-        c1.data + lane_len,
-        c1.data + 2 * lane_len,
-        c1.data + 3 * lane_len,
-        c1.data + 4 * lane_len,
-    };
-    uint8_t *wptrs[lanes + 1] = {
-        c2.data,
-        c2.data + lane_len,
-        c2.data + 2 * lane_len,
-        c2.data + 3 * lane_len,
-        c2.data + 4 * lane_len,
-    };
-    uint8_t *endings[lanes] = {0, 0, 0, 0};
-    for (int l = 0; l < lanes; ++l) {
-        uint8_t *_from = rptrs[l];
-        uint8_t *_to = rptrs[l + 1];
-        uint8_t *writ = wptrs[l];
-        *writ = *_from;
-        for (uint8_t *it = _from + 1; it < _to; ++it) {
-            if (*it != *writ) {
-                ++writ;
-                *writ = *it;
-            }
-        }
-        endings[l] = writ;
-    }
-    return {
-        {wptrs[0], endings[0]},
-        {wptrs[1], endings[1]},
-        {wptrs[2], endings[2]},
-        {wptrs[3], endings[3]},
-    };
-}
-template <int lanes = 4>
-inline uint64_t parse1_bam_syncmer_with_lanes(
-    std::array<std::pair<uint8_t *, uint8_t *>, lanes> data, int64_t len,
-    struct lps *str, const auto &syncmer_functor) {
-    const auto k = syncmer_functor.k();
-
-    if (str->capacity < len * CONSTANT_FACTOR) {
-        str->capacity = 2 * len * CONSTANT_FACTOR;
-        str->cores = (struct core *)realloc(
-            str->cores, (str->capacity) * sizeof(struct core));
-    }
-    auto *cores = str->cores;
-    for (int l = 0; l < lanes; ++l) {
-        int core_index = 0;
-        KmerViewOnInts<uint64_t, 2> kmer_view{k};
-        int64_t it1 = [&data, len, l, k, &kmer_view]() {
-            if (l == 0) {
-                return kmer_view.fill(data[l].first,
-                                      len);  // Fill from beginning
-            } else {
-                return kmer_view.fill(data[l - 1].second - k + 1,
-                                      len);  // Fill from previous ending-K
-            }
-        }();
-        const uint8_t *ending = data[l].second;
-        for (uint8_t *it = data[l].first + it1; it != ending; ++it) {
-            const auto kmer = kmer_view.get();
-            if (syncmer_functor(kmer)) {
-                init_core_kmer<uint32_t>(&(cores[core_index]), kmer, it1,
-                                         it1 + k,
-                                         k);  // TODO fix si, ei
-                core_index++;
-            }
-            it1 = kmer_view.move_get(data, it1, len);
-        }
-    }
-    return 0;
-}
-inline void parse_cores_from_bam_record2(const uint8_t *data, size_t len,
-                                         int lcp_level, lps *str,
-                                         const auto &syncmer_functor,
-                                         charsi &chs, charsi &chs2,
-                                         lcp_read &lr) {
-    chs.require(len);
-    chs2.require(len);
-    onehotto2bitDNA_bivec_chs(data, len, chs);
-    std::array<std::pair<uint8_t *, uint8_t *>, 4> lane_boundary =
-        scalar_rlc<4>(chs, chs2, len);
-    prepare_lps(str, len);
-    parse1_bam_syncmer_with_lanes(lane_boundary, len, str, syncmer_functor);
-    lps_deepen(str, lcp_level);
-
-    for (int i = 0; i < str->size; ++i) {
-        lr.cores.emplace_back(str->cores[i].label);
-        lr.pos.emplace_back(str->cores[i].start, str->cores[i].end);
-    }
-    lr.data = data;
-}
-lcp_read parse_cores_from_kseq(const char *data, size_t len, int lcp_level);
 #endif
