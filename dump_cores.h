@@ -13,7 +13,7 @@ class App;
 }
 
 // "dump-cores" subcommand: owns its parameters and registers itself with the
-// parent app on construction (see lasm.cpp main). Copy/move deleted so the
+// parent app on construction (see gallifrey.cpp main). Copy/move deleted so the
 // callback's captured `this` cannot dangle.
 class DumpCoresProgram {
     std::string input;

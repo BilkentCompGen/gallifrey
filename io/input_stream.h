@@ -1,5 +1,5 @@
-#ifndef _LASM_INPUT_STREAM_H_
-#define _LASM_INPUT_STREAM_H_
+#ifndef _GALLIFREY_INPUT_STREAM_H_
+#define _GALLIFREY_INPUT_STREAM_H_
 
 #include <blockingconcurrentqueue.h>
 #include <fcntl.h>

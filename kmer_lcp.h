@@ -1,5 +1,5 @@
 // LCP deepening of cores whose level 1 is k-mers, on per-field arrays.
-// lcptools parses characters generically (struct lps, lps_deepen). lasm's
+// lcptools parses characters generically (struct lps, lps_deepen). Gallifrey's
 // level-1 cores are the selected k-mers, so the k-mer compression and the
 // array layout live here, and lcptools supplies only the core label hash.
 // core_buf::deepen gives exactly lps_deepen's cores (label, start, end,

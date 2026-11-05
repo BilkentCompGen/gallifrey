@@ -1,5 +1,5 @@
-#ifndef _LASM_IO_BAM_CHUNKS_H_
-#define _LASM_IO_BAM_CHUNKS_H_
+#ifndef _GALLIFREY_IO_BAM_CHUNKS_H_
+#define _GALLIFREY_IO_BAM_CHUNKS_H_
 
 #include <cstdint>
 #include <cstring>

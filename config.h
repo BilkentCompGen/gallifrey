@@ -1,5 +1,5 @@
-#ifndef _LASM_CONFIG_H_
-#define _LASM_CONFIG_H_
+#ifndef _GALLIFREY_CONFIG_H_
+#define _GALLIFREY_CONFIG_H_
 
 #ifndef WAIT_QUEUE_TIMEOUT_MS
 #define WAIT_QUEUE_TIMEOUT_MS 2

@@ -1,5 +1,5 @@
-#ifndef _LASM_IO_CHUNKED_INPUT_H_
-#define _LASM_IO_CHUNKED_INPUT_H_
+#ifndef _GALLIFREY_IO_CHUNKED_INPUT_H_
+#define _GALLIFREY_IO_CHUNKED_INPUT_H_
 
 #include <fcntl.h>
 #include <sys/stat.h>

@@ -1,5 +1,5 @@
-#ifndef _LASM_NT16_H_
-#define _LASM_NT16_H_
+#ifndef _GALLIFREY_NT16_H_
+#define _GALLIFREY_NT16_H_
 
 #include <cstddef>
 #include <cstdint>

@@ -1,5 +1,5 @@
-#ifndef _LASM_BAM_READER_H_
-#define _LASM_BAM_READER_H_
+#ifndef _GALLIFREY_BAM_READER_H_
+#define _GALLIFREY_BAM_READER_H_
 
 #include <cstdint>
 #include <cstring>
