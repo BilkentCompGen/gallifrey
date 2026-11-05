@@ -1,5 +1,5 @@
-#ifndef _LASM_INLINE_VEC_H_
-#define _LASM_INLINE_VEC_H_
+#ifndef _GALLIFREY_INLINE_VEC_H_
+#define _GALLIFREY_INLINE_VEC_H_
 
 #include <algorithm>
 #include <cassert>
@@ -143,4 +143,4 @@ class inline_vec {
     };
 };
 
-#endif  // _LASM_INLINE_VEC_H_
+#endif  // _GALLIFREY_INLINE_VEC_H_

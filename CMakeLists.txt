@@ -1,6 +1,6 @@
 # CMakeLists.txt
 cmake_minimum_required(VERSION 3.20)
-project(lasm)
+project(gallifrey)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -12,8 +12,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_program(MOLD_LINKER mold)
 if(MOLD_LINKER)
     include(CheckLinkerFlag)
-    check_linker_flag(CXX "-fuse-ld=mold" LASM_HAVE_MOLD)
-    if(LASM_HAVE_MOLD)
+    check_linker_flag(CXX "-fuse-ld=mold" GALLIFREY_HAVE_MOLD)
+    if(GALLIFREY_HAVE_MOLD)
         if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.29)
             set(CMAKE_LINKER_TYPE MOLD)
         else()
@@ -27,7 +27,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 # Build options
-option(LASM_NATIVE "Optimize for the build host CPU (-march=native); produces non-portable binaries" OFF)
+option(GALLIFREY_NATIVE "Optimize for the build host CPU (-march=native); produces non-portable binaries" OFF)
 
 # Compiler flags
 # Project defaults come first; a user's -DCMAKE_<LANG>_FLAGS_<CONFIG> is
@@ -51,11 +51,11 @@ add_compile_options($<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wno-interference-size>)
 # builds target x86-64-v2 (SSSE3/SSE4.2/POPCNT; every x86-64 CPU since ~2009)
 # so the SSSE3 SIMD paths are used instead of the scalar fallbacks. ARM64
 # always has NEON and needs no flag.
-option(LASM_X86_64_V2 "Portable x86-64 builds target x86-64-v2 (SSSE3/SSE4.2)" ON)
-if(LASM_NATIVE)
+option(GALLIFREY_X86_64_V2 "Portable x86-64 builds target x86-64-v2 (SSSE3/SSE4.2)" ON)
+if(GALLIFREY_NATIVE)
     add_compile_options($<$<CONFIG:Release,RelWithDebInfo>:-march=native>)
     add_compile_options($<$<CONFIG:RelWithDebInfo>:-mtune=native>)
-elseif(LASM_X86_64_V2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+elseif(GALLIFREY_X86_64_V2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
     add_compile_options(-march=x86-64-v2)
 endif()
 
@@ -77,7 +77,7 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(DEFLATE REQUIRED IMPORTED_TARGET libdeflate)
 
-set(SOURCE_FILES lasm.cpp asm2.cpp dump_cores.cpp)
+set(SOURCE_FILES gallifrey.cpp asm2.cpp dump_cores.cpp)
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
 target_include_directories(${PROJECT_NAME} PRIVATE ./ext)
@@ -94,12 +94,12 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(cli11_proj)
 # CLI11's implementation is compiled once, in its own source file, instead of
-# inline in every source file that includes CLI11. It is part of lasm rather
-# than CLI11's precompiled library, which the Makefile generator would build
-# before starting on lasm's sources.
+# inline in every source file that includes CLI11. It is part of gallifrey
+# rather than CLI11's precompiled library, which the Makefile generator would
+# build before starting on gallifrey's sources.
 set(CLI11_IMPL ${cli11_proj_SOURCE_DIR}/src/Precompile.cpp)
 target_sources(${PROJECT_NAME} PRIVATE ${CLI11_IMPL})
-set_source_files_properties(lasm.cpp dump_cores.cpp ${CLI11_IMPL}
+set_source_files_properties(gallifrey.cpp dump_cores.cpp ${CLI11_IMPL}
                             PROPERTIES COMPILE_DEFINITIONS CLI11_COMPILE)
 
 FetchContent_Declare(
@@ -175,7 +175,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 # Convenience target: run the assembler on a local sample (data not in repo).
-add_custom_target(rtest COMMAND lasm hifi test/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8)
+add_custom_target(rtest COMMAND gallifrey hifi test/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8)
 add_dependencies(rtest ${PROJECT_NAME})
 
 # Debug targets

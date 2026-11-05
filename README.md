@@ -1,4 +1,6 @@
-# HiFi assembler
+# Gallifrey
+
+Gallifrey is a de novo genome assembler for PacBio HiFi reads.
 
 ## Build
 
@@ -19,7 +21,7 @@ cmake --build build -j
 The main executable is:
 
 ```bash
-./build/lasm
+./build/gallifrey
 ```
 
 ### Build types
@@ -35,8 +37,8 @@ build directory so you can keep them side by side.
 | `MinSizeRel` | `-Os -DNDEBUG` |
 
 ### Build options
-- `LASM_NATIVE` — add `-march=native`
-- `LASM_X86_64_V2` (default `ON`) — without `LASM_NATIVE`, x86-64 builds
+- `GALLIFREY_NATIVE` — add `-march=native`
+- `GALLIFREY_X86_64_V2` (default `ON`) — without `GALLIFREY_NATIVE`, x86-64 builds
   target `-march=x86-64-v2` (SSSE3/SSE4.2/POPCNT, any x86-64 CPU from about
   2009 on), so the SIMD paths are used. Turn it off only for older CPUs; the
   scalar fallbacks are several times slower. ARM64 builds always use NEON.
@@ -47,17 +49,17 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
 # Fastest local build for this machine
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLASM_NATIVE=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGALLIFREY_NATIVE=ON
 cmake --build build -j
 
 # Profiling build with native tuning (produces gmon.out after a run)
-cmake -S . -B build-prof -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLASM_NATIVE=ON
+cmake -S . -B build-prof -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGALLIFREY_NATIVE=ON
 cmake --build build-prof -j
 ```
 
 ## Input
 
-`lasm hifi` accepts one or more read files. Supported formats:
+`gallifrey hifi` accepts one or more read files. Supported formats:
 
 - BAM (mapped or unmapped; every record's sequence is used)
 - FASTA and FASTQ, plain, gzipped or bgzipped
@@ -72,9 +74,9 @@ formats can be mixed in one invocation.
 
 An input can also be a pipe: `-` reads standard input, and a named pipe or
 `/dev/stdin` works like a file, for example
-`samtools view -b reads.cram | lasm hifi - -o assembly.gfa -l 5`.
+`samtools view -b reads.cram | gallifrey hifi - -o assembly.gfa -l 5`.
 Several pipes can be given, but each must already have its writer running
-when lasm starts: lasm opens every input before it reads any, so pipes filled
+when gallifrey starts: gallifrey opens every input before it reads any, so pipes filled
 one after the other would wait forever. `--multipass` reads its inputs once
 per pass, so it needs regular files. Each input can be given only once.
 
@@ -82,13 +84,13 @@ A single large gzipped FASTA/FASTQ file is decompressed on one thread, which
 can limit the whole run. Decompressing it in parallel with
 [rapidgzip](https://github.com/mxmlnkn/rapidgzip) and piping the result in is
 faster, for example
-`rapidgzip -d -c -P 4 reads.fq.gz | lasm hifi - -o assembly.gfa -l 5`.
+`rapidgzip -d -c -P 4 reads.fq.gz | gallifrey hifi - -o assembly.gfa -l 5`.
 rapidgzip does not report a truncated gzip file, so check the file first
 (`gzip -t reads.fq.gz`) if it may be incomplete. Several gzipped files are
 already decompressed in parallel with `--file-reading-mode parallel`.
 
 ```bash
-lasm hifi <reads1> [reads2 ...] -o output.gfa -l <lcp_level> [--syncmer K/S[/T]]
+gallifrey hifi <reads1> [reads2 ...] -o output.gfa -l <lcp_level> [--syncmer K/S[/T]]
 ```
 
 ## Basic Usage
@@ -96,13 +98,13 @@ lasm hifi <reads1> [reads2 ...] -o output.gfa -l <lcp_level> [--syncmer K/S[/T]]
 Minimal example (default syncmers: k=11, open syncmer with s=4, t=6):
 
 ```bash
-build/lasm hifi reads.bam -o assembly.gfa -l 5
+build/gallifrey hifi reads.bam -o assembly.gfa -l 5
 ```
 
 Example with explicit syncmer and thread settings:
 
 ```bash
-build/lasm hifi reads.bam \
+build/gallifrey hifi reads.bam \
   -o assembly.gfa \
   -l 5 \
   -t 16 \
@@ -114,7 +116,7 @@ build/lasm hifi reads.bam \
 
 ## Main Parameters
 
-`lasm hifi --help` lists these; `lasm hifi --help-all` shows every option,
+`gallifrey hifi --help` lists these; `gallifrey hifi --help-all` shows every option,
 including the advanced ones below.
 
 Required:

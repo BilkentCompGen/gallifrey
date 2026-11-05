@@ -1,5 +1,5 @@
-#ifndef _LASM_FASTX_H_
-#define _LASM_FASTX_H_
+#ifndef _GALLIFREY_FASTX_H_
+#define _GALLIFREY_FASTX_H_
 
 #include <cstdint>
 #include <cstdio>
@@ -145,7 +145,7 @@ class fastx_reader {
     static inline void store16(uint8_t *dst, half_t a, half_t b) {
         vst1q_u8(dst, vcombine_u8(a, b));
     }
-#define LASM_FASTX_SIMD 1
+#define GALLIFREY_FASTX_SIMD 1
 #elif defined(__SSSE3__)
     using vec_t = __m128i;
     using half_t = __m128i;  // low 8 bytes significant
@@ -191,7 +191,7 @@ class fastx_reader {
         _mm_storeu_si128(reinterpret_cast<__m128i *>(dst),
                          _mm_unpacklo_epi64(a, b));
     }
-#define LASM_FASTX_SIMD 1
+#define GALLIFREY_FASTX_SIMD 1
 #endif
 
     // Packs [p, q) of ASCII bases onto the end of `rec`, dropping any byte at
@@ -204,7 +204,7 @@ class fastx_reader {
         rec.reserve_bases(rec.len + static_cast<uint32_t>(q - p));
         uint8_t *dst = rec.nibbles;
         uint32_t len = rec.len;
-#ifdef LASM_FASTX_SIMD
+#ifdef GALLIFREY_FASTX_SIMD
         // Vector stores need an even base offset (whole output bytes); pack
         // one base scalar to get there.
         while ((len & 1) && p != q) {

@@ -292,7 +292,7 @@ class AsmProgram {
 };
 
 int main(int argc, char **argv) {
-    CLI::App app("lasm");
+    CLI::App app("gallifrey");
     app.require_subcommand(1);
     app.formatter(std::make_shared<HelpFormatter>());
 
